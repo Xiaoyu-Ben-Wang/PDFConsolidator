@@ -133,6 +133,7 @@ def build(
     margin_inches: float = 0.5,
     bookmarks: bool = True,
     policy: email_items.ExtractionPolicy | None = None,
+    options: assemble.MergeOptions | None = None,
     on_event=None,
     keep_scratch: bool = False,
     scratch_dir: str | None = None,
@@ -147,6 +148,14 @@ def build(
     dest = Path(dest).resolve()
     target = pages.resolve(page_size_name)
     margin = margin_inches * 72.0
+
+    if options is None:
+        options = assemble.MergeOptions()
+    options.page_size = target
+    options.margin = margin
+    options.bookmarks = bookmarks
+    if not options.title:
+        options.title = dest.stem
 
     started = time.time()
     if scratch_dir:
@@ -296,9 +305,7 @@ def build(
         return report
 
     emit("Assembling %d segment(s)..." % len(entries))
-    report.merged = assemble.merge(
-        entries, dest, page_size=target, margin=margin, bookmarks=bookmarks, title=dest.stem,
-    )
+    report.merged = assemble.merge(entries, dest, options=options)
     report.output = dest
     report.seconds = time.time() - started
 

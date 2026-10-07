@@ -10,7 +10,15 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import __version__, convert, email_items, libreoffice, pages, pipeline
+from . import (
+    __version__,
+    assemble,
+    convert,
+    email_items,
+    libreoffice,
+    pages,
+    pipeline,
+)
 
 # What is pulled out of an email item unless told otherwise.
 DEFAULT_EXTRACT = ("pdf", "images", "office")
@@ -54,6 +62,21 @@ def _cmd_build(args: argparse.Namespace) -> int:
         print("Nothing supported to convert.", file=sys.stderr)
         return 2
 
+    options = assemble.MergeOptions(
+        separator=args.separator,
+        numbering=assemble.PageNumbering(
+            mode=args.page_numbers,
+            position=args.number_position,
+            template=args.number_format,
+            start=args.number_start,
+        ),
+        header=assemble.HeaderFooter(args.header_left, args.header_center, args.header_right),
+        footer=assemble.HeaderFooter(args.footer_left, args.footer_center, args.footer_right),
+        title=args.title or Path(args.output).stem,
+        author=args.author,
+        subject=args.subject,
+    )
+
     report = pipeline.build(
         supported,
         Path(args.output),
@@ -61,6 +84,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         margin_inches=args.margin,
         bookmarks=not args.no_bookmarks,
         policy=policy,
+        options=options,
         on_event=lambda message: print(message, flush=True),
         keep_scratch=args.keep_scratch,
     )
@@ -156,6 +180,32 @@ def build_parser() -> argparse.ArgumentParser:
                        help="skip attachments larger than this (default: %(default)s)")
     email.add_argument("--max-depth", type=int, default=3,
                        help="maximum nested-message depth (default: %(default)s)")
+
+    layout = build.add_argument_group("layout")
+    layout.add_argument("--separator", default="none",
+                        choices=("none", "blank", "title"),
+                        help="insert a page between source documents (default: %(default)s)")
+    layout.add_argument("--page-numbers", default="none",
+                        choices=("none", "continuous", "per-document"),
+                        help="page numbering mode (default: %(default)s)")
+    layout.add_argument("--number-format", default="{n}",
+                        help="page number template; placeholders {n} {total} {doc} "
+                             "{n_doc} {total_doc} {date} (default: %(default)s)")
+    layout.add_argument("--number-position", default="bottom-center",
+                        choices=tuple("%s-%s" % (edge, slot)
+                                      for edge in ("top", "bottom")
+                                      for slot in ("left", "center", "right")),
+                        help="where the page number goes (default: %(default)s)")
+    layout.add_argument("--number-start", type=int, default=1,
+                        help="first page number (default: %(default)s)")
+    for edge in ("header", "footer"):
+        for slot in ("left", "center", "right"):
+            layout.add_argument("--%s-%s" % (edge, slot), default="",
+                                help="%s %s text (placeholders as for --number-format)"
+                                     % (edge, slot))
+    layout.add_argument("--title", default="", help="PDF title metadata")
+    layout.add_argument("--author", default="", help="PDF author metadata")
+    layout.add_argument("--subject", default="", help="PDF subject metadata")
     build.set_defaults(func=_cmd_build)
 
     check = sub.add_parser("check", help="report the detected conversion engine")
