@@ -22,12 +22,13 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
 TEXT_EXTS = {".txt", ".md", ".markdown", ".log", ".csv"}
 PDF_EXTS = {".pdf"}
 OFFICE_EXTS = {".docx", ".doc", ".rtf", ".odt", ".xlsx", ".xls", ".ods", ".pptx", ".ppt", ".odp"}
+MSG_EXTS = {".msg"}
+EML_EXTS = {".eml"}
+EMAIL_EXTS = MSG_EXTS | EML_EXTS
 
-# Formats we knowingly do not handle yet, so the error is a clear message
-# rather than a confusing "unsupported extension".
+# Formats we knowingly do not handle, so the error is a clear message rather
+# than a confusing "unsupported extension".
 KNOWN_UNSUPPORTED = {
-    ".msg": "Outlook items are not implemented yet",
-    ".eml": "Email messages are not implemented yet",
     ".pub": "Microsoft Publisher is not supported",
     ".heic": "HEIC images need an extra codec that is not bundled",
     ".heif": "HEIF images need an extra codec that is not bundled",
@@ -181,8 +182,13 @@ def convert(src: Path, dest: Path, workdir: Path, page_size: tuple | None = None
         convert_image(src, dest, workdir, page_size)
     elif ext in TEXT_EXTS:
         convert_text(src, dest, workdir, page_size)
-    elif _is_office(ext):
+    elif ext in OFFICE_EXTS:
         convert_office(src, dest, workdir)
+    elif ext in EMAIL_EXTS:
+        raise ConversionError(
+            "email items expand into several segments; use "
+            "email_items.expand_to_segments instead"
+        )
     elif ext in KNOWN_UNSUPPORTED:
         raise ConversionError(KNOWN_UNSUPPORTED[ext])
     else:
@@ -194,5 +200,5 @@ def convert(src: Path, dest: Path, workdir: Path, page_size: tuple | None = None
 
 def is_supported(path: Path) -> bool:
     return Path(path).suffix.lower() in (
-        PDF_EXTS | IMAGE_EXTS | TEXT_EXTS | OFFICE_EXTS
+        PDF_EXTS | IMAGE_EXTS | TEXT_EXTS | OFFICE_EXTS | EMAIL_EXTS
     )

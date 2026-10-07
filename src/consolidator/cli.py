@@ -1,6 +1,6 @@
 """Command line interface.
 
-    python -m consolidator build <paths...> -o out.pdf
+    python -m consolidator build <paths...> -o out.pdf [options]
     python -m consolidator check
 """
 
@@ -10,7 +10,10 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import __version__, convert, libreoffice, pages, pipeline
+from . import __version__, convert, email_items, libreoffice, pages, pipeline
+
+# What is pulled out of an email item unless told otherwise.
+DEFAULT_EXTRACT = ("pdf", "images", "office")
 
 
 def _cmd_build(args: argparse.Namespace) -> int:
@@ -20,11 +23,30 @@ def _cmd_build(args: argparse.Namespace) -> int:
         return 2
 
     supported = [s for s in sources if convert.is_supported(s)]
-    skipped = [s for s in sources if not convert.is_supported(s)]
+    unsupported = [s for s in sources if not convert.is_supported(s)]
+
+    chosen = {c.strip().lower() for c in args.extract.split(",") if c.strip()}
+    unknown = chosen - set(email_items.CATEGORIES)
+    if unknown:
+        print("Unknown extract category: %s" % ", ".join(sorted(unknown)), file=sys.stderr)
+        print("Valid categories: %s" % ", ".join(email_items.CATEGORIES), file=sys.stderr)
+        return 2
+
+    policy = email_items.ExtractionPolicy(
+        body=not args.no_body,
+        pdf="pdf" in chosen,
+        images="images" in chosen,
+        office="office" in chosen,
+        embedded="embedded" in chosen,
+        other="other" in chosen,
+        max_attachment_bytes=int(args.max_attachment_mb * 1024 * 1024),
+        max_depth=args.max_depth,
+    )
 
     print("PDF Consolidator %s" % __version__)
     print("  %d file(s) selected, %d supported" % (len(sources), len(supported)))
     print("  page size : %s" % args.page_size)
+    print("  extract   : %s%s" % (args.extract, "" if not args.no_body else " (no body)"))
     print("  output    : %s" % args.output)
     print()
 
@@ -32,36 +54,49 @@ def _cmd_build(args: argparse.Namespace) -> int:
         print("Nothing supported to convert.", file=sys.stderr)
         return 2
 
-    def on_event(message: str) -> None:
-        print(message, flush=True)
-
     report = pipeline.build(
         supported,
         Path(args.output),
         page_size_name=args.page_size,
         margin_inches=args.margin,
         bookmarks=not args.no_bookmarks,
-        on_event=on_event,
+        policy=policy,
+        on_event=lambda message: print(message, flush=True),
         keep_scratch=args.keep_scratch,
     )
 
     print()
-    print("=" * 68)
-    print("Converted : %d/%d" % (len(report.succeeded), len(report.outcomes)))
-    for outcome in report.failed:
-        print("  FAILED  %s" % outcome.source.name)
-        print("          %s" % outcome.detail)
-    for path in skipped:
+    print("=" * 70)
+    print("Converted : %d/%d source(s), %d segment(s)"
+          % (len(report.succeeded), len(report.sources), len(report.segments)))
+
+    for result in report.failed:
+        detail = "; ".join(s.detail for s in result.segments if s.detail) or "no output"
+        print("  FAILED  %s" % result.source.name)
+        print("          %s" % detail)
+
+    excluded = [s for s in report.skipped_segments if "excluded by the extraction policy" in s.detail]
+    if excluded:
+        print("  EXCLUDED by policy: %d segment(s)" % len(excluded))
+        for segment in excluded[:10]:
+            print("          %s" % segment.label)
+
+    other_skips = [s for s in report.skipped_segments if s not in excluded]
+    for segment in other_skips:
+        print("  SKIPPED %s" % segment.label)
+        print("          %s" % segment.detail)
+
+    for path in unsupported:
         print("  SKIPPED %s (unsupported)" % path.name)
 
     if report.merged:
         merged = report.merged
-        print("Merged    : %d document(s), %d page(s), %d bookmark(s)"
+        print("Merged    : %d segment(s), %d page(s), %d bookmark(s)"
               % (merged.entries, merged.pages, merged.outline_items))
         for label, why in merged.skipped:
             print("  MERGE-SKIP %s - %s" % (label, why))
-        print("Written   : %s (%.1f KB)"
-              % (report.output, report.output.stat().st_size / 1024))
+        size_kb = report.output.stat().st_size / 1024
+        print("Written   : %s (%.1f KB)" % (report.output, size_kb))
     else:
         print("No output produced.")
 
@@ -74,6 +109,13 @@ def _cmd_check(args: argparse.Namespace) -> int:
     print("  python          : %s" % sys.version.split()[0])
     exe = libreoffice.find_soffice()
     print("  LibreOffice     : %s" % (exe or "NOT FOUND"))
+    try:
+        import extract_msg
+
+        print("  extract-msg     : %s" % extract_msg.__version__)
+    except Exception:
+        print("  extract-msg     : NOT AVAILABLE (Outlook .msg support disabled)")
+
     if exe is None:
         print("\n  Set CONSOLIDATOR_SOFFICE, or place a copy at")
         print("  <app>/libreoffice/program/soffice.exe")
@@ -97,11 +139,23 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--margin", type=float, default=0.5,
                        help="margin in inches when fitting to a page size (default: %(default)s)")
     build.add_argument("--no-bookmarks", action="store_true",
-                       help="do not create a bookmark per source document")
+                       help="do not create a bookmark per segment")
     build.add_argument("--no-recursive", action="store_true",
                        help="do not descend into subfolders")
     build.add_argument("--keep-scratch", action="store_true",
                        help="keep intermediate PDFs for inspection")
+
+    email = build.add_argument_group("email extraction")
+    email.add_argument("--extract", default=",".join(DEFAULT_EXTRACT),
+                       help="attachment categories to extract from Outlook items and email, "
+                            "comma separated (default: %s). Choices: %s"
+                            % (",".join(DEFAULT_EXTRACT), ", ".join(email_items.CATEGORIES)))
+    email.add_argument("--no-body", action="store_true",
+                       help="omit the message body page")
+    email.add_argument("--max-attachment-mb", type=float, default=64.0,
+                       help="skip attachments larger than this (default: %(default)s)")
+    email.add_argument("--max-depth", type=int, default=3,
+                       help="maximum nested-message depth (default: %(default)s)")
     build.set_defaults(func=_cmd_build)
 
     check = sub.add_parser("check", help="report the detected conversion engine")

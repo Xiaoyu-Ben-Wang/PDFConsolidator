@@ -1,14 +1,15 @@
-"""Phase A orchestration: gather sources, convert each to a PDF, then assemble.
+"""Phase A orchestration: gather sources, convert each to PDF segment(s), assemble.
 
-Two things drive the shape of this module:
+Two things shape this module:
 
-* **LibreOffice start-up dominates.** Ten documents converted in one invocation
-  take far less time than ten invocations, so Office formats are staged with
-  unique names and converted as a single batch.
-* **Staging with unique names avoids stem collisions.** ``soffice`` always names
-  its output after the input, so two files called ``report.docx`` in different
-  folders would otherwise overwrite each other. Every source is therefore copied
-  to ``<index>_<stem>.<ext>`` before conversion.
+* **A source can yield several segments.** An Outlook item produces a body
+  segment plus one per extracted attachment, and those all become pages. So the
+  pipeline works in segments, not files.
+* **LibreOffice start-up dominates.** Plain Office documents are staged under
+  unique names and converted in a single batched invocation, which is far faster
+  than one invocation each. Staging with an index prefix also removes any chance
+  of two files with the same name colliding, since ``soffice`` always names its
+  output after its input.
 """
 
 from __future__ import annotations
@@ -21,36 +22,70 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import assemble, convert, libreoffice, pages
+from . import assemble, convert, email_items, libreoffice, pages
+from .model import DOCUMENT, Segment, SourceResult
 
 OFFICE_BATCH_TIMEOUT = 900
 
 
 @dataclass
-class Outcome:
-    """What happened to one source file."""
-
-    source: Path
-    pdf: Path | None = None
-    ok: bool = False
-    detail: str = ""
-    seconds: float = 0.0
-
-
-@dataclass
 class BuildReport:
-    outcomes: list[Outcome] = field(default_factory=list)
+    sources: list[SourceResult] = field(default_factory=list)
     merged: assemble.MergeReport | None = None
     output: Path | None = None
     seconds: float = 0.0
+    policy: email_items.ExtractionPolicy | None = None
 
     @property
-    def succeeded(self) -> list[Outcome]:
-        return [o for o in self.outcomes if o.ok]
+    def segments(self) -> list[Segment]:
+        """Every successfully produced segment, in source order."""
+        return [s for result in self.sources for s in result.segments if s.ok]
 
     @property
-    def failed(self) -> list[Outcome]:
-        return [o for o in self.outcomes if not o.ok]
+    def all_segments(self) -> list[Segment]:
+        return [s for result in self.sources for s in result.segments]
+
+    @property
+    def succeeded(self) -> list[SourceResult]:
+        return [r for r in self.sources if r.ok]
+
+    @property
+    def failed(self) -> list[SourceResult]:
+        return [r for r in self.sources if not r.ok]
+
+    @property
+    def skipped_segments(self) -> list[Segment]:
+        """Segments deliberately not produced (excluded, too large, nested)."""
+        return [s for s in self.all_segments if not s.ok]
+
+
+def choose_scratch(preferred_parent: Path | None = None) -> Path:
+    """Return a scratch directory, verified writable by actually writing to it.
+
+    ``%TEMP%`` cannot be assumed to exist or be writable - it can be missing,
+    full, or restricted by policy. Rather than trusting it, each candidate is
+    probed and the first that works wins. This matters for an application meant
+    to run from removable media on an unfamiliar machine.
+    """
+    candidates: list[Path] = [Path(tempfile.gettempdir()) / "pdfconsolidator"]
+    if preferred_parent is not None:
+        candidates.append(Path(preferred_parent) / ".consolidator-scratch")
+    candidates.append(Path.cwd() / ".consolidator-scratch")
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / "_writetest"
+            probe.write_bytes(b"x")
+            probe.unlink()
+            return candidate
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        "no writable scratch directory found (tried: %s)"
+        % ", ".join(str(c) for c in candidates)
+    )
 
 
 def _natural_key(path: Path):
@@ -74,33 +109,21 @@ def gather(paths: list[str], recursive: bool = True) -> list[Path]:
     return found
 
 
-def choose_scratch(preferred_parent: Path | None = None) -> Path:
-    """Return a scratch directory, verified writable by actually writing to it.
-
-    ``%TEMP%`` cannot be assumed to exist or be writable - it can be missing,
-    full, or restricted by policy. Rather than trusting it, each candidate is
-    probed, and the first that works wins. This matters for an application meant
-    to run on an unfamiliar machine from removable media.
-    """
-    candidates: list[Path] = [Path(tempfile.gettempdir()) / "pdfconsolidator"]
-    if preferred_parent is not None:
-        candidates.append(Path(preferred_parent) / ".consolidator-scratch")
-    candidates.append(Path.cwd() / ".consolidator-scratch")
-
-    for candidate in candidates:
-        try:
-            candidate.mkdir(parents=True, exist_ok=True)
-            probe = candidate / "_writetest"
-            probe.write_bytes(b"x")
-            probe.unlink()
-            return candidate
-        except Exception:
-            continue
-
-    raise RuntimeError(
-        "no writable scratch directory found (tried: %s)"
-        % ", ".join(str(c) for c in candidates)
-    )
+def _convert_one_to_segment(
+    src: Path, out_pdf: Path, workdir: Path, page_size, label: str | None = None
+) -> Segment:
+    """Convert a single ordinary file into one segment."""
+    started = time.time()
+    try:
+        convert.convert(src, out_pdf, workdir, page_size=page_size)
+        return Segment(src, label or src.stem, DOCUMENT, out_pdf, True, "", time.time() - started)
+    except convert.ConversionError as exc:
+        return Segment(src, label or src.stem, DOCUMENT, None, False, str(exc), time.time() - started)
+    except Exception as exc:
+        return Segment(
+            src, label or src.stem, DOCUMENT, None, False,
+            "%s: %s" % (type(exc).__name__, exc), time.time() - started,
+        )
 
 
 def build(
@@ -109,16 +132,18 @@ def build(
     page_size_name: str = pages.DEFAULT_PAGE_SIZE,
     margin_inches: float = 0.5,
     bookmarks: bool = True,
+    policy: email_items.ExtractionPolicy | None = None,
     on_event=None,
     keep_scratch: bool = False,
     scratch_dir: str | None = None,
 ) -> BuildReport:
-    """Convert every source to a PDF then merge them into ``dest``."""
+    """Convert every source into PDF segments, then merge them into ``dest``."""
 
     def emit(message: str) -> None:
         if on_event:
             on_event(message)
 
+    policy = policy or email_items.ExtractionPolicy()
     dest = Path(dest).resolve()
     target = pages.resolve(page_size_name)
     margin = margin_inches * 72.0
@@ -132,95 +157,122 @@ def build(
         root = choose_scratch(preferred_parent=dest.parent)
         scratch = Path(tempfile.mkdtemp(prefix="run_", dir=str(root)))
         owned_scratch = True
+
     staging = scratch / "staging"
     work = scratch / "out"
     staging.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
 
-    report = BuildReport()
+    report = BuildReport(policy=policy)
+    results: dict[int, SourceResult] = {}
 
-    # Index every source so intermediate names are unique and stable.
-    indexed: list[tuple[int, Path]] = [(i, Path(s)) for i, s in enumerate(sources)]
-    office_items: list[tuple[int, Path, Path]] = []
-    simple_items: list[tuple[int, Path]] = []
+    # Partition sources by how they must be handled.
+    office_batch: list[tuple[int, Path, Path]] = []
+    email_list: list[tuple[int, Path]] = []
+    simple_list: list[tuple[int, Path]] = []
 
-    for index, src in indexed:
+    for index, raw in enumerate(sources):
+        src = Path(raw)
         ext = src.suffix.lower()
+
         if not src.exists():
-            report.outcomes.append(Outcome(src, None, False, "file not found"))
+            results[index] = SourceResult(src, [Segment(src, src.stem, DOCUMENT, None, False, "file not found")])
         elif ext in convert.KNOWN_UNSUPPORTED:
-            report.outcomes.append(Outcome(src, None, False, convert.KNOWN_UNSUPPORTED[ext]))
+            results[index] = SourceResult(
+                src, [Segment(src, src.stem, DOCUMENT, None, False, convert.KNOWN_UNSUPPORTED[ext])]
+            )
+        elif ext in convert.EMAIL_EXTS:
+            email_list.append((index, src))
         elif ext in convert.OFFICE_EXTS:
             staged = staging / ("%04d_%s%s" % (index, src.stem, ext))
             try:
                 shutil.copyfile(src, staged)
-                office_items.append((index, src, staged))
+                office_batch.append((index, src, staged))
             except OSError as exc:
-                report.outcomes.append(Outcome(src, None, False, "could not stage: %s" % exc))
-        elif ext in (convert.PDF_EXTS | convert.IMAGE_EXTS | convert.TEXT_EXTS):
-            simple_items.append((index, src))
+                results[index] = SourceResult(
+                    src, [Segment(src, src.stem, DOCUMENT, None, False, "could not stage: %s" % exc)]
+                )
+        elif convert.is_supported(src):
+            simple_list.append((index, src))
         else:
-            report.outcomes.append(
-                Outcome(src, None, False, "unsupported file type %r" % (ext or "(none)"))
+            results[index] = SourceResult(
+                src, [Segment(src, src.stem, DOCUMENT, None, False,
+                              "unsupported file type %r" % (ext or "(none)"))]
             )
 
-    # ---- Office formats: one LibreOffice invocation for the whole batch ----
-    if office_items:
-        emit("Converting %d Office document(s) with LibreOffice..." % len(office_items))
+    # ---- Office documents: one LibreOffice invocation for the whole batch ----
+    if office_batch:
+        emit("Converting %d Office document(s) with LibreOffice..." % len(office_batch))
         batch = libreoffice.convert_batch(
-            [staged for _, _, staged in office_items], work, timeout=OFFICE_BATCH_TIMEOUT
+            [staged for _, _, staged in office_batch], work, timeout=OFFICE_BATCH_TIMEOUT
         )
-        produced = batch.produced
-        for index, src, staged in office_items:
-            pdf = produced.get(str(staged))
-            if pdf:
-                report.outcomes.append(Outcome(src, Path(pdf), True, "", batch.seconds / len(office_items)))
+        per_file = batch.seconds / max(len(office_batch), 1)
+        for index, src, staged in office_batch:
+            produced = batch.produced.get(str(staged))
+            if produced:
+                results[index] = SourceResult(
+                    src, [Segment(src, src.stem, DOCUMENT, Path(produced), True, "", per_file)]
+                )
                 emit("  ok   %s" % src.name)
             else:
                 reason = batch.failed.get(str(staged), "conversion failed")
-                report.outcomes.append(Outcome(src, None, False, reason, batch.seconds / len(office_items)))
+                results[index] = SourceResult(
+                    src, [Segment(src, src.stem, DOCUMENT, None, False, reason, per_file)]
+                )
                 emit("  FAIL %s - %s" % (src.name, reason))
 
-    # ---- Everything else, one file at a time ----
-    for index, src in simple_items:
-        out_pdf = work / ("%04d_%s.pdf" % (index, src.stem))
-        t0 = time.time()
+    # ---- Email items: parse, then expand into body + attachment segments ----
+    for index, src in email_list:
+        emit("Reading %s..." % src.name)
         try:
-            convert.convert(src, out_pdf, staging, page_size=target)
-            report.outcomes.append(Outcome(src, out_pdf, True, "", time.time() - t0))
-            emit("  ok   %s" % src.name)
-        except convert.ConversionError as exc:
-            report.outcomes.append(Outcome(src, None, False, str(exc), time.time() - t0))
-            emit("  FAIL %s - %s" % (src.name, exc))
-        except Exception as exc:  # never let one file abort the run
-            report.outcomes.append(
-                Outcome(src, None, False, "%s: %s" % (type(exc).__name__, exc), time.time() - t0)
+            item = email_items.read_message(src)
+        except Exception as exc:
+            results[index] = SourceResult(
+                src, [Segment(src, src.stem, DOCUMENT, None, False,
+                              "could not read message: %s: %s" % (type(exc).__name__, exc))]
             )
-            emit("  FAIL %s - %s" % (src.name, exc))
+            emit("  FAIL %s - unreadable message" % src.name)
+            continue
+
+        segments = email_items.expand_to_segments(
+            item, work / ("email%04d" % index), policy, page_size=target, on_event=emit
+        )
+        results[index] = SourceResult(src, segments)
+        kept = sum(1 for s in segments if s.ok)
+        emit("  %s: %d segment(s), %d attachment(s)"
+             % (src.name, kept, len(item.attachments)))
+
+    # ---- Everything else, one file at a time ----
+    for index, src in simple_list:
+        out_pdf = work / ("%04d_%s.pdf" % (index, src.stem))
+        segment = _convert_one_to_segment(src, out_pdf, staging, target)
+        results[index] = SourceResult(src, [segment])
+        emit("  %s   %s" % ("ok  " if segment.ok else "FAIL", src.name))
+
+    report.sources = [results[i] for i in sorted(results)]
 
     # ---- Phase B ----
-    # Preserve the original selection order rather than grouping by engine.
-    order = {str(src): i for i, src in enumerate(sources)}
     entries = [
-        assemble.MergeEntry(o.pdf, o.source.stem)
-        for o in sorted(report.outcomes, key=lambda o: order.get(str(o.source), 0))
-        if o.ok and o.pdf is not None
+        assemble.MergeEntry(segment.pdf, segment.label)
+        for segment in report.segments
+        if segment.pdf is not None
     ]
 
     if not entries:
         emit("Nothing converted successfully - no PDF written.")
         report.seconds = time.time() - started
+        if owned_scratch and not keep_scratch:
+            libreoffice._remove_tree(scratch)
         return report
 
-    emit("Assembling %d document(s)..." % len(entries))
+    emit("Assembling %d segment(s)..." % len(entries))
     report.merged = assemble.merge(
-        entries, dest, page_size=target, margin=margin, bookmarks=bookmarks,
-        title=dest.stem,
+        entries, dest, page_size=target, margin=margin, bookmarks=bookmarks, title=dest.stem,
     )
     report.output = dest
     report.seconds = time.time() - started
 
     if owned_scratch and not keep_scratch:
-        shutil.rmtree(scratch, ignore_errors=True)
+        libreoffice._remove_tree(scratch)
 
     return report

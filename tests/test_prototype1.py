@@ -214,7 +214,7 @@ def test_end_to_end_build(tmp_path, fixtures):
     assert not report.failed, [f"{o.source.name}: {o.detail}" for o in report.failed]
     assert dest.exists()
     assert report.merged.pages > 0
-    assert len(report.outcomes) == len(sources)
+    assert len(report.sources) == len(sources)
 
 
 def test_end_to_end_without_office(tmp_path, fixtures):
