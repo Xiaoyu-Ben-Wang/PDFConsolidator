@@ -1,0 +1,36 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- Vendored dependencies (regenerate with tools/vendor.py) ----
+vendor/
+_probe/vendor/
+_probe/vendor2/
+_probe/*.whl
+_probe/tmp/
+_probe/simulated-target/
+_probe/**/build/
+_probe/**/dist/
+_probe/**/_dist/
+_probe/**/*.x/
+
+# ---- PyInstaller ----
+build/
+dist/
+*.spec
+
+# ---- Test / scratch output ----
+out/
+fixtures/out/
+fixtures/generated/
+*.pdf.tmp
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
