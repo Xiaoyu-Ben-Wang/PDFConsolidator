@@ -49,6 +49,8 @@ pip-target-*/
 ab_*/
 dbg_lo_*/
 consolidator_*/
+tmp*/
+run_*/
 
 # ---- Editor / OS ----
 .vscode/
