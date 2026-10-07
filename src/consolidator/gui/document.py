@@ -165,6 +165,19 @@ class DocumentModel:
         for page in self.pages:
             page.selected = selected
 
+    def remove_failed_for(self, source: Path) -> int:
+        """Drop the failed segments belonging to one source, before a retry.
+
+        Successful segments are left alone, so retrying only ever replaces what
+        actually went wrong.
+        """
+        source = Path(source)
+        before = len(self.segments)
+        self.segments = [
+            s for s in self.segments if not (s.source == source and not s.ok)
+        ]
+        return before - len(self.segments)
+
     def group_by_source(self) -> None:
         """Cluster pages so every page from one source file is contiguous.
 

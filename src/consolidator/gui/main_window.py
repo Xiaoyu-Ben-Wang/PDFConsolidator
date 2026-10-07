@@ -846,7 +846,77 @@ class MainWindow(QMainWindow):
         box.exec()
 
         if box.clickedButton() is retry:
-            self.status.showMessage("Retrying failed items is not implemented yet.")
+            unique: list[Path] = []
+            seen = set()
+            for segment in failures:
+                if str(segment.source) not in seen:
+                    seen.add(str(segment.source))
+                    unique.append(segment.source)
+            self.retry_sources(unique)
+
+    def retry_sources(self, sources: list[Path]) -> None:
+        """Convert just the failed sources again, leaving everything else alone.
+
+        The retry uses its own scratch subdirectory: reusing the first run's
+        directory would collide with the intermediate files already there, since
+        those are named by index within their batch.
+        """
+        if not sources or self.scratch is None:
+            return
+
+        attempts = len(list(Path(self.scratch).glob("retry*")))
+        retry_root = Path(self.scratch) / ("retry%d" % attempts)
+
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+        self.act_convert.setEnabled(False)
+        self.status.showMessage("Retrying %d file(s)\u2026" % len(sources))
+
+        self._conversion = ConversionWorker(
+            sources, retry_root, self.default_policy, self, policy_for=self.policy_for
+        )
+        self._conversion.progressed.connect(self.status.showMessage)
+        self._conversion.completed.connect(self._on_retried)
+        self._conversion.crashed.connect(self._on_worker_crash)
+        self._conversion.start()
+
+    def _on_retried(self, report) -> None:
+        self.progress.setVisible(False)
+        self.act_convert.setEnabled(True)
+
+        recovered = 0
+        for result in report.sources:
+            self.model.remove_failed_for(result.source)
+            for segment in result.segments:
+                if segment.ok:
+                    recovered += 1
+                self.model.add_segment(
+                    result.source,
+                    segment.label,
+                    segment.pdf,
+                    segment.ok,
+                    kind=segment.kind,
+                    detail=segment.detail,
+                    page_count=pipeline.count_pages(segment.pdf)
+                    if segment.ok and segment.pdf else 0,
+                )
+
+        self.refresh_tree()
+        self.refresh_pages()
+
+        still_failing = [
+            s for s in report.all_segments if not s.ok and not is_policy_exclusion(s)
+        ]
+        if recovered:
+            self.status.showMessage(
+                "Retry recovered %d segment(s); %d page(s) now."
+                % (recovered, self.model.page_count)
+            )
+        if still_failing:
+            self._report_failures(still_failing)
+        elif recovered:
+            QMessageBox.information(self, "Retry succeeded",
+                                    "%d segment(s) were recovered." % recovered)
 
     def _on_worker_crash(self, detail: str) -> None:
         self.progress.setVisible(False)

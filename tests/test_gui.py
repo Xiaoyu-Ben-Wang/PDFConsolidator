@@ -426,3 +426,99 @@ def test_scope_label_names_the_selected_email(window_with_emails):
     _select_source(window, "first.eml")
     assert "first.eml" in window.lbl_policy_scope.text()
 
+
+# ------------------------------------------------------------------- retry
+
+
+def test_remove_failed_for_only_drops_that_sources_failures(tmp_path):
+    m = DocumentModel()
+    m.add_segment(Path("a.docx"), "a", None, False, detail="boom")
+    m.add_segment(Path("a.docx"), "a-part", make_pdf(tmp_path / "a.pdf", 1), True, page_count=1)
+    m.add_segment(Path("b.docx"), "b", None, False, detail="boom")
+
+    removed = m.remove_failed_for(Path("a.docx"))
+
+    assert removed == 1
+    assert [s.label for s in m.segments] == ["a-part", "b"]
+    assert m.page_count == 1, "the good segment keeps its pages"
+
+
+def test_remove_failed_for_ignores_successes(tmp_path):
+    m = DocumentModel()
+    m.add_segment(Path("a.docx"), "a", make_pdf(tmp_path / "a.pdf", 1), True, page_count=1)
+    assert m.remove_failed_for(Path("a.docx")) == 0
+    assert len(m.segments) == 1
+
+
+def test_retry_replaces_failed_segments_with_pages(window, tmp_path, monkeypatch):
+    """What 'Retry failed' does once a conversion finally succeeds."""
+    from PySide6.QtWidgets import QMessageBox
+
+    from consolidator.gui import main_window as mw
+    from consolidator.model import Segment, SourceResult
+    from consolidator.pipeline import BuildReport
+
+    # The success path pops a dialog; answering it is not what is under test.
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+
+    window.model.add_segment(Path("broken.doc"), "broken", None, False,
+                             detail="LibreOffice timed out")
+    assert window.model.page_count == 0
+
+    pdf = make_pdf(tmp_path / "broken.pdf", 2)
+    segment = Segment(Path("broken.doc"), "broken", DOCUMENT, pdf, True)
+    window._on_retried(BuildReport(sources=[SourceResult(Path("broken.doc"), [segment])]))
+
+    assert window.model.page_count == 2
+    assert all(s.ok for s in window.model.segments)
+    assert window.page_list.count() == 2
+
+
+def test_retry_without_a_scratch_dir_is_safe(window):
+    window.scratch = None
+    window.retry_sources([Path("a.doc")])   # must not raise
+    assert window.scratch is None
+
+
+def test_retry_uses_a_separate_scratch_subdirectory(window, tmp_path, monkeypatch):
+    """Reusing the first run's directory would collide with its intermediates."""
+    from consolidator.gui import main_window as mw
+
+    captured = {}
+
+    class FakeWorker:
+        def __init__(self, sources, scratch, policy, parent=None, policy_for=None):
+            captured["scratch"] = scratch
+            captured["sources"] = list(sources)
+
+        def start(self):
+            captured["started"] = True
+
+        def isRunning(self):        # consulted by MainWindow.closeEvent
+            return False
+
+        def cancel(self):
+            pass
+
+        def wait(self, *_a):
+            return True
+
+        # Signal stand-ins so connect() succeeds.
+        class _Sig:
+            def connect(self, *_a, **_k):
+                pass
+
+        progressed = _Sig()
+        completed = _Sig()
+        crashed = _Sig()
+
+    monkeypatch.setattr(mw, "ConversionWorker", FakeWorker)
+
+    window.scratch = tmp_path
+    (tmp_path / "retry0").mkdir()          # pretend a retry already happened
+    window.retry_sources([Path("a.doc")])
+
+    assert captured["started"]
+    assert captured["scratch"] == tmp_path / "retry1"
+    assert captured["scratch"].name != "retry0"
+
