@@ -183,6 +183,24 @@ def test_libreoffice_env_has_no_python_vars():
     assert env["TMP"] and env["TEMP"]
 
 
+@requires_lo
+def test_convert_one_leaves_no_scratch_behind(tmp_path, fixtures):
+    """Regression: LibreOffice marks its ~lock files read-only.
+
+    Windows refuses to delete a read-only file, so a plain rmtree fails with
+    WinError 5 and every conversion silently leaks its scratch directory.
+    """
+    import tempfile
+
+    root = Path(tempfile.gettempdir())
+    before = {p.name for p in root.glob("consolidator_lo_*")}
+
+    libreoffice.convert_one(fixtures / "memo.docx", tmp_path / "memo.pdf")
+
+    after = {p.name for p in root.glob("consolidator_lo_*")}
+    assert after == before, "scratch directories leaked: %s" % sorted(after - before)
+
+
 # ---------------------------------------------------------------- pipeline ----
 
 

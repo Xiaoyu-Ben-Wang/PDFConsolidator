@@ -95,7 +95,40 @@ def require_soffice() -> Path:
     return exe
 
 
+def _remove_tree(path: Path, attempts: int = 6, delay: float = 0.4) -> None:
+    """Remove a scratch directory, including LibreOffice's lock files.
+
+    Two obstacles, both silent under ``rmtree(ignore_errors=True)``:
+
+    * ``soffice`` can still hold its ``.~lock.<name>#`` file open for a moment
+      after it appears to have exited, so removal is retried briefly.
+    * It marks those lock files **read-only**, and Windows refuses to delete a
+      read-only file (``WinError 5``). The attribute must be cleared first -
+      otherwise every conversion leaves its scratch directory behind.
+    """
+    for _ in range(attempts):
+        if not path.exists():
+            return
+
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    os.chmod(os.path.join(root, name), 0o666)
+                except OSError:
+                    pass
+
+        shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            return
+        time.sleep(delay)
+
+
 def _profile_dir(workdir: Path) -> Path:
+    """A per-run LibreOffice user profile.
+
+    Two ``soffice`` processes sharing a profile fail *silently*, so every run
+    gets its own.
+    """
     profile = workdir / "lo_profile"
     profile.mkdir(parents=True, exist_ok=True)
     return profile
@@ -228,19 +261,27 @@ def convert_one(
     """Convert a single file to ``dest``.
 
     ``soffice`` always names its output after the input, so the file is converted
-    into a private directory and then moved into place.
+    into a private directory and then moved into place. A private directory this
+    function created is removed again; one the caller supplied is left alone.
     """
     src = Path(src)
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
+    owns_scratch = workdir is None
     scratch = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="consolidator_lo_"))
-    result = convert_batch([src], scratch, timeout=timeout)
 
-    produced = result.produced.get(str(src))
-    if not produced:
-        reason = result.failed.get(str(src), "conversion failed")
-        raise LibreOfficeError("%s: %s" % (src.name, reason))
+    try:
+        result = convert_batch([src], scratch, timeout=timeout)
 
-    shutil.move(produced, dest)
-    return dest
+        produced = result.produced.get(str(src))
+        if not produced:
+            reason = result.failed.get(str(src), "conversion failed")
+            raise LibreOfficeError("%s: %s" % (src.name, reason))
+
+        shutil.move(produced, dest)
+        return dest
+    finally:
+        if owns_scratch:
+            _remove_tree(scratch)
+
