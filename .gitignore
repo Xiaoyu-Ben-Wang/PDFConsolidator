@@ -27,7 +27,13 @@ dist/
 out/
 fixtures/out/
 fixtures/generated/
+fixtures/email/
+fixtures/msg/
 *.pdf.tmp
+
+# Vendored dependency cache (regenerate with tools/vendor.py)
+.vendor-cache/
+vendor/
 
 # Scratch directories. The system temp directory can be missing or unwritable,
 # in which case Python, pip and pytest fall back to the working directory and
