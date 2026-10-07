@@ -29,6 +29,21 @@ fixtures/out/
 fixtures/generated/
 *.pdf.tmp
 
+# Scratch directories. The system temp directory can be missing or unwritable,
+# in which case Python, pip and pytest fall back to the working directory and
+# leave these behind.
+.consolidator-scratch/
+pdfconsolidator/
+pytest-of-*/
+pip-metadata-*/
+pip-unpack-*/
+pip-install-*/
+pip-build-*/
+pip-target-*/
+ab_*/
+dbg_lo_*/
+consolidator_*/
+
 # ---- Editor / OS ----
 .vscode/
 .idea/

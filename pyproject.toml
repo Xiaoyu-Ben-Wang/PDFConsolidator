@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "consolidator"
+version = "0.1.0"
+description = "Convert a mixed folder of documents into a single merged PDF"
+requires-python = ">=3.10"
+dependencies = [
+    "pypdf>=6.0",
+    "img2pdf>=0.6",
+    "pillow>=10",
+    "reportlab>=4",
+]
+
+[project.scripts]
+consolidator = "consolidator.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
