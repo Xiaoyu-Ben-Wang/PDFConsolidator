@@ -146,6 +146,16 @@ def _cmd_check(args: argparse.Namespace) -> int:
     return 0 if exe else 1
 
 
+def _cmd_gui(args: argparse.Namespace) -> int:
+    try:
+        from .gui.app import run
+    except ImportError as exc:
+        print("The graphical interface needs PySide6: %s" % exc, file=sys.stderr)
+        print("Install it with: pip install PySide6-Essentials", file=sys.stderr)
+        return 3
+    return run(initial=args.paths or None)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="consolidator",
@@ -210,6 +220,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     check = sub.add_parser("check", help="report the detected conversion engine")
     check.set_defaults(func=_cmd_check)
+
+    gui = sub.add_parser("gui", help="launch the graphical interface")
+    gui.add_argument("paths", nargs="*", help="files or folders to preload")
+    gui.set_defaults(func=_cmd_gui)
 
     return parser
 

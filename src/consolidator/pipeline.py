@@ -10,6 +10,10 @@ Two things shape this module:
   than one invocation each. Staging with an index prefix also removes any chance
   of two files with the same name colliding, since ``soffice`` always names its
   output after its input.
+
+Conversion and assembly are separate entry points on purpose: the GUI converts
+once, then lets the user edit for as long as they like without repeating any of
+the expensive work.
 """
 
 from __future__ import annotations
@@ -126,56 +130,35 @@ def _convert_one_to_segment(
         )
 
 
-def build(
+def convert_sources(
     sources: list[Path],
-    dest: Path,
-    page_size_name: str = pages.DEFAULT_PAGE_SIZE,
-    margin_inches: float = 0.5,
-    bookmarks: bool = True,
+    workdir: Path,
     policy: email_items.ExtractionPolicy | None = None,
-    options: assemble.MergeOptions | None = None,
+    page_size: tuple[float, float] | None = None,
     on_event=None,
-    keep_scratch: bool = False,
-    scratch_dir: str | None = None,
 ) -> BuildReport:
-    """Convert every source into PDF segments, then merge them into ``dest``."""
+    """Convert sources into segments without assembling anything.
+
+    This is the expensive half, and the GUI calls it once and then edits freely.
+    ``workdir`` must outlive the result, because the segments it returns are
+    paths into it.
+    """
+    policy = policy or email_items.ExtractionPolicy()
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
 
     def emit(message: str) -> None:
         if on_event:
             on_event(message)
 
-    policy = policy or email_items.ExtractionPolicy()
-    dest = Path(dest).resolve()
-    target = pages.resolve(page_size_name)
-    margin = margin_inches * 72.0
-
-    if options is None:
-        options = assemble.MergeOptions()
-    options.page_size = target
-    options.margin = margin
-    options.bookmarks = bookmarks
-    if not options.title:
-        options.title = dest.stem
-
     started = time.time()
-    if scratch_dir:
-        scratch = Path(scratch_dir)
-        scratch.mkdir(parents=True, exist_ok=True)
-        owned_scratch = False
-    else:
-        root = choose_scratch(preferred_parent=dest.parent)
-        scratch = Path(tempfile.mkdtemp(prefix="run_", dir=str(root)))
-        owned_scratch = True
-
-    staging = scratch / "staging"
-    work = scratch / "out"
+    report = BuildReport(policy=policy)
+    staging = workdir / "staging"
+    work = workdir / "out"
     staging.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
 
-    report = BuildReport(policy=policy)
     results: dict[int, SourceResult] = {}
-
-    # Partition sources by how they must be handled.
     office_batch: list[tuple[int, Path, Path]] = []
     email_list: list[tuple[int, Path]] = []
     simple_list: list[tuple[int, Path]] = []
@@ -185,7 +168,9 @@ def build(
         ext = src.suffix.lower()
 
         if not src.exists():
-            results[index] = SourceResult(src, [Segment(src, src.stem, DOCUMENT, None, False, "file not found")])
+            results[index] = SourceResult(
+                src, [Segment(src, src.stem, DOCUMENT, None, False, "file not found")]
+            )
         elif ext in convert.KNOWN_UNSUPPORTED:
             results[index] = SourceResult(
                 src, [Segment(src, src.stem, DOCUMENT, None, False, convert.KNOWN_UNSUPPORTED[ext])]
@@ -274,7 +259,7 @@ def build(
                 item,
                 work / ("email%04d" % index),
                 policy,
-                page_size=target,
+                page_size=page_size,
                 body_pdf=Path(bodies[key]) if key in bodies else None,
                 body_error=body_errors.get(key) if key and key not in bodies else None,
                 on_event=emit,
@@ -284,13 +269,58 @@ def build(
     # ---- Everything else, one file at a time ----
     for index, src in simple_list:
         out_pdf = work / ("%04d_%s.pdf" % (index, src.stem))
-        segment = _convert_one_to_segment(src, out_pdf, staging, target)
+        segment = _convert_one_to_segment(src, out_pdf, staging, page_size)
         results[index] = SourceResult(src, [segment])
         emit("  %s   %s" % ("ok  " if segment.ok else "FAIL", src.name))
 
     report.sources = [results[i] for i in sorted(results)]
+    report.seconds = time.time() - started
+    return report
 
-    # ---- Phase B ----
+
+def build(
+    sources: list[Path],
+    dest: Path,
+    page_size_name: str = pages.DEFAULT_PAGE_SIZE,
+    margin_inches: float = 0.5,
+    bookmarks: bool = True,
+    policy: email_items.ExtractionPolicy | None = None,
+    options: assemble.MergeOptions | None = None,
+    on_event=None,
+    keep_scratch: bool = False,
+    scratch_dir: str | None = None,
+) -> BuildReport:
+    """Convert every source into PDF segments, then merge them into ``dest``."""
+
+    def emit(message: str) -> None:
+        if on_event:
+            on_event(message)
+
+    dest = Path(dest).resolve()
+    target = pages.resolve(page_size_name)
+    margin = margin_inches * 72.0
+
+    if options is None:
+        options = assemble.MergeOptions()
+    options.page_size = target
+    options.margin = margin
+    options.bookmarks = bookmarks
+    if not options.title:
+        options.title = dest.stem
+
+    started = time.time()
+    if scratch_dir:
+        scratch = Path(scratch_dir)
+        scratch.mkdir(parents=True, exist_ok=True)
+        owned_scratch = False
+    else:
+        root = choose_scratch(preferred_parent=dest.parent)
+        scratch = Path(tempfile.mkdtemp(prefix="run_", dir=str(root)))
+        owned_scratch = True
+
+    report = convert_sources(sources, scratch, policy=policy,
+                             page_size=target, on_event=on_event)
+
     entries = [
         assemble.MergeEntry(segment.pdf, segment.label)
         for segment in report.segments
@@ -313,3 +343,13 @@ def build(
         libreoffice._remove_tree(scratch)
 
     return report
+
+
+def count_pages(pdf: Path) -> int:
+    """Page count of a produced PDF, or 0 if it cannot be read."""
+    try:
+        from pypdf import PdfReader
+
+        return len(PdfReader(str(pdf)).pages)
+    except Exception:
+        return 0
