@@ -15,6 +15,7 @@ from pypdf import PdfWriter
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from consolidator.gui.document import DocumentModel, PageRef  # noqa: E402
+from consolidator.model import DOCUMENT  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -282,3 +283,146 @@ def test_policy_exclusions_are_not_failures():
 
     assert is_policy_exclusion(excluded)
     assert not is_policy_exclusion(failed)
+
+
+# ------------------------------------------------- row labels and grouping
+
+
+def test_row_label_leads_with_the_original_filename(tmp_path):
+    """The filename must lead the row so the column sorts and scans by source."""
+    from consolidator.gui.main_window import row_description
+    from consolidator.model import Segment
+
+    node = Segment(Path("Q3 report.docx"), "Q3 report", DOCUMENT, tmp_path / "a.pdf", True)
+    assert row_description(node, PageRef(0, 0), 3) == "3.  Q3 report.docx"
+
+
+def test_row_label_names_the_email_part(tmp_path):
+    """An email's body and attachments must be distinguishable, and the repeated
+    message stem must not be repeated on every row."""
+    from consolidator.gui.main_window import row_description
+    from consolidator.model import ATTACHMENT, Segment
+
+    node = Segment(Path("invoice.msg"), "invoice - invoice.pdf", ATTACHMENT,
+                   tmp_path / "a.pdf", True)
+    text = row_description(node, PageRef(0, 3), 7)
+    assert text.startswith("7.  invoice.msg")
+    assert "invoice.pdf" in text
+    assert text.count("invoice") == 2, "the message stem should not be repeated"
+
+
+def test_row_label_marks_rotation(tmp_path):
+    from consolidator.gui.main_window import row_description
+    from consolidator.model import Segment
+
+    node = Segment(Path("a.docx"), "a", DOCUMENT, tmp_path / "a.pdf", True)
+    page = PageRef(0, 0)
+    page.rotation = 90
+    assert "[90\u00b0]" in row_description(node, page, 1)
+
+
+def test_colour_is_stable_and_source_specific():
+    from consolidator.gui.main_window import source_colour
+
+    assert source_colour("a.docx") == source_colour("a.docx")
+    assert source_colour("a.docx") != source_colour("b.docx")
+
+
+# ------------------------------------------------ per-email extraction policy
+
+
+@pytest.fixture
+def window_with_emails(window, tmp_path):
+    """Two email sources, each with a one-page segment."""
+    from PySide6.QtCore import Qt
+
+    window.selected_sources = [Path("first.eml"), Path("second.eml")]
+    for name in ("first.eml", "second.eml"):
+        pdf = make_pdf(tmp_path / (name + ".pdf"), 1)
+        window.model.add_segment(Path(name), name, pdf, True, kind=DOCUMENT, page_count=1)
+    window.refresh_tree()
+    return window
+
+
+def _select_source(window, name: str):
+    for i in range(window.tree.topLevelItemCount()):
+        item = window.tree.topLevelItem(i)
+        if item.text(0) == name:
+            window.tree.setCurrentItem(item)
+            return
+    raise AssertionError("source %s not in the tree" % name)
+
+
+def test_policy_defaults_to_the_global_setting(window_with_emails):
+    window = window_with_emails
+    window.default_policy = window._policy_from_widgets()
+    assert window.policy_for(Path("first.eml")) is window.default_policy
+
+
+def test_each_email_keeps_its_own_policy(window_with_emails):
+    """The user asked for extraction to be decided email by email."""
+    window = window_with_emails
+
+    _select_source(window, "first.eml")
+    window.policy_checks["office"].setChecked(False)
+    first = window.policy_for(Path("first.eml"))
+    assert first.office is False
+
+    _select_source(window, "second.eml")
+    # The second email must still have the default.
+    assert window.policy_for(Path("second.eml")).office is True
+    assert window.policy_checks["office"].isChecked() is True
+
+    window.policy_checks["embedded"].setChecked(True)
+    second = window.policy_for(Path("second.eml"))
+    assert second.embedded is True
+
+    # And the first email is unchanged.
+    assert window.policy_for(Path("first.eml")).office is False
+    assert window.policy_for(Path("first.eml")).embedded is False
+
+
+def test_selecting_an_email_loads_its_policy_into_the_checkboxes(window_with_emails):
+    window = window_with_emails
+
+    _select_source(window, "first.eml")
+    window.policy_checks["pdf"].setChecked(False)
+
+    _select_source(window, "second.eml")
+    assert window.policy_checks["pdf"].isChecked() is True
+
+    _select_source(window, "first.eml")
+    assert window.policy_checks["pdf"].isChecked() is False
+
+
+def test_non_email_selection_edits_the_default(window_with_emails, tmp_path):
+    window = window_with_emails
+    window.selected_sources.append(Path("plain.docx"))
+    pdf = make_pdf(tmp_path / "plain.pdf", 1)
+    window.model.add_segment(Path("plain.docx"), "plain", pdf, True, page_count=1)
+    window.refresh_tree()
+
+    _select_source(window, "plain.docx")
+    window.policy_checks["other"].setChecked(True)
+    assert window.default_policy.other is True
+    assert "Default for newly added emails" in window.lbl_policy_scope.text()
+
+
+def test_apply_to_all_emails_resets_overrides(window_with_emails):
+    window = window_with_emails
+
+    _select_source(window, "first.eml")
+    window.policy_checks["office"].setChecked(False)
+    assert window.source_policies
+
+    _select_source(window, "second.eml")
+    window.apply_policy_to_all_emails()
+    assert window.source_policies == {}
+    assert window.policy_for(Path("first.eml")) is window.default_policy
+
+
+def test_scope_label_names_the_selected_email(window_with_emails):
+    window = window_with_emails
+    _select_source(window, "first.eml")
+    assert "first.eml" in window.lbl_policy_scope.text()
+

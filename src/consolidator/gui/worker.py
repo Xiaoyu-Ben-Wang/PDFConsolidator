@@ -23,11 +23,13 @@ class ConversionWorker(QThread):
     crashed = Signal(str)
 
     def __init__(self, sources: list[Path], scratch: Path,
-                 policy: email_items.ExtractionPolicy, parent=None) -> None:
+                 policy: email_items.ExtractionPolicy, parent=None,
+                 policy_for=None) -> None:
         super().__init__(parent)
         self.sources = [Path(s) for s in sources]
         self.scratch = Path(scratch)
         self.policy = policy
+        self.policy_for = policy_for
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -44,6 +46,7 @@ class ConversionWorker(QThread):
                 policy=self.policy,
                 page_size=None,
                 on_event=self.progressed.emit,
+                policy_for=self.policy_for,
             )
             self.completed.emit(report)
         except Exception:

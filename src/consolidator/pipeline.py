@@ -136,16 +136,28 @@ def convert_sources(
     policy: email_items.ExtractionPolicy | None = None,
     page_size: tuple[float, float] | None = None,
     on_event=None,
+    policy_for=None,
 ) -> BuildReport:
     """Convert sources into segments without assembling anything.
 
     This is the expensive half, and the GUI calls it once and then edits freely.
     ``workdir`` must outlive the result, because the segments it returns are
     paths into it.
+
+    ``policy_for`` optionally supplies a per-source policy, so what gets extracted
+    can be decided separately for each email rather than globally for the batch.
     """
     policy = policy or email_items.ExtractionPolicy()
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
+
+    def policy_of(source: Path):
+        if policy_for is None:
+            return policy
+        try:
+            return policy_for(source) or policy
+        except Exception:
+            return policy
 
     def emit(message: str) -> None:
         if on_event:
@@ -235,7 +247,7 @@ def convert_sources(
                 continue
 
             html_path = None
-            if policy.body:
+            if policy_of(src).body:
                 html_path = email_items.write_body_html(
                     item, body_dir / ("email%04d_body.html" % index)
                 )
@@ -258,7 +270,7 @@ def convert_sources(
             segments = email_items.expand_to_segments(
                 item,
                 work / ("email%04d" % index),
-                policy,
+                policy_of(src),
                 page_size=page_size,
                 body_pdf=Path(bodies[key]) if key in bodies else None,
                 body_error=body_errors.get(key) if key and key not in bodies else None,

@@ -5,13 +5,15 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import QFileInfo, Qt, QSize
 from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFileIconProvider,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -31,20 +33,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import assemble, email_items, pages, pipeline
+from .. import assemble, convert, email_items, pages, pipeline
 from .document import DocumentModel
 from .thumbs import ThumbnailCache
 from .worker import ConversionWorker, MergeWorker, ThumbnailWorker
 
-KIND_LABELS = {"document": "document", "body": "message body", "attachment": "attachment"}
-
 POLICY_EXCLUSION = "excluded by the extraction policy"
 
-# Row height and thumbnail size in the vertical page column.
+# Row metrics. The page column is deliberately compact so more pages fit.
 LIST_THUMB_W = 64
 LIST_THUMB_H = 84
 ROW_HEIGHT = 92
 PREVIEW_HEIGHT = 640
+TREE_ROW_HEIGHT = 20
+TREE_ICON = 16
+
+# How each kind of segment is described in a row.
+KIND_SUFFIX = {"body": "body", "attachment": "attachment", "document": ""}
 
 
 def is_policy_exclusion(segment) -> bool:
@@ -65,24 +70,36 @@ def source_colour(key: str) -> QColor:
     """
     digest = hashlib.md5(str(key).encode("utf-8", "replace")).digest()
     hue = digest[0] * 359 // 255
-    # Light enough that the black label stays readable on top.
     return QColor.fromHsv(hue, 55, 246)
 
 
+def part_name(node) -> str:
+    """The part of a segment, without the repeated source stem.
+
+    ``with_pdf.eml`` plus the label ``with_pdf - invoice.pdf`` yields
+    ``invoice.pdf``, which is what the row should show.
+    """
+    label = node.label or ""
+    prefix = node.source.stem + " - "
+    if label.startswith(prefix):
+        return label[len(prefix):]
+    return label
+
+
 def row_description(node, page, position: int) -> str:
-    """One line identifying a page and where it came from."""
+    """One line naming a page and the file it came from.
+
+    The original filename always leads, so the column sorts and scans by source,
+    with the particular part of an email appended after an arrow.
+    """
     if node is None:
         return "%d.  (unknown)" % position
-    # For a plain document the label is the file stem, so showing the full name
-    # with its extension is more informative. For an email segment the label
-    # already names the message and the part.
-    if node.label == node.source.stem:
-        origin = node.source.name
-    else:
-        origin = node.label
-    text = "%d.  %s" % (position, origin)
+
+    text = "%d.  %s" % (position, node.source.name)
+    if node.kind != "document":
+        text += "  \u2192  %s" % part_name(node)
     if page.rotation:
-        text += "   [%d°]" % page.rotation
+        text += "   [%d\u00b0]" % page.rotation
     return text
 
 
@@ -90,12 +107,20 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("PDF Consolidator")
-        self.resize(1180, 780)
+        self.resize(1240, 820)
 
         self.model = DocumentModel()
         self.thumbs = ThumbnailCache()
+        self.icon_provider = QFileIconProvider()
         self.selected_sources: list[Path] = []
         self.scratch: Path | None = None
+        self.output_path: Path | None = None
+
+        # Extraction settings. The checkboxes edit the default policy, or the
+        # policy of the email currently selected in the tree.
+        self.default_policy = email_items.ExtractionPolicy()
+        self.source_policies: dict[str, email_items.ExtractionPolicy] = {}
+        self._loading_policy = False
 
         self._conversion: ConversionWorker | None = None
         self._merge: MergeWorker | None = None
@@ -103,7 +128,9 @@ class MainWindow(QMainWindow):
 
         self._build_toolbar()
         self._build_body()
+        self._build_options()
         self._build_status()
+        self._load_policy_into_widgets(self.default_policy)
         self._update_actions()
 
     # ------------------------------------------------------------------ UI
@@ -113,16 +140,15 @@ class MainWindow(QMainWindow):
         bar.setMovable(False)
         self.addToolBar(bar)
 
-        self.act_add_files = QAction("Add Files…", self)
+        self.act_add_files = QAction("Add Files\u2026", self)
         self.act_add_files.triggered.connect(self.add_files)
         bar.addAction(self.act_add_files)
 
-        self.act_add_folder = QAction("Add Folder…", self)
+        self.act_add_folder = QAction("Add Folder\u2026", self)
         self.act_add_folder.triggered.connect(self.add_folder)
         bar.addAction(self.act_add_folder)
 
         bar.addSeparator()
-
         self.act_remove = QAction("Remove", self)
         self.act_remove.triggered.connect(self.remove_selected_sources)
         bar.addAction(self.act_remove)
@@ -152,9 +178,17 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(QLabel("Sources"))
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Source", "Pages"])
-        self.tree.setColumnWidth(0, 280)
-        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.tree.setColumnWidth(0, 250)
+        self.tree.setIconSize(QSize(TREE_ICON, TREE_ICON))
+        self.tree.setIndentation(14)
+        self.tree.setRootIsDecorated(True)
+        self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        # Compact rows: the default padding wastes a lot of vertical space.
+        self.tree.setStyleSheet(
+            "QTreeWidget::item { height: %dpx; padding: 0px; }" % TREE_ROW_HEIGHT
+        )
         self.tree.itemChanged.connect(self._on_tree_item_changed)
+        self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
         left_layout.addWidget(self.tree)
         splitter.addWidget(left)
 
@@ -166,14 +200,14 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         header.addWidget(QLabel("Pages"))
         header.addStretch(1)
-        for label, slot in (("⟲ Left", lambda: self.rotate_selected(-90)),
-                            ("⟳ Right", lambda: self.rotate_selected(90)),
-                            ("180°", lambda: self.rotate_selected(180))):
+        for label, slot in (("\u21ba Left", lambda: self.rotate_selected(-90)),
+                            ("\u21b3 Right", lambda: self.rotate_selected(90)),
+                            ("180\u00b0", lambda: self.rotate_selected(180))):
             button = QPushButton(label)
             button.clicked.connect(slot)
             header.addWidget(button)
-        for label, slot in (("▲", self.move_selected_up),
-                            ("▼", self.move_selected_down),
+        for label, slot in (("\u25b2", self.move_selected_up),
+                            ("\u25bc", self.move_selected_down),
                             ("Duplicate", self.duplicate_selected),
                             ("Delete", self.delete_selected)):
             button = QPushButton(label)
@@ -188,7 +222,6 @@ class MainWindow(QMainWindow):
         header.addWidget(group_button)
         right_layout.addLayout(header)
 
-        # A single vertical column of pages, with a large preview beside it.
         pages_split = QSplitter(Qt.Horizontal)
 
         self.page_list = QListWidget()
@@ -209,7 +242,7 @@ class MainWindow(QMainWindow):
         preview_layout.setContentsMargins(0, 0, 0, 0)
         self.preview = QLabel("Select a page to preview it")
         self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setMinimumWidth(280)
+        self.preview.setMinimumWidth(260)
         self.preview.setStyleSheet("QLabel { background: #303030; color: #c8c8c8; }")
         preview_layout.addWidget(self.preview, 1)
         self.preview_caption = QLabel("")
@@ -220,91 +253,112 @@ class MainWindow(QMainWindow):
 
         pages_split.setStretchFactor(0, 3)
         pages_split.setStretchFactor(1, 2)
-        pages_split.setSizes([560, 340])
+        pages_split.setSizes([600, 340])
         right_layout.addWidget(pages_split, 1)
         splitter.addWidget(right)
 
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([420, 760])
+        splitter.setSizes([430, 810])
 
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(splitter, 1)
-        layout.addWidget(self._build_options())
         self.setCentralWidget(central)
 
-    def _build_options(self) -> QWidget:
+    def _build_options(self) -> None:
+        central = self.centralWidget()
+        central.layout().addWidget(self._options_widget())
+
+    def _options_widget(self) -> QWidget:
         box = QGroupBox("Options")
         outer = QHBoxLayout(box)
+        outer.setSpacing(10)
 
-        # Email extraction checklist.
-        email_box = QGroupBox("Extract from email items")
+        # ---------------- email extraction ----------------
+        email_box = QGroupBox()
         email_layout = QVBoxLayout(email_box)
-        self.chk_body = QCheckBox("Message body")
-        self.chk_pdf = QCheckBox("PDF documents")
-        self.chk_images = QCheckBox("Images (excludes inline)")
-        self.chk_office = QCheckBox("Office documents")
-        self.chk_embedded = QCheckBox("Embedded messages")
-        self.chk_other = QCheckBox("Other attachments (listed only)")
-        for widget, on in ((self.chk_body, True), (self.chk_pdf, True),
-                           (self.chk_images, True), (self.chk_office, True),
-                           (self.chk_embedded, False), (self.chk_other, False)):
-            widget.setChecked(on)
-            email_layout.addWidget(widget)
-        outer.addWidget(email_box)
+        email_layout.setSpacing(4)
 
-        # Layout.
+        self.lbl_policy_scope = QLabel()
+        self.lbl_policy_scope.setWordWrap(True)
+        email_layout.addWidget(self.lbl_policy_scope)
+
+        self.policy_checks: dict[str, QCheckBox] = {}
+        for key, label in (
+            ("body", "Message body"),
+            ("pdf", "PDF documents"),
+            ("images", "Images (excludes inline)"),
+            ("office", "Office documents"),
+            ("embedded", "Embedded messages"),
+            ("other", "Other attachments (listed only)"),
+        ):
+            check = QCheckBox(label)
+            check.stateChanged.connect(self._on_policy_toggled)
+            email_layout.addWidget(check)
+            self.policy_checks[key] = check
+
+        apply_all = QPushButton("Apply to all emails")
+        apply_all.setToolTip("Give every Outlook item and email these settings")
+        apply_all.clicked.connect(self.apply_policy_to_all_emails)
+        email_layout.addWidget(apply_all)
+        outer.addWidget(email_box, 2)
+
+        # ---------------- layout ----------------
         layout_box = QGroupBox("Layout")
-        grid = QVBoxLayout(layout_box)
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Page size:"))
+        grid = QGridLayout(layout_box)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+
+        grid.addWidget(QLabel("Page size:"), 0, 0)
         self.cmb_page_size = QComboBox()
-        self.cmb_page_size.addItems([name for name in ("letter", "a4", "legal", "original")])
+        self.cmb_page_size.addItems(["letter", "a4", "legal", "original"])
         self.cmb_page_size.setCurrentText(pages.DEFAULT_PAGE_SIZE)
-        row1.addWidget(self.cmb_page_size)
-        row1.addWidget(QLabel("Numbers:"))
+        grid.addWidget(self.cmb_page_size, 0, 1)
+
+        grid.addWidget(QLabel("Numbers:"), 0, 2)
         self.cmb_numbering = QComboBox()
         self.cmb_numbering.addItems(["none", "continuous", "per-document"])
-        row1.addWidget(self.cmb_numbering)
-        row1.addWidget(QLabel("Separator:"))
+        grid.addWidget(self.cmb_numbering, 0, 3)
+
+        grid.addWidget(QLabel("Separator:"), 0, 4)
         self.cmb_separator = QComboBox()
         self.cmb_separator.addItems(["none", "blank", "title"])
-        row1.addWidget(self.cmb_separator)
-        grid.addLayout(row1)
+        grid.addWidget(self.cmb_separator, 0, 5)
 
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("Footer:"))
+        grid.addWidget(QLabel("Footer:"), 1, 0)
         self.edt_footer = QLineEdit("{doc}")
-        self.edt_footer.setPlaceholderText("e.g. {doc} - page {n} of {total}")
-        row2.addWidget(self.edt_footer, 1)
+        self.edt_footer.setPlaceholderText("{doc}  {n}  {total}  {date}")
+        grid.addWidget(self.edt_footer, 1, 1, 1, 4)
+
         self.chk_bookmarks = QCheckBox("Bookmarks")
         self.chk_bookmarks.setChecked(True)
-        row2.addWidget(self.chk_bookmarks)
-        grid.addLayout(row2)
-        outer.addWidget(layout_box, 1)
+        grid.addWidget(self.chk_bookmarks, 1, 5)
 
-        # Output.
+        for column in (1, 3, 5):
+            grid.setColumnStretch(column, 1)
+        outer.addWidget(layout_box, 3)
+
+        # ---------------- output ----------------
         out_box = QGroupBox("Output")
         out_layout = QVBoxLayout(out_box)
-        row3 = QHBoxLayout()
-        self.edt_output = QLineEdit()
-        self.edt_output.setPlaceholderText("destination PDF…")
-        row3.addWidget(self.edt_output, 1)
-        browse = QPushButton("Browse…")
-        browse.clicked.connect(self.choose_output)
-        row3.addWidget(browse)
-        out_layout.addLayout(row3)
 
-        row4 = QHBoxLayout()
-        row4.addStretch(1)
+        self.btn_output = QPushButton("Save as\u2026")
+        self.btn_output.setToolTip("Choose where to write the merged PDF")
+        self.btn_output.clicked.connect(self.choose_output)
+        out_layout.addWidget(self.btn_output)
+
+        self.lbl_output = QLabel("No destination chosen")
+        self.lbl_output.setWordWrap(True)
+        self.lbl_output.setStyleSheet("QLabel { color: #555; }")
+        out_layout.addWidget(self.lbl_output)
+
+        out_layout.addStretch(1)
         self.btn_create = QPushButton("Create PDF")
-        self.btn_create.setDefault(True)
         self.btn_create.clicked.connect(self.create_pdf)
-        row4.addWidget(self.btn_create)
-        out_layout.addLayout(row4)
-        outer.addWidget(out_box)
+        out_layout.addWidget(self.btn_create)
+        outer.addWidget(out_box, 2)
 
         return box
 
@@ -312,16 +366,86 @@ class MainWindow(QMainWindow):
         self.status = self.statusBar()
         self.progress = QProgressBar()
         self.progress.setMaximumWidth(220)
-        self.progress.setRange(0, 0)      # indeterminate until work starts
+        self.progress.setRange(0, 0)
         self.progress.setVisible(False)
         self.status.addPermanentWidget(self.progress)
         self.status.showMessage("Add files or a folder to begin.")
 
+    # ------------------------------------------------- extraction policies
+
+    def _load_policy_into_widgets(self, policy: email_items.ExtractionPolicy) -> None:
+        self._loading_policy = True
+        for key, check in self.policy_checks.items():
+            check.setChecked(bool(getattr(policy, key, False)))
+        self._loading_policy = False
+
+    def _policy_from_widgets(self) -> email_items.ExtractionPolicy:
+        return email_items.ExtractionPolicy(
+            **{key: check.isChecked() for key, check in self.policy_checks.items()}
+        )
+
+    def selected_email(self) -> Path | None:
+        """The email source currently selected in the tree, if any."""
+        items = self.tree.selectedItems()
+        if not items:
+            return None
+        item = items[0]
+        root = item
+        while root.parent() is not None:
+            root = root.parent()
+        path = root.data(0, Qt.UserRole)
+        if path is None:
+            return None
+        candidate = Path(path)
+        return candidate if candidate.suffix.lower() in convert.EMAIL_EXTS else None
+
+    def policy_for(self, source: Path) -> email_items.ExtractionPolicy:
+        """Per-source extraction policy, falling back to the default."""
+        override = self.source_policies.get(str(source))
+        return override or self.default_policy
+
+    def _on_tree_selection_changed(self) -> None:
+        email = self.selected_email()
+        if email is None:
+            self.lbl_policy_scope.setText(
+                "<b>Extract from email items</b><br>"
+                "<span style='color:#666'>Default for newly added emails.</span>"
+            )
+            self._load_policy_into_widgets(self.default_policy)
+        else:
+            self.lbl_policy_scope.setText(
+                "<b>Extract from email items</b><br>"
+                "<span style='color:#666'>Editing: <b>%s</b></span>" % email.name
+            )
+            self._load_policy_into_widgets(self.policy_for(email))
+
+    def _on_policy_toggled(self, *_args) -> None:
+        if self._loading_policy:
+            return
+        policy = self._policy_from_widgets()
+        email = self.selected_email()
+        if email is None:
+            self.default_policy = policy
+        else:
+            self.source_policies[str(email)] = policy
+            self.status.showMessage("Extraction updated for %s." % email.name)
+
+    def apply_policy_to_all_emails(self) -> None:
+        policy = self._policy_from_widgets()
+        self.default_policy = policy
+        self.source_policies.clear()
+        self.status.showMessage("Extraction settings applied to all emails.")
+
     # -------------------------------------------------------------- sources
 
+    def file_icon(self, path: Path) -> QIcon:
+        """The real Windows icon for this file type, via the shell."""
+        try:
+            return self.icon_provider.icon(QFileInfo(str(path)))
+        except Exception:
+            return QIcon()
+
     def add_files(self) -> None:
-        # Native Windows dialog: no DontUseNativeDialog, so Quick Access,
-        # mapped drives and shell extensions all work.
         names, _ = QFileDialog.getOpenFileNames(
             self, "Add files", "",
             "All supported (*.pdf *.docx *.doc *.rtf *.odt *.xlsx *.xls *.ods "
@@ -354,18 +478,18 @@ class MainWindow(QMainWindow):
         self._update_actions()
 
     def remove_selected_sources(self) -> None:
-        chosen = {self.tree.indexOfTopLevelItem(item) for item in self.tree.selectedItems()}
-        # Removing a child removes its whole source, which is the least
-        # surprising behaviour.
-        top = set()
-        for item in self.tree.selectedItems():
+        items = self.tree.selectedItems()
+        if not items:
+            return
+        roots = []
+        for item in items:
             root = item
             while root.parent() is not None:
                 root = root.parent()
-            top.add(root.text(0))
-        if not top:
-            return
-        self.selected_sources = [p for p in self.selected_sources if p.name not in top]
+            roots.append(root)
+        doomed = {root.data(0, Qt.UserRole) for root in roots if root.data(0, Qt.UserRole)}
+
+        self.selected_sources = [p for p in self.selected_sources if str(p) not in doomed]
         self.refresh_tree()
         self._update_actions()
 
@@ -373,6 +497,7 @@ class MainWindow(QMainWindow):
         self.selected_sources.clear()
         self.model.clear()
         self.thumbs.clear()
+        self.source_policies.clear()
         if self.scratch and self.scratch.exists():
             from .. import libreoffice
 
@@ -411,42 +536,61 @@ class MainWindow(QMainWindow):
         for segment in self.model.segments:
             by_source.setdefault(str(segment.source), []).append(segment)
 
-        ordered = sorted(self.selected_sources, key=self._sort_key)
-        for path in ordered:
+        for path in sorted(self.selected_sources, key=self._sort_key):
             root = QTreeWidgetItem(self.tree, [path.name, ""])
             root.setToolTip(0, str(path))
+            root.setIcon(0, self.file_icon(path))
+            root.setData(0, Qt.UserRole, str(path))
             root.setFlags(root.flags() | Qt.ItemIsUserCheckable)
             root.setCheckState(0, Qt.Checked)
 
-            segments = by_source.pop(str(path), [])
-            for segment in segments:
-                child = QTreeWidgetItem(root, ["  " + segment.label,
-                                               str(segment.page_count) if segment.ok else "—"])
-                child.setToolTip(0, segment.detail or segment.label)
+            for segment in by_source.pop(str(path), []):
                 if segment.ok:
+                    label = "  " + part_name(segment)
+                    child = QTreeWidgetItem(root, [label, str(segment.page_count)])
+                    child.setToolTip(0, segment.label)
                     child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
                     child.setCheckState(0, Qt.Checked if segment.enabled else Qt.Unchecked)
                     child.setData(0, Qt.UserRole, segment.id)
                 else:
+                    child = QTreeWidgetItem(
+                        root, ["  %s (%s)" % (part_name(segment), segment.detail or "failed"), "\u2014"]
+                    )
                     child.setForeground(0, Qt.gray)
-                    child.setText(0, "  %s (%s)" % (segment.label, segment.detail or "failed"))
+                    child.setToolTip(0, segment.detail)
             root.setExpanded(True)
 
-        # Segments whose source is no longer in the selection still need showing.
+        # Segments left over (their source was removed) still need showing.
         for source, segments in by_source.items():
             root = QTreeWidgetItem(self.tree, [Path(source).name, ""])
             root.setForeground(0, Qt.gray)
             for segment in segments:
-                QTreeWidgetItem(root, ["  " + segment.label, str(segment.page_count)])
+                QTreeWidgetItem(root, ["  " + part_name(segment), str(segment.page_count)])
             root.setExpanded(True)
 
         self.tree.blockSignals(False)
+        self._on_tree_selection_changed()
 
     def _on_tree_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        # A source-level checkbox toggles all of its segments at once.
         segment_id = item.data(0, Qt.UserRole)
-        if segment_id is None:
+        if isinstance(segment_id, int):
+            self.model.set_segment_enabled(segment_id, item.checkState(0) == Qt.Checked)
+            self.refresh_pages()
             return
-        self.model.set_segment_enabled(segment_id, item.checkState(0) == Qt.Checked)
+
+        path = item.data(0, Qt.UserRole)
+        if path is None:
+            return
+        wanted = item.checkState(0) == Qt.Checked
+        self.tree.blockSignals(True)
+        for index in range(item.childCount()):
+            child = item.child(index)
+            child_id = child.data(0, Qt.UserRole)
+            if isinstance(child_id, int):
+                child.setCheckState(0, Qt.Checked if wanted else Qt.Unchecked)
+                self.model.set_segment_enabled(child_id, wanted)
+        self.tree.blockSignals(False)
         self.refresh_pages()
 
     # ---------------------------------------------------------------- pages
@@ -469,7 +613,7 @@ class MainWindow(QMainWindow):
                                page.index + 1,
                                node.page_count if node else 0))
             # The row tint identifies the originating file, so pages from one
-            # document are obvious as a block even before they are grouped.
+            # document read as a block even before they are grouped.
             item.setBackground(QBrush(tint))
             item.setForeground(QBrush(QColor("#202020")))
             item.setSizeHint(QSize(0, ROW_HEIGHT))
@@ -509,8 +653,7 @@ class MainWindow(QMainWindow):
 
     def _on_thumbnail(self, position: int, image) -> None:
         if 0 <= position < self.page_list.count():
-            item = self.page_list.item(position)
-            item.setIcon(QIcon(QPixmap.fromImage(image)))
+            self.page_list.item(position).setIcon(QIcon(QPixmap.fromImage(image)))
 
     # -------------------------------------------------------------- preview
 
@@ -518,7 +661,6 @@ class MainWindow(QMainWindow):
         self._update_preview()
 
     def _update_preview(self) -> None:
-        """Show a large render of the selected page, or clear the pane."""
         indices = self.selected_page_indices()
         if not indices:
             self.preview.setPixmap(QPixmap())
@@ -542,28 +684,26 @@ class MainWindow(QMainWindow):
             self.preview.setText("")
             self.preview.setPixmap(QPixmap.fromImage(image))
 
-        extra = ""
-        if len(indices) > 1:
-            extra = "   (+%d more selected)" % (len(indices) - 1)
-        rotation = "   rotated %d°" % page.rotation if page.rotation else ""
+        extra = "   (+%d more selected)" % (len(indices) - 1) if len(indices) > 1 else ""
+        rotation = "   rotated %d\u00b0" % page.rotation if page.rotation else ""
         self.preview_caption.setText(
             "Page %d of %d\n%s%s%s"
-            % (position + 1, self.model.page_count, node.label, rotation, extra)
+            % (position + 1, self.model.page_count, node.source.name, rotation, extra)
         )
 
     def selected_page_indices(self) -> list[int]:
         return sorted(self.page_list.row(item) for item in self.page_list.selectedItems())
 
     def _on_pages_reordered(self, *_args) -> None:
-        """Adopt the order the user dragged the grid into."""
+        """Adopt the order the user dragged the list into."""
+        from .document import PageRef
+
         reordered = []
         for row in range(self.page_list.count()):
             data = self.page_list.item(row).data(Qt.UserRole)
             if data is None:
                 continue
             segment_id, index, rotation = data
-            from .document import PageRef
-
             reordered.append(PageRef(segment_id, index, rotation))
         if len(reordered) == len(self.model.pages):
             self.model.pages = reordered
@@ -644,28 +784,18 @@ class MainWindow(QMainWindow):
         self.thumbs.clear()
         self.refresh_pages()
 
-        policy = self._policy()
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
         self.act_convert.setEnabled(False)
 
         self._conversion = ConversionWorker(
-            self.selected_sources, self.scratch, policy, self
+            self.selected_sources, self.scratch, self.default_policy, self,
+            policy_for=self.policy_for,
         )
         self._conversion.progressed.connect(self.status.showMessage)
         self._conversion.completed.connect(self._on_converted)
         self._conversion.crashed.connect(self._on_worker_crash)
         self._conversion.start()
-
-    def _policy(self) -> email_items.ExtractionPolicy:
-        return email_items.ExtractionPolicy(
-            body=self.chk_body.isChecked(),
-            pdf=self.chk_pdf.isChecked(),
-            images=self.chk_images.isChecked(),
-            office=self.chk_office.isChecked(),
-            embedded=self.chk_embedded.isChecked(),
-            other=self.chk_other.isChecked(),
-        )
 
     def _on_converted(self, report) -> None:
         self.progress.setVisible(False)
@@ -680,13 +810,9 @@ class MainWindow(QMainWindow):
                     segment.ok,
                     kind=segment.kind,
                     detail=segment.detail,
-                    page_count=pipeline.count_pages(segment.pdf) if segment.ok and segment.pdf else 0,
+                    page_count=pipeline.count_pages(segment.pdf)
+                    if segment.ok and segment.pdf else 0,
                 )
-
-        # Segments produced for sources not in the visible list still belong.
-        for source_result in report.sources:
-            if source_result.source not in self.selected_sources:
-                self.selected_sources.append(source_result.source)
 
         self.refresh_tree()
         self.refresh_pages()
@@ -708,7 +834,7 @@ class MainWindow(QMainWindow):
         for segment in failures[:14]:
             lines.append("%s\n    %s" % (segment.display, segment.detail or "failed"))
         if len(failures) > 14:
-            lines.append("… and %d more" % (len(failures) - 14))
+            lines.append("\u2026 and %d more" % (len(failures) - 14))
 
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
@@ -735,41 +861,46 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- output
 
     def choose_output(self) -> None:
-        name, _ = QFileDialog.getSaveFileName(self, "Save merged PDF", "", "PDF (*.pdf)")
-        if name:
-            self.edt_output.setText(name)
+        """Pick the destination with the native Windows save dialog."""
+        start = str(self.output_path) if self.output_path else "consolidated.pdf"
+        name, _ = QFileDialog.getSaveFileName(
+            self, "Save merged PDF as", start, "PDF (*.pdf)"
+        )
+        if not name:
+            return
+        path = Path(name)
+        if path.suffix.lower() != ".pdf":
+            path = path.with_suffix(".pdf")
+        self.output_path = path
+        self.lbl_output.setText(str(path))
+        self.status.showMessage("Output set to %s" % path.name)
 
     def create_pdf(self) -> None:
         if not self.model.pages:
-            QMessageBox.information(self, "Nothing to assemble",
-                                    "Convert some files first.")
+            QMessageBox.information(self, "Nothing to assemble", "Convert some files first.")
             return
-        dest = self.edt_output.text().strip()
-        if not dest:
+
+        if self.output_path is None:
             self.choose_output()
-            dest = self.edt_output.text().strip()
-            if not dest:
+            if self.output_path is None:
                 return
-        if not dest.lower().endswith(".pdf"):
-            dest += ".pdf"
 
         entries = self.model.to_entries()
         if not entries:
             QMessageBox.information(self, "Nothing to assemble", "No usable pages.")
             return
 
-        options = self._merge_options(Path(dest))
+        options = self._merge_options(self.output_path)
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
         self.btn_create.setEnabled(False)
 
-        self._merge = MergeWorker(entries, Path(dest), options, self)
+        self._merge = MergeWorker(entries, self.output_path, options, self)
         self._merge.completed.connect(self._on_merged)
         self._merge.crashed.connect(self._on_merge_crash)
         self._merge.start()
 
     def _merge_options(self, dest: Path) -> assemble.MergeOptions:
-        size = pages.resolve(self.cmb_page_size.currentText())
         numbering = assemble.PageNumbering(
             mode=self.cmb_numbering.currentText(),
             position="bottom-center",
@@ -777,12 +908,13 @@ class MainWindow(QMainWindow):
         )
         footer_text = self.edt_footer.text().strip()
         return assemble.MergeOptions(
-            page_size=size,
+            page_size=pages.resolve(self.cmb_page_size.currentText()),
             margin=36.0,
             bookmarks=self.chk_bookmarks.isChecked(),
             separator=self.cmb_separator.currentText(),
             numbering=numbering,
-            footer=assemble.HeaderFooter(center=footer_text) if footer_text else assemble.HeaderFooter(),
+            footer=assemble.HeaderFooter(center=footer_text)
+            if footer_text else assemble.HeaderFooter(),
             title=dest.stem,
         )
 
@@ -793,7 +925,9 @@ class MainWindow(QMainWindow):
         if report.separators:
             message += " including %d separator(s)" % report.separators
         self.status.showMessage(message + ".")
-        QMessageBox.information(self, "Done", "%s.\n\n%s" % (message, self.edt_output.text()))
+        QMessageBox.information(
+            self, "Done", "%s.\n\n%s" % (message, self.output_path)
+        )
 
     def _on_merge_crash(self, detail: str) -> None:
         self.progress.setVisible(False)
