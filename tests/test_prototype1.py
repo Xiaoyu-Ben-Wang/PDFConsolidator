@@ -227,3 +227,27 @@ def test_end_to_end_without_office(tmp_path, fixtures):
 
     assert not report.failed, [o.detail for o in report.failed]
     assert dest.exists()
+
+
+# ---------------------------------------------------------------- selftest ----
+
+
+@requires_lo
+def test_selftest_passes(tmp_path, monkeypatch):
+    """The self-test is how the frozen build proves itself, so it must pass."""
+    from consolidator import cli
+
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["selftest"]) == 0
+    assert (tmp_path / "selftest.log").exists()
+    assert "RESULT: PASS" in (tmp_path / "selftest.log").read_text(encoding="utf-8")
+
+
+def test_selftest_writes_a_log(tmp_path, monkeypatch):
+    from consolidator import cli
+
+    monkeypatch.chdir(tmp_path)
+    cli.main(["selftest"])
+    log = tmp_path / "selftest.log"
+    assert log.exists()
+    assert "LibreOffice" in log.read_text(encoding="utf-8")

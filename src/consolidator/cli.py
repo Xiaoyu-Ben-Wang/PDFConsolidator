@@ -77,17 +77,24 @@ def _cmd_build(args: argparse.Namespace) -> int:
         subject=args.subject,
     )
 
-    report = pipeline.build(
-        supported,
-        Path(args.output),
-        page_size_name=args.page_size,
-        margin_inches=args.margin,
-        bookmarks=not args.no_bookmarks,
-        policy=policy,
-        options=options,
-        on_event=lambda message: print(message, flush=True),
-        keep_scratch=args.keep_scratch,
-    )
+    try:
+        report = pipeline.build(
+            supported,
+            Path(args.output),
+            page_size_name=args.page_size,
+            margin_inches=args.margin,
+            bookmarks=not args.no_bookmarks,
+            policy=policy,
+            options=options,
+            on_event=lambda message: print(message, flush=True),
+            keep_scratch=args.keep_scratch,
+        )
+    except OSError as exc:
+        # Most often an unwritable destination; a traceback would only obscure it.
+        print()
+        print("Could not write the output: %s" % exc, file=sys.stderr)
+        print("Check that the destination folder exists and is writable.", file=sys.stderr)
+        return 1
 
     print()
     print("=" * 70)
@@ -144,6 +151,115 @@ def _cmd_check(args: argparse.Namespace) -> int:
         print("\n  Set CONSOLIDATOR_SOFFICE, or place a copy at")
         print("  <app>/libreoffice/program/soffice.exe")
     return 0 if exe else 1
+
+
+def _cmd_selftest(args: argparse.Namespace) -> int:
+    """Convert generated samples end to end and report.
+
+    Exists because the shipped build is a windowed executable with no console:
+    without this there is no way to prove that the frozen application can still
+    find its bundled LibreOffice and produce a PDF. Writes to stdout when there
+    is one, and always to ``selftest.log`` beside the executable.
+    """
+    import tempfile
+    import traceback
+
+    lines: list[str] = []
+
+    def say(message: str = "") -> None:
+        lines.append(message)
+        print(message, flush=True)
+
+    say("PDF Consolidator %s self-test" % __version__)
+    say("  python      : %s" % sys.version.split()[0])
+    say("  frozen      : %s" % bool(getattr(sys, "frozen", False)))
+    say("  executable  : %s" % sys.executable)
+
+    exe = libreoffice.find_soffice()
+    say("  LibreOffice : %s" % (exe or "NOT FOUND"))
+    if exe is None:
+        say()
+        say("RESULT: FAIL - no conversion engine")
+        _write_selftest_log(lines)
+        return 1
+
+    ok = True
+    try:
+        import io
+
+        from PIL import Image
+        from pypdf import PdfReader
+
+        work = Path(tempfile.mkdtemp(prefix="selftest_"))
+        say("  scratch     : %s" % work)
+
+        source_dir = work / "in"
+        source_dir.mkdir(parents=True, exist_ok=True)
+
+        # Plain text, an image, and an RTF document - the last one exercises
+        # LibreOffice, which is the part most likely to break in a bundle.
+        # (HTML is deliberately not an accepted input, so RTF stands in.)
+        (source_dir / "notes.txt").write_text("self test\n" * 40, encoding="utf-8")
+        Image.new("RGB", (600, 400), (200, 220, 240)).save(source_dir / "swatch.png")
+        (source_dir / "memo.rtf").write_text(
+            r"{\rtf1\ansi\deff0{\fonttbl{\f0 Calibri;}}"
+            r"\f0\fs28 Self test\par"
+            r"This paragraph proves LibreOffice converted it.\par"
+            r"}",
+            encoding="ascii",
+        )
+
+        dest = work / "out.pdf"
+        report = pipeline.build(
+            pipeline.gather([str(source_dir)]),
+            dest,
+            page_size_name="letter",
+        )
+
+        say("  converted   : %d/%d source(s), %d segment(s)"
+            % (len(report.succeeded), len(report.sources), len(report.segments)))
+        for result in report.failed:
+            ok = False
+            say("    FAILED %s: %s"
+                % (result.source.name,
+                   "; ".join(s.detail for s in result.segments if s.detail)))
+
+        if not dest.exists():
+            ok = False
+            say("  output      : MISSING")
+        else:
+            pages = len(PdfReader(str(dest)).pages)
+            say("  output      : %s, %d page(s), %d bytes"
+                % (dest.name, pages, dest.stat().st_size))
+            if pages < 3:
+                ok = False
+                say("    expected at least 3 pages")
+
+        import shutil as _shutil
+
+        _shutil.rmtree(work, ignore_errors=True)
+
+    except Exception:
+        ok = False
+        say("  EXCEPTION:")
+        for line in traceback.format_exc().splitlines():
+            say("    " + line)
+
+    say()
+    say("RESULT: %s" % ("PASS" if ok else "FAIL"))
+    _write_selftest_log(lines)
+    return 0 if ok else 1
+
+
+def _write_selftest_log(lines: list[str]) -> None:
+    try:
+        if getattr(sys, "frozen", False):
+            base = Path(sys.executable).parent
+        else:
+            base = Path.cwd()
+        (base / "selftest.log").write_text("\n".join(lines), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _cmd_gui(args: argparse.Namespace) -> int:
@@ -224,6 +340,11 @@ def build_parser() -> argparse.ArgumentParser:
     gui = sub.add_parser("gui", help="launch the graphical interface")
     gui.add_argument("paths", nargs="*", help="files or folders to preload")
     gui.set_defaults(func=_cmd_gui)
+
+    selftest = sub.add_parser(
+        "selftest", help="convert generated samples end to end and report"
+    )
+    selftest.set_defaults(func=_cmd_selftest)
 
     return parser
 

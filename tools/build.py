@@ -41,7 +41,38 @@ TRIM_PATHS = [
     "share/xslt",
     "share/autotext",
     "share/autocorr",
+    # Only used to benchmark OpenCL devices - and it caches a read-only lock
+    # file inside the bundle, which then blocks the next build's cleanup.
+    "program/opencl",
 ]
+
+
+def force_remove(path: Path) -> None:
+    """Remove a tree, clearing read-only attributes first.
+
+    LibreOffice marks its ``.~lock.*#`` files read-only, and Windows refuses to
+    delete a read-only file, so a plain ``rmtree`` fails with ``WinError 5``.
+    Running the bundled LibreOffice leaves exactly such a file behind, which is
+    what breaks a subsequent rebuild.
+    """
+    if not path.exists():
+        return
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                os.chmod(os.path.join(root, name), 0o666)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+    if path.exists():
+        time.sleep(1.0)          # a handle may still be closing
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    os.chmod(os.path.join(root, name), 0o666)
+                except OSError:
+                    pass
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def directory_size(path: Path) -> int:
@@ -106,7 +137,7 @@ def copy_libreoffice(bundle: Path, source: Path, trim: bool) -> int:
     destination = bundle / "libreoffice"
     if destination.exists():
         print("removing previous LibreOffice copy ...", flush=True)
-        shutil.rmtree(destination, ignore_errors=True)
+        force_remove(destination)
 
     print("copying LibreOffice from %s ..." % source, flush=True)
     shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=False)
@@ -141,6 +172,10 @@ def main(argv: list[str] | None = None) -> int:
 
     out_dir = Path(args.out)
     started = time.time()
+
+    # Clear any previous bundle before PyInstaller tries to clean it, since it
+    # does not cope with the read-only lock files LibreOffice leaves behind.
+    force_remove(out_dir / "PDFConsolidator")
 
     bundle = run_pyinstaller(out_dir)
     print("application bundle: %s" % human(directory_size(bundle)))

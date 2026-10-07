@@ -386,8 +386,19 @@ def merge(
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
-    with open(tmp, "wb") as handle:
-        writer.write(handle)
-    os.replace(tmp, dest)
+    try:
+        with open(tmp, "wb") as handle:
+            writer.write(handle)
+        os.replace(tmp, dest)
+    except OSError as exc:
+        # Never leave a half-written file where a complete one is expected.
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise OSError(
+            "could not write %s: %s" % (dest, getattr(exc, "strerror", exc) or exc)
+        ) from exc
 
     return report

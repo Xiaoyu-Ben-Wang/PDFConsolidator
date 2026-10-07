@@ -51,6 +51,9 @@ dbg_lo_*/
 consolidator_*/
 tmp*/
 run_*/
+selftest_*/
+selftest.log
+startup-error.log
 
 # ---- Editor / OS ----
 .vscode/
