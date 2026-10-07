@@ -221,26 +221,56 @@ def build(
                 )
                 emit("  FAIL %s - %s" % (src.name, reason))
 
-    # ---- Email items: parse, then expand into body + attachment segments ----
-    for index, src in email_list:
-        emit("Reading %s..." % src.name)
-        try:
-            item = email_items.read_message(src)
-        except Exception as exc:
-            results[index] = SourceResult(
-                src, [Segment(src, src.stem, DOCUMENT, None, False,
-                              "could not read message: %s: %s" % (type(exc).__name__, exc))]
-            )
-            emit("  FAIL %s - unreadable message" % src.name)
-            continue
+    # ---- Email items: parse, render all bodies in one batch, then expand ----
+    if email_list:
+        emit("Reading %d email item(s)..." % len(email_list))
+        parsed: list[tuple[int, Path, object, Path | None]] = []
+        body_dir = work / "bodies"
+        body_dir.mkdir(parents=True, exist_ok=True)
 
-        segments = email_items.expand_to_segments(
-            item, work / ("email%04d" % index), policy, page_size=target, on_event=emit
-        )
-        results[index] = SourceResult(src, segments)
-        kept = sum(1 for s in segments if s.ok)
-        emit("  %s: %d segment(s), %d attachment(s)"
-             % (src.name, kept, len(item.attachments)))
+        for index, src in email_list:
+            try:
+                item = email_items.read_message(src)
+            except Exception as exc:
+                results[index] = SourceResult(
+                    src,
+                    [Segment(src, src.stem, DOCUMENT, None, False,
+                             "could not read message: %s: %s" % (type(exc).__name__, exc))],
+                )
+                emit("  FAIL %s - unreadable message" % src.name)
+                continue
+
+            html_path = None
+            if policy.body:
+                html_path = email_items.write_body_html(
+                    item, body_dir / ("email%04d_body.html" % index)
+                )
+            parsed.append((index, src, item, html_path))
+            emit("  read %s (%d attachment(s))" % (src.name, len(item.attachments)))
+
+        # One LibreOffice invocation for every body: start-up dominates, and
+        # rendering them one at a time costs seconds per message.
+        bodies: dict[str, str] = {}
+        body_errors: dict[str, str] = {}
+        htmls = [h for _, _, _, h in parsed if h is not None]
+        if htmls:
+            emit("Rendering %d message body/bodies..." % len(htmls))
+            batch = libreoffice.convert_batch(htmls, body_dir, timeout=OFFICE_BATCH_TIMEOUT)
+            bodies = batch.produced
+            body_errors = batch.failed
+
+        for index, src, item, html_path in parsed:
+            key = str(html_path) if html_path else ""
+            segments = email_items.expand_to_segments(
+                item,
+                work / ("email%04d" % index),
+                policy,
+                page_size=target,
+                body_pdf=Path(bodies[key]) if key in bodies else None,
+                body_error=body_errors.get(key) if key and key not in bodies else None,
+                on_event=emit,
+            )
+            results[index] = SourceResult(src, segments)
 
     # ---- Everything else, one file at a time ----
     for index, src in simple_list:

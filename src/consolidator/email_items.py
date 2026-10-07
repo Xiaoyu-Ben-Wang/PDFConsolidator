@@ -402,12 +402,20 @@ def _write_attachment(att: Attachment, directory: Path, index: int) -> Path:
     return target
 
 
-def render_body_pdf(item: EmailItem, workdir: Path, dest: Path, timeout: int = 300) -> Path:
-    """Render the message body to a PDF by way of HTML.
+def write_body_html(item: EmailItem, dest: Path) -> Path:
+    """Write the message body as a standalone HTML file."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(body_html(item), encoding="utf-8")
+    return dest
 
-    HTML is written to scratch and handed to LibreOffice. That keeps the engine
-    set at one, and the GUI can swap in a richer renderer later without changing
-    this contract.
+
+def render_body_pdf(item: EmailItem, workdir: Path, dest: Path, timeout: int = 300) -> Path:
+    """Render one message body to a PDF by way of HTML.
+
+    Used for single conversions and for nested messages. Callers converting many
+    messages should write the HTML with :func:`write_body_html` and convert them
+    all in one batch instead - LibreOffice start-up dominates otherwise.
     """
     from . import libreoffice
 
@@ -415,10 +423,7 @@ def render_body_pdf(item: EmailItem, workdir: Path, dest: Path, timeout: int = 3
     workdir.mkdir(parents=True, exist_ok=True)
     stem = _safe_name((item.source or Path("message")).stem, "message")
 
-    # LibreOffice names its output after the input, so give the HTML a distinct
-    # stem from the body PDF we want back.
-    html_path = workdir / ("%s_body.html" % stem)
-    html_path.write_text(body_html(item), encoding="utf-8")
+    html_path = write_body_html(item, workdir / ("%s_body.html" % stem))
 
     out_dir = workdir / ("%s_body_out" % stem)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -443,6 +448,8 @@ def expand_to_segments(
     policy: ExtractionPolicy,
     page_size: tuple[float, float] | None = None,
     depth: int = 0,
+    body_pdf: Path | None = None,
+    body_error: str | None = None,
     on_event=None,
 ) -> list:
     """Expand a parsed message into an ordered list of segments.
@@ -450,6 +457,9 @@ def expand_to_segments(
     Body first, then attachments in their original order. PDF attachments are
     copied byte-for-byte; everything else is routed through the normal converter
     so an attached spreadsheet becomes pages too.
+
+    ``body_pdf`` lets the caller supply an already-rendered body, which is how a
+    batch of messages shares a single LibreOffice invocation.
     """
     from . import convert
     from .model import ATTACHMENT, BODY, DOCUMENT, Segment
@@ -467,15 +477,21 @@ def expand_to_segments(
 
     # ---- body ----
     if policy.body:
-        dest = workdir / ("%s_body.pdf" % stem)
-        try:
-            render_body_pdf(item, workdir, dest)
-            segments.append(Segment(source, "%s - body" % source.stem, BODY, dest, True))
-        except Exception as exc:
-            segments.append(
-                Segment(source, "%s - body" % source.stem, BODY, None, False,
-                        "%s: %s" % (type(exc).__name__, exc))
-            )
+        label = "%s - body" % source.stem
+        if body_error is not None:
+            segments.append(Segment(source, label, BODY, None, False, body_error))
+        elif body_pdf is not None and Path(body_pdf).exists():
+            segments.append(Segment(source, label, BODY, Path(body_pdf), True))
+        else:
+            dest = workdir / ("%s_body.pdf" % stem)
+            try:
+                render_body_pdf(item, workdir, dest)
+                segments.append(Segment(source, label, BODY, dest, True))
+            except Exception as exc:
+                segments.append(
+                    Segment(source, label, BODY, None, False,
+                            "%s: %s" % (type(exc).__name__, exc))
+                )
 
     # ---- attachments ----
     for index, att in enumerate(item.attachments):
