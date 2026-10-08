@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import itertools
 import sys
 import tempfile
 import time
@@ -32,6 +33,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+# Distinguishes concurrent profiles within one process.
+_profile_counter = itertools.count(1)
 
 # A start-up plus conversion budget for a batch. Large batches may need more.
 DEFAULT_TIMEOUT = 600
@@ -124,12 +128,26 @@ def _remove_tree(path: Path, attempts: int = 6, delay: float = 0.4) -> None:
 
 
 def _profile_dir(workdir: Path) -> Path:
-    """A per-run LibreOffice user profile.
+    """A per-run LibreOffice user profile, at a deliberately **short** path.
 
-    Two ``soffice`` processes sharing a profile fail *silently*, so every run
-    gets its own.
+    Two constraints shape this:
+
+    * Two ``soffice`` processes sharing a profile fail *silently*, so every run
+      needs its own.
+    * LibreOffice is not manifested for long paths. Its profile holds very deep
+      internal paths, and nesting the profile under a deep working directory
+      pushes those past ``MAX_PATH`` and crashes it - Windows' long-path setting
+      does not help, because it only applies to applications that opt in.
+
+    So the profile lives at a short fixed prefix beside the application rather
+    than under the run's working directory. ``workdir`` is accepted so callers
+    have one place to pass it, but is deliberately not where the profile goes.
     """
-    profile = workdir / "lo_profile"
+    home = app_root() / "lo-profiles"
+    home.mkdir(parents=True, exist_ok=True)
+    profile = home / ("p%d-%d" % (os.getpid(), next(_profile_counter)))
+    if profile.exists():
+        _remove_tree(profile)
     profile.mkdir(parents=True, exist_ok=True)
     return profile
 
@@ -238,6 +256,9 @@ def convert_batch(
 
     result = BatchResult(seconds=seconds, stdout=stdout, stderr=stderr, timed_out=timed_out)
 
+    # A crash dump in the profile explains an otherwise silent empty result.
+    crashed = (profile / "crash" / "dump.ini").exists()
+
     # Never trust the exit code - verify each expected artifact.
     for src in sources:
         out = workdir / (src.stem + ".pdf")
@@ -245,9 +266,14 @@ def convert_batch(
             result.produced[str(src)] = str(out)
         elif timed_out:
             result.failed[str(src)] = "LibreOffice timed out after %ds" % timeout
+        elif crashed:
+            result.failed[str(src)] = "LibreOffice crashed while converting this file"
         else:
             detail = (stderr or stdout or "").strip().splitlines()
             result.failed[str(src)] = detail[-1] if detail else "no output produced"
+
+    # The profile is large and belongs to this run only.
+    _remove_tree(profile)
 
     return result
 

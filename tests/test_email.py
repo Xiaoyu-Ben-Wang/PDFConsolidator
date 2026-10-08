@@ -128,8 +128,9 @@ def test_expansion_order_is_body_then_attachments(emails, tmp_path):
     segments = email_items.expand_to_segments(
         item, tmp_path, email_items.ExtractionPolicy(), page_size=pages.LETTER
     )
+    failures = [s.detail for s in segments if not s.ok]
     kinds = [s.kind for s in segments if s.ok]
-    assert kinds[0] == "body"
+    assert kinds and kinds[0] == "body", "body failed: %s" % failures
     assert kinds[1:] == ["attachment"] * (len(kinds) - 1)
 
 

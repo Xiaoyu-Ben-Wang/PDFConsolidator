@@ -97,7 +97,14 @@ def convert_image(src: Path, dest: Path, workdir: Path, page_size: tuple | None)
                     img = canvas
                 elif img.mode not in ("RGB", "L"):
                     img = img.convert("RGB")
-                temp_path = Path(tempfile.mkstemp(suffix=".png", dir=str(workdir))[1])
+
+                # mkstemp returns an open descriptor as well as a path. Leaving
+                # it open leaks a handle per image, and on Windows an open handle
+                # prevents the file being deleted afterwards - so the scratch
+                # copy would survive every conversion.
+                handle, name = tempfile.mkstemp(suffix=".png", dir=str(workdir))
+                os.close(handle)
+                temp_path = Path(name)
                 img.save(temp_path, "PNG")
             prepared = temp_path
 

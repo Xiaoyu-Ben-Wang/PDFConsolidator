@@ -38,10 +38,13 @@ fixtures/msg/
 .vendor-cache/
 vendor/
 
-# Scratch directories. The system temp directory can be missing or unwritable,
-# in which case Python, pip and pytest fall back to the working directory and
-# leave these behind.
+# Scratch directories. The application creates its own rather than trusting the
+# system temp directory, which can be missing or unwritable.
+.scratch/
 .consolidator-scratch/
+.pytest-tmp/
+pytest-tmp/
+lo-profiles/
 pdfconsolidator/
 pytest-of-*/
 pip-metadata-*/

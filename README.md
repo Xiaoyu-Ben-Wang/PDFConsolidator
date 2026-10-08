@@ -160,13 +160,18 @@ Three things the code goes out of its way to handle, all found by testing:
 - **LibreOffice inherits the launcher's environment.** If `PYTHONPATH` is set —
   which it is whenever this app runs from Python — LibreOffice's own bundled
   Python breaks and reports `source file could not be loaded`.
-- **`%TEMP%` cannot be trusted.** LibreOffice needs to create work files; when it
-  cannot, it reports that same misleading error. The engine is given its own
-  scratch directory, and the pipeline probes for a writable location rather than
-  assuming one.
-- **LibreOffice marks its lock files read-only**, and Windows refuses to delete a
-  read-only file, so cleanup must clear the attribute first or every conversion
-  silently leaks its scratch directory.
+- **The system temp directory is not used.** The application creates its own
+  scratch folder, `.scratch`, beside itself — the directory it is run from — and
+  falls back only if that is unwritable. LibreOffice needs to create work files,
+  and when it cannot it reports that same misleading error. A portable
+  application is copied somewhere writable by definition, so it should not
+  depend on `%TEMP%` at all.
+- **LibreOffice is not manifested for long paths.** Its profile holds very deep
+  internal paths; nesting that under a deep working directory exceeds
+  `MAX_PATH` and crashes it. Windows' `LongPathsEnabled` does not help, because
+  it only applies to applications that opt in. The profile therefore lives at a
+  short fixed prefix (`.lo-profiles` beside the application), not under the
+  working directory, and is removed after each run.
 
 A page's `/Rotate` is baked into its content stream before anything else happens,
 because a viewer applies `/Rotate` to the whole page — so a page number drawn

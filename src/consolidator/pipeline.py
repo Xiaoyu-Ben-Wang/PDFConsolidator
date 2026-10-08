@@ -64,17 +64,23 @@ class BuildReport:
 
 
 def choose_scratch(preferred_parent: Path | None = None) -> Path:
-    """Return a scratch directory, verified writable by actually writing to it.
+    """Pick a scratch directory, verified writable by actually writing to it.
 
-    ``%TEMP%`` cannot be assumed to exist or be writable - it can be missing,
-    full, or restricted by policy. Rather than trusting it, each candidate is
-    probed and the first that works wins. This matters for an application meant
-    to run from removable media on an unfamiliar machine.
+    The system temp directory is deliberately **not** the first choice. It can be
+    missing, full, or - as on the machine this was developed on - simply not
+    writable by the process that needs it. LibreOffice reports that failure as a
+    misleading ``source file could not be loaded``, which costs a lot of time to
+    diagnose once and should never have to be diagnosed twice.
+
+    A portable application is copied somewhere writable by definition, so its own
+    directory is the natural home for scratch files. The system temp directory is
+    kept only as a last resort, for a read-only installation.
     """
-    candidates: list[Path] = [Path(tempfile.gettempdir()) / "pdfconsolidator"]
+    candidates: list[Path] = [libreoffice.app_root() / ".scratch"]
     if preferred_parent is not None:
         candidates.append(Path(preferred_parent) / ".consolidator-scratch")
     candidates.append(Path.cwd() / ".consolidator-scratch")
+    candidates.append(Path(tempfile.gettempdir()) / "pdfconsolidator")
 
     for candidate in candidates:
         try:
