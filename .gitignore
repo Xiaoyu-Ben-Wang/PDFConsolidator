@@ -19,7 +19,10 @@ _probe/**/_dist/
 _probe/**/*.x/
 
 # ---- PyInstaller ----
-build/
+# Only PyInstaller's own output is ignored. build/ also holds the frozen entry
+# point and the Windows version resource, which are source and must be tracked -
+# a blanket "build/" made a fresh clone unable to produce the bundle at all.
+build/_work/
 dist/
 *.spec
 
