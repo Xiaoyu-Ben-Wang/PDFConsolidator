@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QFileInfo, Qt, QSize
-from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QPixmap
+from PySide6.QtCore import QFileInfo, Qt, QSize, QTimer
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QIcon,
+    QKeySequence,
+    QPixmap,
+    QShortcut,
+    QTransform,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -122,14 +132,28 @@ class MainWindow(QMainWindow):
         self.source_policies: dict[str, email_items.ExtractionPolicy] = {}
         self._loading_policy = False
 
+        # Sources already converted, so adding a file only converts the new one.
+        self._converted_sources: set[str] = set()
+        self._run_counter = 0
+
         self._conversion: ConversionWorker | None = None
         self._merge: MergeWorker | None = None
         self._thumbs: ThumbnailWorker | None = None
+
+        # Adding files converts automatically, shortly after the user stops
+        # adding. It must be the *incremental* entry point: a full re-convert
+        # would discard page edits the user has already made.
+        self._pending_convert = False
+        self._autoconvert = QTimer(self)
+        self._autoconvert.setSingleShot(True)
+        self._autoconvert.setInterval(350)
+        self._autoconvert.timeout.connect(self._convert_new_sources)
 
         self._build_toolbar()
         self._build_body()
         self._build_options()
         self._build_status()
+        self._install_shortcuts()
         self._load_policy_into_widgets(self.default_policy)
         self._update_actions()
 
@@ -371,6 +395,17 @@ class MainWindow(QMainWindow):
         self.status.addPermanentWidget(self.progress)
         self.status.showMessage("Add files or a folder to begin.")
 
+    def _install_shortcuts(self) -> None:
+        """Delete and Backspace remove what the focused list has selected."""
+        for sequence in (QKeySequence.Delete, QKeySequence("Backspace")):
+            for widget, slot in (
+                (self.tree, self.remove_selected_sources),
+                (self.page_list, self.delete_selected),
+            ):
+                shortcut = QShortcut(sequence, widget)
+                shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+                shortcut.activated.connect(slot)
+
     # ------------------------------------------------- extraction policies
 
     def _load_policy_into_widgets(self, policy: email_items.ExtractionPolicy) -> None:
@@ -472,10 +507,14 @@ class MainWindow(QMainWindow):
                 self.selected_sources.append(Path(path))
                 known.add(str(path))
                 added += 1
-        self.status.showMessage("Added %d file(s). %d selected."
-                                % (added, len(self.selected_sources)))
+        if not added:
+            return
+        self.status.showMessage("Added %d file(s). Converting\u2026" % added)
         self.refresh_tree()
         self._update_actions()
+        # Convert on our own: making the user press Convert just to see pages
+        # was a pointless extra step.
+        self._autoconvert.start()
 
     def remove_selected_sources(self) -> None:
         items = self.tree.selectedItems()
@@ -488,16 +527,27 @@ class MainWindow(QMainWindow):
                 root = root.parent()
             roots.append(root)
         doomed = {root.data(0, Qt.UserRole) for root in roots if root.data(0, Qt.UserRole)}
+        names = {root.text(0) for root in roots}
 
         self.selected_sources = [p for p in self.selected_sources if str(p) not in doomed]
+        # Removing a source removes what it contributed, not just the row.
+        for path in list(doomed):
+            self.model.drop_source(Path(path))
+            self.source_policies.pop(path, None)
+
         self.refresh_tree()
+        self.refresh_pages()
         self._update_actions()
+        if names:
+            self.status.showMessage("Removed %d source(s)." % len(names))
 
     def clear_all(self) -> None:
         self.selected_sources.clear()
         self.model.clear()
         self.thumbs.clear()
         self.source_policies.clear()
+        self._converted_sources.clear()
+        self._run_counter = 0
         if self.scratch and self.scratch.exists():
             from .. import libreoffice
 
@@ -678,6 +728,15 @@ class MainWindow(QMainWindow):
             return
 
         image = self.thumbs.render(node.pdf, page.index, PREVIEW_HEIGHT)
+        if image is not None and page.rotation:
+            # Show the page as it will be written, not as it sits in the source
+            # PDF - otherwise rotating a page appears to do nothing.
+            image = image.transformed(
+                QTransform().rotate(page.rotation), Qt.SmoothTransformation
+            )
+            if image.height() > PREVIEW_HEIGHT:
+                image = image.scaledToHeight(PREVIEW_HEIGHT, Qt.SmoothTransformation)
+
         if image is None:
             self.preview.setText("Preview unavailable")
         else:
@@ -764,32 +823,78 @@ class MainWindow(QMainWindow):
 
     # ----------------------------------------------------------- conversion
 
-    def start_conversion(self) -> None:
-        if not self.selected_sources:
-            QMessageBox.information(self, "Nothing to convert", "Add some files first.")
-            return
-        if self._conversion is not None and self._conversion.isRunning():
-            return
+    def _ensure_scratch(self, reset: bool = False) -> Path:
+        """A scratch directory that survives incremental conversions.
+
+        Segments produced earlier point into this directory, so it must only be
+        cleared when everything is being converted again.
+        """
+        import tempfile
 
         from .. import libreoffice
 
-        if self.scratch and self.scratch.exists():
+        if reset and self.scratch and self.scratch.exists():
             libreoffice._remove_tree(self.scratch)
-        root = pipeline.choose_scratch()
-        import tempfile
+            self.scratch = None
+        if self.scratch is None:
+            self.scratch = Path(
+                tempfile.mkdtemp(prefix="gui_", dir=str(pipeline.choose_scratch()))
+            )
+        return self.scratch
 
-        self.scratch = Path(tempfile.mkdtemp(prefix="gui_", dir=str(root)))
+    def _next_run_dir(self) -> Path:
+        """A fresh subdirectory per run.
 
-        self.model.clear()
-        self.thumbs.clear()
-        self.refresh_pages()
+        Intermediate files are named by index within their batch, so reusing a
+        directory across runs would overwrite them.
+        """
+        scratch = self._ensure_scratch()
+        self._run_counter += 1
+        run_dir = scratch / ("run%d" % self._run_counter)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+
+    def start_conversion(self) -> None:
+        """Convert everything again from scratch, discarding current pages."""
+        if not self.selected_sources:
+            return
+        self._converted_sources.clear()
+        self._run_conversion(self.selected_sources, replace=True)
+
+    def _convert_new_sources(self) -> None:
+        """Convert only sources added since the last run.
+
+        Adding a file must not throw away page edits the user has already made,
+        so this appends rather than rebuilding.
+        """
+        pending = [p for p in self.selected_sources if str(p) not in self._converted_sources]
+        if pending:
+            self._run_conversion(pending, replace=False)
+
+    def _run_conversion(self, sources: list[Path], replace: bool) -> None:
+        if self._conversion is not None and self._conversion.isRunning():
+            # Files arrived mid-conversion; pick them up when it finishes.
+            self._pending_convert = True
+            return
+
+        if replace:
+            self._ensure_scratch(reset=True)
+            self.model.clear()
+            self.thumbs.clear()
+            self.refresh_pages()
 
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
         self.act_convert.setEnabled(False)
+        self.status.showMessage(
+            "Converting %d file(s)\u2026" % len(sources) if sources else ""
+        )
 
         self._conversion = ConversionWorker(
-            self.selected_sources, self.scratch, self.default_policy, self,
+            [Path(s) for s in sources],
+            self._next_run_dir(),
+            self.default_policy,
+            self,
             policy_for=self.policy_for,
         )
         self._conversion.progressed.connect(self.status.showMessage)
@@ -797,11 +902,18 @@ class MainWindow(QMainWindow):
         self._conversion.crashed.connect(self._on_worker_crash)
         self._conversion.start()
 
+    def _resume_pending_conversion(self) -> None:
+        """Convert anything that arrived while a run was in progress."""
+        if self._pending_convert:
+            self._pending_convert = False
+            self._autoconvert.start()
+
     def _on_converted(self, report) -> None:
         self.progress.setVisible(False)
         self.act_convert.setEnabled(True)
 
         for result in report.sources:
+            self._converted_sources.add(str(result.source))
             for segment in result.segments:
                 self.model.add_segment(
                     result.source,
@@ -817,6 +929,7 @@ class MainWindow(QMainWindow):
         self.refresh_tree()
         self.refresh_pages()
         self._update_actions()
+        self._resume_pending_conversion()
 
         failures = [s for s in report.all_segments if not s.ok and not is_policy_exclusion(s)]
         excluded = [s for s in report.all_segments if not s.ok and is_policy_exclusion(s)]
@@ -903,6 +1016,7 @@ class MainWindow(QMainWindow):
 
         self.refresh_tree()
         self.refresh_pages()
+        self._resume_pending_conversion()
 
         still_failing = [
             s for s in report.all_segments if not s.ok and not is_policy_exclusion(s)
@@ -921,6 +1035,7 @@ class MainWindow(QMainWindow):
     def _on_worker_crash(self, detail: str) -> None:
         self.progress.setVisible(False)
         self.act_convert.setEnabled(True)
+        self._resume_pending_conversion()
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Critical)
         box.setWindowTitle("Conversion failed")
@@ -1018,13 +1133,36 @@ class MainWindow(QMainWindow):
         self.act_convert.setEnabled(has_sources)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        for worker in (self._conversion, self._merge, self._thumbs):
-            if worker is not None and worker.isRunning():
-                if hasattr(worker, "cancel"):
-                    worker.cancel()
-                worker.wait(3000)
-        if self.scratch and self.scratch.exists():
+        """Shut down promptly.
+
+        Waiting the full cancel timeout for each worker made closing feel
+        sluggish, and deleting the scratch tree on the GUI thread could take
+        seconds for a large run. So: ask everything to stop, wait only briefly,
+        and clean up in the background.
+        """
+        import threading
+
+        self._autoconvert.stop()
+
+        workers = [w for w in (self._conversion, self._merge, self._thumbs) if w is not None]
+        for worker in workers:
+            if worker.isRunning() and hasattr(worker, "cancel"):
+                worker.cancel()
+
+        deadline = time.monotonic() + 0.5
+        for worker in workers:
+            if worker.isRunning():
+                remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+                worker.wait(remaining_ms)
+
+        scratch = self.scratch
+        self.scratch = None
+        if scratch and Path(scratch).exists():
             from .. import libreoffice
 
-            libreoffice._remove_tree(self.scratch)
+            # A daemon thread so a slow delete cannot hold up the exit.
+            threading.Thread(
+                target=libreoffice._remove_tree, args=(Path(scratch),), daemon=True
+            ).start()
+
         super().closeEvent(event)

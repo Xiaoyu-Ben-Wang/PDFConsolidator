@@ -165,6 +165,17 @@ class DocumentModel:
         for page in self.pages:
             page.selected = selected
 
+    def drop_source(self, source: Path) -> int:
+        """Forget everything a source contributed, including its pages."""
+        source = Path(source)
+        removed = [s.id for s in self.segments if s.source == source]
+        if not removed:
+            return 0
+        doomed = set(removed)
+        self.segments = [s for s in self.segments if s.id not in doomed]
+        self.pages = [p for p in self.pages if p.segment_id not in doomed]
+        return len(removed)
+
     def remove_failed_for(self, source: Path) -> int:
         """Drop the failed segments belonging to one source, before a retry.
 

@@ -221,7 +221,7 @@ def convert_batch(
         if stale.exists():
             stale.unlink()
 
-    started = time.time()
+    started = time.monotonic()
     timed_out = False
     try:
         proc = subprocess.run(
@@ -234,7 +234,7 @@ def convert_batch(
         stdout = (exc.stdout or b"").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
         stderr = (exc.stderr or b"").decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
 
-    seconds = time.time() - started
+    seconds = time.monotonic() - started
 
     result = BatchResult(seconds=seconds, stdout=stdout, stderr=stderr, timed_out=timed_out)
 

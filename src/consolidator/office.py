@@ -116,7 +116,7 @@ def convert_office(kind: str, src: str, out: str, timeout: int = 180) -> OfficeR
         out,
     ]
 
-    started = time.time()
+    started = time.monotonic()
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
         creationflags=_NO_WINDOW,
@@ -133,7 +133,7 @@ def convert_office(kind: str, src: str, out: str, timeout: int = 180) -> OfficeR
         except Exception:
             stdout, stderr = "", ""
 
-    seconds = time.time() - started
+    seconds = time.monotonic() - started
 
     # Always sweep: even a clean exit can leave an Office process behind.
     killed = kill_new_office(before)

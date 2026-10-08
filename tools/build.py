@@ -105,6 +105,9 @@ def run_pyinstaller(out_dir: Path) -> Path:
         "--workpath", str(ROOT / "build" / "_work"),
         "--specpath", str(ROOT / "build"),
         "--paths", str(ROOT / "src"),
+        # Sets the Properties -> Details fields; the publisher Windows shows in
+        # SmartScreen and UAC comes from the signature applied below.
+        "--version-file", str(ROOT / "build" / "version_info.txt"),
         # Not used, and each pulls in a large Qt module.
         "--exclude-module", "PySide6.QtWebEngineCore",
         "--exclude-module", "PySide6.QtWebEngineWidgets",
@@ -161,6 +164,35 @@ def copy_libreoffice(bundle: Path, source: Path, trim: bool) -> int:
     return freed
 
 
+def sign_executable(exe: Path, publisher: str, trust: bool) -> bool:
+    """Sign the executable so Windows names the publisher instead of 'unknown'.
+
+    Without an Authenticode signature the publisher is reported as unknown, and
+    there is no setting that simply declares one - the file must be signed. See
+    tools/sign.ps1 for what a self-signed certificate does and does not buy.
+    """
+    script = ROOT / "tools" / "sign.ps1"
+    if not script.exists():
+        print("WARNING: tools/sign.ps1 not found; skipping signing")
+        return False
+
+    cmd = [
+        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-File", str(script),
+        "-Path", str(exe),
+        "-Publisher", publisher,
+    ]
+    if trust:
+        cmd.append("-Trust")
+
+    print("signing as %r ..." % publisher, flush=True)
+    result = subprocess.run(cmd, cwd=str(ROOT))
+    if result.returncode != 0:
+        print("WARNING: signing failed with code %d" % result.returncode)
+        return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default=str(ROOT / "dist"), help="output directory")
@@ -168,10 +200,16 @@ def main(argv: list[str] | None = None) -> int:
                         help="LibreOffice installation to bundle")
     parser.add_argument("--skip-libreoffice", action="store_true")
     parser.add_argument("--no-trim", action="store_true")
+    parser.add_argument("--publisher", default="Xiaoyu-Ben-Wang",
+                        help="publisher name to sign with (default: %(default)s)")
+    parser.add_argument("--no-sign", action="store_true",
+                        help="skip signing the executable")
+    parser.add_argument("--trust", action="store_true",
+                        help="also trust the certificate locally (needs administrator)")
     args = parser.parse_args(argv)
 
     out_dir = Path(args.out)
-    started = time.time()
+    started = time.monotonic()
 
     # Clear any previous bundle before PyInstaller tries to clean it, since it
     # does not cope with the read-only lock files LibreOffice leaves behind.
@@ -183,13 +221,18 @@ def main(argv: list[str] | None = None) -> int:
     if not args.skip_libreoffice:
         copy_libreoffice(bundle, Path(args.libreoffice), trim=not args.no_trim)
 
+    exe = bundle / "PDFConsolidator.exe"
+    if not args.no_sign:
+        sign_executable(exe, args.publisher, args.trust)
+
     total = directory_size(bundle)
     print()
     print("=" * 68)
-    print("Bundle : %s" % bundle)
-    print("Size   : %s" % human(total))
-    print("Exe    : %s" % (bundle / "PDFConsolidator.exe"))
-    print("Time   : %.1fs" % (time.time() - started))
+    print("Bundle    : %s" % bundle)
+    print("Size      : %s" % human(total))
+    print("Exe       : %s" % exe)
+    print("Publisher : %s" % (args.publisher if not args.no_sign else "(not signed)"))
+    print("Time      : %.1fs" % (time.monotonic() - started))
     print("=" * 68)
     print()
     print("Copy that whole folder to the target machine and run")

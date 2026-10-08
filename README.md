@@ -33,12 +33,15 @@ Generate some sample input and try it:
 
 - **Sources** (left) lists the selected files with their real Windows file-type
   icons. Expanding a source shows what it contributed — a document, an email's
-  body, each extracted attachment. Unticking anything leaves it out.
+  body, each extracted attachment. Unticking anything leaves it out. Select a
+  row and press **Delete** or **Backspace** to remove it and its pages.
 - **Pages** (middle) is a single vertical column, one row per page, each row
   showing the page number, the file it came from and any rotation. Rows are
   coloured by source document, so pages from one file read as a block.
-  Drag rows to reorder them, or select several and use the buttons.
-- **Preview** (right) shows the selected page large, with its origin underneath.
+  Drag rows to reorder them, or select several and use the buttons. Delete and
+  Backspace remove the selected pages.
+- **Preview** (right) shows the selected page large, rotated as it will be
+  written, with its origin underneath.
 - **Group by document** clusters the pages so everything from one file sits
   together, keeping each document's own page order.
 - **Extract from email items** is decided *per email*. Select an email in the
@@ -48,8 +51,10 @@ Generate some sample input and try it:
 - **Output** is a single *Save as…* button that opens the standard Windows save
   dialog.
 
-Conversion happens once, when you press **Convert**. Changing the page size or
-layout afterwards only re-assembles, so editing is cheap.
+Conversion happens automatically when files are added — only the new files are
+converted, so page edits already made are never lost. **Convert** re-converts
+everything from scratch. Changing the page size or layout afterwards only
+re-assembles, so editing is cheap.
 
 ### Email extraction
 
@@ -96,6 +101,35 @@ consolidator gui
 Produces `dist/PDFConsolidator/`: the frozen application plus a trimmed
 LibreOffice. Copy that folder to the target machine and run
 `PDFConsolidator.exe`. No installer, no Python and no Office are required.
+
+### Publisher name
+
+Windows reports "Unknown Publisher" because the executable has no Authenticode
+signature, and **there is no setting that simply declares a publisher** — the
+name comes from the signing certificate. The build therefore:
+
+1. embeds a version resource (`build/version_info.txt`) setting CompanyName,
+   ProductName and copyright; this is what the file's *Properties → Details*
+   tab shows;
+2. signs the executable with a self-signed certificate whose subject is the
+   publisher, which is what SmartScreen and UAC read.
+
+```sh
+python tools/build.py --publisher "Xiaoyu-Ben-Wang"       # default
+python tools/build.py --no-sign                            # skip signing
+python tools/build.py --trust                              # also trust it locally
+```
+
+`tools/sign.ps1` can be run on its own against an existing executable.
+
+**Being honest about what this does.** A self-signed certificate *identifies* the
+publisher; it does not *vouch* for them. The name will appear in place of
+"Unknown Publisher", but Windows will still warn until the certificate is trusted
+on that machine. `--trust` adds it to the local Trusted Root and Trusted
+Publishers stores and needs administrator rights; other machines need
+`pdfconsolidator-publisher.cer` installed the same way. Only a certificate from a
+public authority earns "verified publisher" reputation.
+
 
 ## Supported formats
 

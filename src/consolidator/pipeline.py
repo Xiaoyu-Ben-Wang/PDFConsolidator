@@ -117,16 +117,16 @@ def _convert_one_to_segment(
     src: Path, out_pdf: Path, workdir: Path, page_size, label: str | None = None
 ) -> Segment:
     """Convert a single ordinary file into one segment."""
-    started = time.time()
+    started = time.monotonic()
     try:
         convert.convert(src, out_pdf, workdir, page_size=page_size)
-        return Segment(src, label or src.stem, DOCUMENT, out_pdf, True, "", time.time() - started)
+        return Segment(src, label or src.stem, DOCUMENT, out_pdf, True, "", time.monotonic() - started)
     except convert.ConversionError as exc:
-        return Segment(src, label or src.stem, DOCUMENT, None, False, str(exc), time.time() - started)
+        return Segment(src, label or src.stem, DOCUMENT, None, False, str(exc), time.monotonic() - started)
     except Exception as exc:
         return Segment(
             src, label or src.stem, DOCUMENT, None, False,
-            "%s: %s" % (type(exc).__name__, exc), time.time() - started,
+            "%s: %s" % (type(exc).__name__, exc), time.monotonic() - started,
         )
 
 
@@ -163,7 +163,7 @@ def convert_sources(
         if on_event:
             on_event(message)
 
-    started = time.time()
+    started = time.monotonic()
     report = BuildReport(policy=policy)
     staging = workdir / "staging"
     work = workdir / "out"
@@ -286,7 +286,7 @@ def convert_sources(
         emit("  %s   %s" % ("ok  " if segment.ok else "FAIL", src.name))
 
     report.sources = [results[i] for i in sorted(results)]
-    report.seconds = time.time() - started
+    report.seconds = time.monotonic() - started
     return report
 
 
@@ -320,7 +320,7 @@ def build(
     if not options.title:
         options.title = dest.stem
 
-    started = time.time()
+    started = time.monotonic()
     if scratch_dir:
         scratch = Path(scratch_dir)
         scratch.mkdir(parents=True, exist_ok=True)
@@ -341,7 +341,7 @@ def build(
 
     if not entries:
         emit("Nothing converted successfully - no PDF written.")
-        report.seconds = time.time() - started
+        report.seconds = time.monotonic() - started
         if owned_scratch and not keep_scratch:
             libreoffice._remove_tree(scratch)
         return report
@@ -349,7 +349,7 @@ def build(
     emit("Assembling %d segment(s)..." % len(entries))
     report.merged = assemble.merge(entries, dest, options=options)
     report.output = dest
-    report.seconds = time.time() - started
+    report.seconds = time.monotonic() - started
 
     if owned_scratch and not keep_scratch:
         libreoffice._remove_tree(scratch)

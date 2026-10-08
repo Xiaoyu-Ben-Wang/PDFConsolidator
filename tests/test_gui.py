@@ -481,7 +481,6 @@ def test_retry_without_a_scratch_dir_is_safe(window):
 
 
 def test_retry_uses_a_separate_scratch_subdirectory(window, tmp_path, monkeypatch):
-    """Reusing the first run's directory would collide with its intermediates."""
     from consolidator.gui import main_window as mw
 
     captured = {}
@@ -521,4 +520,154 @@ def test_retry_uses_a_separate_scratch_subdirectory(window, tmp_path, monkeypatc
     assert captured["started"]
     assert captured["scratch"] == tmp_path / "retry1"
     assert captured["scratch"].name != "retry0"
+
+
+# ------------------------------------------------------- adding and removing
+
+
+def test_adding_files_schedules_conversion(window, tmp_path):
+    """Pages should appear without the user pressing Convert."""
+    pdf = make_pdf(tmp_path / "a.pdf", 1)
+    window._add([pdf])
+    assert window._autoconvert.isActive(), "conversion should be queued"
+
+
+def test_only_new_sources_are_converted(window, tmp_path, monkeypatch):
+    """Adding a file must not throw away edits made to existing pages."""
+    from consolidator.gui import main_window as mw
+
+    captured = {}
+
+    class FakeWorker:
+        def __init__(self, sources, scratch, policy, parent=None, policy_for=None):
+            captured["sources"] = list(sources)
+
+        def start(self):
+            captured["started"] = True
+
+        def isRunning(self):
+            return False
+
+        class _Sig:
+            def connect(self, *_a, **_k):
+                pass
+
+        progressed = _Sig()
+        completed = _Sig()
+        crashed = _Sig()
+
+    monkeypatch.setattr(mw, "ConversionWorker", FakeWorker)
+
+    first = make_pdf(tmp_path / "first.pdf", 1)
+    second = make_pdf(tmp_path / "second.pdf", 1)
+    window.selected_sources = [first, second]
+    window._converted_sources = {str(first)}          # first is already done
+
+    window._convert_new_sources()
+
+    assert captured["started"]
+    assert captured["sources"] == [second]
+
+
+def test_deleting_a_source_removes_its_pages(window, tmp_path):
+    pdf = make_pdf(tmp_path / "a.pdf", 3)
+    window.model.add_segment(Path("a.docx"), "a", pdf, True, page_count=3)
+    window.selected_sources = [Path("a.docx")]
+    window.refresh_tree()
+    assert window.model.page_count == 3
+
+    window.tree.setCurrentItem(window.tree.topLevelItem(0))
+    window.remove_selected_sources()
+
+    assert window.selected_sources == []
+    assert window.model.page_count == 0, "its pages must go too"
+    assert window.page_list.count() == 0
+
+
+def test_drop_source_leaves_other_sources_alone(tmp_path):
+    m = DocumentModel()
+    m.add_segment(Path("a.docx"), "a", make_pdf(tmp_path / "a.pdf", 2), True, page_count=2)
+    m.add_segment(Path("b.docx"), "b", make_pdf(tmp_path / "b.pdf", 1), True, page_count=1)
+
+    assert m.drop_source(Path("a.docx")) == 1
+    assert m.page_count == 1
+    assert [s.label for s in m.segments] == ["b"]
+
+
+def test_delete_and_backspace_remove_the_selected_source(window, tmp_path):
+    from PySide6.QtGui import QKeySequence, QShortcut
+
+    shortcuts = window.tree.findChildren(QShortcut)
+    keys = {s.key().toString() for s in shortcuts}
+    assert QKeySequence(QKeySequence.Delete).toString() in keys
+    assert QKeySequence("Backspace").toString() in keys
+
+
+def test_page_list_also_handles_delete(window, tmp_path):
+    from PySide6.QtGui import QShortcut
+
+    assert window.page_list.findChildren(QShortcut), "pages need a delete shortcut too"
+
+
+# ------------------------------------------------------------ preview rotate
+
+
+def test_preview_reflects_rotation(window, tmp_path):
+    """Rotating must be visible in the preview, or it looks like nothing happened."""
+    pdf = make_pdf(tmp_path / "a.pdf", 1)          # 612x792, portrait
+    window.model.add_segment(Path("a.docx"), "a", pdf, True, page_count=1)
+    window.refresh_pages()
+
+    window.page_list.clearSelection()
+    window.page_list.item(0).setSelected(True)
+    window._update_preview()
+    before = window.preview.pixmap().size()
+    assert before.height() > before.width(), "portrait before rotating"
+
+    window.rotate_selected(90)
+    after = window.preview.pixmap().size()
+    assert after.width() > after.height(), "landscape after rotating"
+
+
+def test_qt_rotation_is_clockwise_matching_pdf():
+    """PDF /Rotate turns clockwise; the preview must agree."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor, QImage, QTransform
+
+    image = QImage(8, 8, QImage.Format_RGB32)
+    image.fill(QColor("white"))
+    image.setPixelColor(0, 0, QColor("red"))       # marker at top-left
+
+    rotated = image.transformed(QTransform().rotate(90), Qt.FastTransformation)
+
+    assert rotated.width() == 8 and rotated.height() == 8
+    # Clockwise: the top-left corner ends up top-right.
+    assert rotated.pixelColor(rotated.width() - 1, 0) == QColor("red")
+
+
+def test_rotating_270_returns_the_marker_to_the_bottom_left():
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor, QImage, QTransform
+
+    image = QImage(8, 8, QImage.Format_RGB32)
+    image.fill(QColor("white"))
+    image.setPixelColor(0, 0, QColor("red"))
+
+    rotated = image.transformed(QTransform().rotate(270), Qt.FastTransformation)
+    assert rotated.pixelColor(0, rotated.height() - 1) == QColor("red")
+
+
+# ---------------------------------------------------------------- shutdown
+
+
+def test_closing_is_prompt(window):
+    """Waiting the full cancel timeout per worker made closing feel sluggish."""
+    import time as _time
+
+    from PySide6.QtGui import QCloseEvent
+
+    started = _time.monotonic()
+    window.closeEvent(QCloseEvent())
+    elapsed = _time.monotonic() - started
+    assert elapsed < 1.5, "closing took %.2fs" % elapsed
 
