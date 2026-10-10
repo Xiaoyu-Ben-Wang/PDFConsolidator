@@ -528,6 +528,31 @@ def test_batch_conversion_survives_relative_paths(tmp_path, monkeypatch):
     assert (tmp_path / "out" / "note.pdf").exists()
 
 
+@requires_lo
+def test_a_lock_left_behind_does_not_block_the_next_conversion(tmp_path):
+    """LibreOffice leaves a read-only lock beside every PDF it writes.
+
+    While ``.~lock.note.pdf#`` exists it cannot write ``note.pdf`` again: the
+    store aborts, nothing is produced, and every retry into that directory was
+    reported as "LibreOffice crashed while converting this file".
+    """
+    import os
+    import stat
+
+    source = tmp_path / "note.html"
+    source.write_text("<html><body><p>again</p></body></html>", encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+    lock = out / ".~lock.note.pdf#"
+    lock.write_text(",someone,HOST,10.10.2026 12:59,file:///x;")
+    os.chmod(lock, stat.S_IREAD)
+
+    result = libreoffice.convert_batch([source], out)
+
+    assert result.produced.get(str(source)), result.failed
+    assert not lock.exists(), "the run must also leave no lock of its own"
+
+
 def test_a_batch_can_be_stopped_part_way(tmp_path):
     """500 files is a long wait; stopping has to keep what was converted."""
     sources = _blank_pdfs(tmp_path, 5)

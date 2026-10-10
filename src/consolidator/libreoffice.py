@@ -127,6 +127,17 @@ def _remove_tree(path: Path, attempts: int = 6, delay: float = 0.4) -> None:
         time.sleep(delay)
 
 
+def _remove_lock(directory: Path, name: str) -> None:
+    """Delete LibreOffice's lock file for ``name``, which it marks read-only."""
+    lock = directory / (".~lock.%s#" % name)
+    try:
+        if lock.exists():
+            os.chmod(lock, 0o666)
+            lock.unlink()
+    except OSError:
+        pass
+
+
 def _profile_dir(workdir: Path) -> Path:
     """A per-run LibreOffice user profile, at a deliberately **short** path.
 
@@ -242,10 +253,16 @@ def convert_batch(
     ] + [str(target) for _src, target in targets]
 
     # A stale output would masquerade as success, so clear expected names first.
+    # So must a stale *lock*: LibreOffice leaves a read-only ``.~lock.<name>#``
+    # beside every PDF it writes, even on success, and while one exists it cannot
+    # write that name again - it fails with an I/O abort and no output, which
+    # read as "LibreOffice crashed" on every retry or re-conversion into the
+    # same directory.
     for src in sources:
         stale = outdir / (src.stem + ".pdf")
         if stale.exists():
             stale.unlink()
+        _remove_lock(outdir, stale.name)
 
     started = time.monotonic()
     timed_out = False
@@ -292,6 +309,9 @@ def convert_batch(
             reason = fallback
         for src in missing:
             result.failed[str(src)] = reason
+
+    for src in sources:
+        _remove_lock(outdir, src.stem + ".pdf")
 
     # The profile is large and belongs to this run only.
     _remove_tree(profile)
