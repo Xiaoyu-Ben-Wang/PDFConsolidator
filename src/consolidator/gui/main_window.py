@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListView,
@@ -77,9 +78,14 @@ KIND_SUFFIX = {"body": "body", "attachment": "attachment", "document": ""}
 # stops being safe once nested messages introduce a third kind of row.
 ROW_ROLE = Qt.UserRole + 1
 
-# Every navigator row can take the page column to what it holds; the tooltip is
-# where that is discoverable.
-JUMP_HINT = "\n\nSelect it and press the jump button (Ctrl+J) to see its pages."
+# Every navigator row can take the page column to what it holds: the arrow at
+# the end of the row does it with one click, Ctrl+J for the selected row.
+JUMP_HINT = "\n\nClick the arrow at the end of the row (or press Ctrl+J) to see its pages."
+
+# Navigator columns. The jump arrow has a narrow column of its own so it lines
+# up down the tree and never competes with a long name for space.
+NAME_COLUMN, PAGES_COLUMN, JUMP_COLUMN = 0, 1, 2
+JUMP_COLUMN_WIDTH = 24
 
 
 # Every extension the converters know about, built from the sets themselves so
@@ -313,8 +319,15 @@ class MainWindow(QMainWindow):
         heading.addWidget(self.btn_jump)
         left_layout.addLayout(heading)
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Source", "Pages"])
-        self.tree.setColumnWidth(0, 250)
+        self.tree.setHeaderLabels(["Source", "Pages", ""])
+        self.tree.setColumnWidth(NAME_COLUMN, 250)
+        header_view = self.tree.header()
+        header_view.setStretchLastSection(False)
+        header_view.setSectionResizeMode(NAME_COLUMN, QHeaderView.Stretch)
+        header_view.setSectionResizeMode(PAGES_COLUMN, QHeaderView.ResizeToContents)
+        header_view.setSectionResizeMode(JUMP_COLUMN, QHeaderView.Fixed)
+        header_view.resizeSection(JUMP_COLUMN, JUMP_COLUMN_WIDTH)
+        self.jump_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowRight)
         self.tree.setIconSize(QSize(TREE_ICON, TREE_ICON))
         self.tree.setIndentation(14)
         self.tree.setRootIsDecorated(True)
@@ -325,6 +338,7 @@ class MainWindow(QMainWindow):
         )
         self.tree.itemChanged.connect(self._on_tree_item_changed)
         self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
+        self.tree.itemClicked.connect(self._on_tree_item_clicked)
         left_layout.addWidget(self.tree)
         splitter.addWidget(left)
 
@@ -819,6 +833,11 @@ class MainWindow(QMainWindow):
             root.setFlags(root.flags() | Qt.ItemIsUserCheckable)
             root.setCheckState(0, Qt.Checked)
             self._fill_source(root, path)
+            pages_here = sum(node.page_count for node in self.model.segments_of(path)
+                             if node.ok)
+            if pages_here:
+                root.setText(PAGES_COLUMN, str(pages_here))
+            self._set_jump(root, pages_here)
             root.setExpanded(True)
 
         # Segments left over (their source was removed) still need showing.
@@ -839,12 +858,46 @@ class MainWindow(QMainWindow):
         self._on_tree_selection_changed()
 
     def _fill_source(self, root: QTreeWidgetItem, path: Path) -> None:
-        """Put a source's own parts and its nested messages under its row."""
-        top_level, messages = self.model.navigator(path)
-        for segment in top_level:
-            self._add_segment_item(root, segment)
-        for message in messages:
-            self._add_message_item(root, message)
+        """Put a source's parts and nested messages under its row, in order.
+
+        In the order the email held them: a forwarded message sits between the
+        attachments it arrived between, rather than after all of them.
+        """
+        self._add_entries(root, self.model.navigator_entries(path))
+
+    def _add_entries(self, parent_item: QTreeWidgetItem, entries: list) -> None:
+        from .document import MessageNode
+
+        for entry in entries:
+            if isinstance(entry, MessageNode):
+                self._add_message_item(parent_item, entry)
+            else:
+                self._add_segment_item(parent_item, entry)
+
+    def _set_jump(self, item: QTreeWidgetItem, page_count: int) -> None:
+        """Give a row the arrow that takes the page column to its first page."""
+        if page_count > 0:
+            item.setIcon(JUMP_COLUMN, self.jump_icon)
+            item.setToolTip(JUMP_COLUMN, "Show in the page list")
+
+    def _on_tree_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        """A click on a row's arrow jumps to its pages; a click elsewhere selects."""
+        if column != JUMP_COLUMN:
+            return
+        position = self.first_page_of(item)
+        if position is None:
+            self.status.showMessage("%s contributes no pages." % item.text(0).strip())
+            return
+        self.go_to_page(position)
+
+    def part_icon(self, segment) -> QIcon:
+        """An attachment's own file-type icon; the generic document for a body."""
+        if segment.kind == "body":
+            return self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+        name = Path(part_name(segment) or "")
+        if name.suffix:
+            return self.file_icon(name)
+        return self.file_icon(segment.source)
 
     def _add_message_item(self, parent_item: QTreeWidgetItem, message) -> None:
         """One nested message: a node of its own, holding its parts.
@@ -866,10 +919,8 @@ class MainWindow(QMainWindow):
                         % (message.page_count, JUMP_HINT))
         if message.label:
             item.setIcon(0, self.file_icon(Path(message.label)))
-        for segment in message.segments:
-            self._add_segment_item(item, segment)
-        for child in message.children:
-            self._add_message_item(item, child)
+        self._set_jump(item, message.page_count)
+        self._add_entries(item, message.entries or message.segments + message.children)
         item.setExpanded(True)
 
     def _add_segment_item(self, parent_item: QTreeWidgetItem, segment) -> None:
@@ -881,6 +932,8 @@ class MainWindow(QMainWindow):
             child.setCheckState(0, Qt.Checked if segment.enabled else Qt.Unchecked)
             child.setData(0, Qt.UserRole, segment.id)
             child.setData(0, ROW_ROLE, "segment")
+            child.setIcon(0, self.part_icon(segment))
+            self._set_jump(child, segment.page_count)
             # Same tint as the pages, so the navigator and the page column agree
             # about which message a row came from.
             child.setBackground(
@@ -893,6 +946,8 @@ class MainWindow(QMainWindow):
             )
             child.setForeground(0, Qt.gray)
             child.setToolTip(0, segment.detail)
+            child.setIcon(0, self.style().standardIcon(
+                QStyle.StandardPixmap.SP_MessageBoxWarning))
             child.setData(0, Qt.UserRole, segment.id)
             child.setData(0, ROW_ROLE, "segment")
 

@@ -944,6 +944,114 @@ def test_jumping_to_a_row_with_no_pages_says_so(window):
     assert "no pages" in window.status.currentMessage()
 
 
+def _mail_with_a_forward_in_the_middle(window, tmp_path):
+    """mail.msg: body, first.pdf, a forwarded message (body, inner.pdf), last.pdf."""
+    source = Path("mail.msg")
+    window.selected_sources = [source]
+    inner = "staged/fwd.msg"
+    add = window.model.add_segment
+    add(source, "mail - body", make_pdf(tmp_path / "b.pdf", 1), True, kind="body",
+        page_count=1, group=str(source), group_label="mail.msg")
+    add(source, "mail - first.pdf", make_pdf(tmp_path / "f.pdf", 2), True,
+        kind="attachment", page_count=2, group=str(source), group_label="mail.msg")
+    add(source, "fwd - body", make_pdf(tmp_path / "fb.pdf", 1), True, kind="body",
+        page_count=1, group=inner, parent=str(source), group_label="fwd.msg", depth=1)
+    add(source, "fwd - inner.pdf", make_pdf(tmp_path / "fi.pdf", 1), True,
+        kind="attachment", page_count=1, group=inner, parent=str(source),
+        group_label="fwd.msg", depth=1)
+    add(source, "mail - last.pdf", make_pdf(tmp_path / "l.pdf", 1), True,
+        kind="attachment", page_count=1, group=str(source), group_label="mail.msg")
+    add(source, "mail - gone.pdf", None, False, kind="attachment",
+        detail="the attachment is empty", group=str(source), group_label="mail.msg")
+    window.refresh_tree()
+    window.refresh_pages()
+    return source
+
+
+def _labels(item, depth=0):
+    rows = [("  " * depth) + item.text(0).strip()]
+    for index in range(item.childCount()):
+        rows.extend(_labels(item.child(index), depth + 1))
+    return rows
+
+
+def test_attachments_nest_under_their_email_in_their_original_order(window, tmp_path):
+    _mail_with_a_forward_in_the_middle(window, tmp_path)
+
+    rows = _labels(window.tree.topLevelItem(0))
+
+    assert rows == [
+        "mail.msg",
+        "  body",
+        "  first.pdf",
+        "  fwd.msg",
+        "    body",
+        "    inner.pdf",
+        "  last.pdf",
+        "  gone.pdf (the attachment is empty)",
+    ]
+
+
+def test_every_row_with_pages_has_a_jump_arrow(window, tmp_path):
+    from consolidator.gui.main_window import JUMP_COLUMN
+
+    _mail_with_a_forward_in_the_middle(window, tmp_path)
+
+    for text in ("mail.msg", "first.pdf", "fwd.msg", "inner.pdf", "last.pdf"):
+        assert not _tree_row(window, text).icon(JUMP_COLUMN).isNull(), text
+    assert _tree_row(window, "gone.pdf").icon(JUMP_COLUMN).isNull(), \
+        "a row with no pages offers nowhere to go"
+
+
+def test_clicking_a_rows_arrow_jumps_to_its_first_page(window, tmp_path):
+    from consolidator.gui.main_window import JUMP_COLUMN
+
+    _mail_with_a_forward_in_the_middle(window, tmp_path)
+
+    for text, expected in (("inner.pdf", 4), ("fwd.msg", 3), ("last.pdf", 5),
+                           ("first.pdf", 1), ("mail.msg", 0)):
+        window.tree.itemClicked.emit(_tree_row(window, text), JUMP_COLUMN)
+        assert window.page_list.currentRow() == expected, text
+
+
+def test_a_row_click_away_from_the_arrow_still_does_not_jump(window, tmp_path):
+    from consolidator.gui.main_window import NAME_COLUMN
+
+    _mail_with_a_forward_in_the_middle(window, tmp_path)
+    window.page_list.setCurrentRow(5)
+
+    window.tree.itemClicked.emit(_tree_row(window, "first.pdf"), NAME_COLUMN)
+
+    assert window.page_list.currentRow() == 5
+
+
+def test_a_reticked_attachment_returns_to_its_place(tmp_path):
+    """Its pages used to be re-inserted at the very top of the document."""
+    model = DocumentModel()
+    for name, count in (("a", 2), ("b", 1), ("c", 2)):
+        model.add_segment(Path(name + ".pdf"), name,
+                          make_pdf(tmp_path / (name + ".pdf"), count), True,
+                          page_count=count)
+    middle = model.segments[1].id
+
+    model.set_segment_enabled(middle, False)
+    model.set_segment_enabled(middle, True)
+
+    assert [p.segment_id for p in model.pages] == [0, 0, 1, 2, 2]
+
+
+def test_a_reticked_first_attachment_goes_back_before_the_rest(tmp_path):
+    model = DocumentModel()
+    for name in ("a", "b"):
+        model.add_segment(Path(name + ".pdf"), name,
+                          make_pdf(tmp_path / (name + ".pdf"), 1), True, page_count=1)
+
+    model.set_segment_enabled(0, False)
+    model.set_segment_enabled(0, True)
+
+    assert [p.segment_id for p in model.pages] == [0, 1]
+
+
 # ------------------------------------------------ per-email extraction policy
 
 

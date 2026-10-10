@@ -52,6 +52,9 @@ class MessageNode:
     segments: list[SegmentNode] = field(default_factory=list)
     children: list["MessageNode"] = field(default_factory=list)
     page_count: int = 0
+    # Segments and child messages together, in the order the message held them,
+    # so a forwarded mail sits between the attachments it arrived between.
+    entries: list = field(default_factory=list)
 
     def descendants(self) -> list[SegmentNode]:
         """Every segment in this message, nested ones included."""
@@ -169,19 +172,45 @@ class DocumentModel:
             return
         node.enabled = enabled
         if enabled:
-            # Re-insert its pages in segment order, after any existing pages of
-            # the same segment, so the user's cross-document ordering survives.
             existing = {p.index for p in self.pages if p.segment_id == segment_id}
-            insert_at = 0
-            for position, page in enumerate(self.pages):
-                if page.segment_id == segment_id:
-                    insert_at = position + 1
-            for index in range(node.page_count):
-                if index not in existing:
-                    self.pages.insert(insert_at, PageRef(segment_id, index))
-                    insert_at += 1
+            missing = [index for index in range(node.page_count) if index not in existing]
+            if not missing:
+                return
+            insert_at = self._home_of(segment_id)
+            for index in missing:
+                self.pages.insert(insert_at, PageRef(segment_id, index))
+                insert_at += 1
         else:
             self.pages = [p for p in self.pages if p.segment_id != segment_id]
+
+    def _home_of(self, segment_id: int) -> int:
+        """Where a segment's returning pages belong in the page list.
+
+        After its own pages if any remain; otherwise after the last page of the
+        nearest segment converted before it, so an attachment ticked back on
+        returns to its place in the email instead of jumping to the top of the
+        document (where re-inserting at position 0 used to put it).
+        """
+        last_own = None
+        for position, page in enumerate(self.pages):
+            if page.segment_id == segment_id:
+                last_own = position
+        if last_own is not None:
+            return last_own + 1
+
+        order = {node.id: rank for rank, node in enumerate(self.segments)}
+        rank = order.get(segment_id, len(order))
+        best_before, best_rank = None, -1
+        after = None
+        for position, page in enumerate(self.pages):
+            other = order.get(page.segment_id, -1)
+            if rank > other >= best_rank:
+                best_rank, best_before = other, position
+            elif other > rank and after is None:
+                after = position
+        if best_before is not None:
+            return best_before + 1
+        return after if after is not None else len(self.pages)
 
     def enabled_segments(self) -> list[SegmentNode]:
         return [s for s in self.segments if s.enabled and s.ok]
@@ -221,20 +250,21 @@ class DocumentModel:
         names.reverse()
         return names[1:]
 
-    def navigator(self, source: Path) -> tuple[list[SegmentNode], list[MessageNode]]:
-        """Split one source's segments into what hangs off it and its messages.
+    def navigator_entries(self, source: Path) -> list:
+        """One source's rows, in order: its own segments and its nested messages.
 
-        Returns the segments belonging to the source itself, in conversion order,
-        and the forest of nested messages, each holding its own segments and the
-        messages found inside it.
+        Each nested message is a :class:`MessageNode` placed where the message was
+        among its carrier's attachments, holding its own entries the same way.
+        The pipeline emits a nested message's segments at the position of the
+        attachment that carried it, so the first segment of a group marks where
+        the group goes.
         """
-        top: list[SegmentNode] = []
+        entries: list = []
         nodes: dict[str, MessageNode] = {}
-        roots: list[MessageNode] = []
 
         for node in self.segments_of(source):
             if node.depth <= 0 or not node.group:
-                top.append(node)
+                entries.append(node)
                 continue
             group = nodes.get(node.group)
             if group is None:
@@ -244,27 +274,44 @@ class DocumentModel:
                 nodes[node.group] = group
                 owner = nodes.get(node.parent)
                 if owner is None:
-                    roots.append(group)
+                    entries.append(group)
                 else:
                     owner.children.append(group)
+                    owner.entries.append(group)
             group.segments.append(node)
+            group.entries.append(node)
 
-        # A message that contributed no segment of its own is only discovered when
-        # its contents arrive, so it can be seen before its carrier. Re-attach
-        # those now that every group is known.
-        for group in list(roots):
-            owner = nodes.get(group.parent)
-            if owner is not None and owner is not group and group not in owner.children:
-                roots.remove(group)
-                owner.children.append(group)
+        # A message seen before its carrier (which the pipeline does not produce,
+        # but a model built by hand can) is moved inside the carrier once known.
+        for entry in list(entries):
+            if isinstance(entry, MessageNode):
+                owner = nodes.get(entry.parent)
+                if owner is not None and owner is not entry and entry not in owner.children:
+                    entries.remove(entry)
+                    owner.children.append(entry)
+                    owner.entries.append(entry)
 
         def total(group: MessageNode) -> int:
             group.page_count = sum(s.page_count for s in group.segments)
             group.page_count += sum(total(child) for child in group.children)
             return group.page_count
 
-        for group in roots:
-            total(group)
+        for entry in entries:
+            if isinstance(entry, MessageNode):
+                total(entry)
+        return entries
+
+    def navigator(self, source: Path) -> tuple[list[SegmentNode], list[MessageNode]]:
+        """Split one source's segments into what hangs off it and its messages.
+
+        Returns the segments belonging to the source itself, in conversion order,
+        and the forest of nested messages, each holding its own segments and the
+        messages found inside it. :meth:`navigator_entries` keeps the two in
+        their original order instead.
+        """
+        entries = self.navigator_entries(source)
+        top = [entry for entry in entries if isinstance(entry, SegmentNode)]
+        roots = [entry for entry in entries if isinstance(entry, MessageNode)]
         return top, roots
 
     # ---------------------------------------------------------- page edits

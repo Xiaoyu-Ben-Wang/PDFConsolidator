@@ -38,17 +38,23 @@ Generate some sample input and try it:
   own attachments. Unticking anything leaves it out, and unticking a message
   leaves out everything inside it. Select a row and press **Delete** or
   **Backspace** to remove it and its pages.
-- **Jump to the page column** with the arrow button beside the *Sources* heading
-  (or **Ctrl+J**): it takes the page list to the earliest page the selected row
-  stands for, scrolled into the middle of the view and selected, so the preview
-  follows. It lands on where the page *is* now, not where it was converted from,
-  so it still works after pages have been moved around. Select a source to go to
-  that source's first page; select an attachment or an email's body to go to that
-  part; select a forwarded message to go to the forwarded message's own first
-  page rather than its carrier's. A row with no pages says so in the status bar.
-  Clicking a row does *not* move the page list — selecting a source is also how
+  An email's parts are listed in the order the email held them, so a forwarded
+  message sits between the attachments it arrived between. Each attachment shows
+  its own file-type icon, and an attachment that could not be read shows a warning
+  icon and the reason.
+- **Jump to the page column** with the arrow at the end of any row that has pages
+  (or select a row and press **Ctrl+J**, or use the arrow beside the *Sources*
+  heading). It takes the page list to the earliest page the row stands for,
+  scrolled into the middle of the view and selected, so the preview follows. It
+  lands on where the page *is* now, not where it was converted from, so it still
+  works after pages have been moved around. A source's arrow goes to that
+  source's first page; an attachment's or an email body's to that part; a
+  forwarded message's to its own first page rather than its carrier's. Clicking
+  elsewhere on a row does *not* move the page list. Selecting a source is also how
   the per-email extraction settings are edited, and a jumping list would be noise
   there.
+- Re-ticking something puts its pages back where they belong, after the part
+  converted before it, rather than at the top of the document.
 - **Pages** (middle) is a single vertical column, one row per page, each row
   showing the page number, the file it came from, the messages it was found
   inside, and any rotation. Rows are coloured by the message they came from, so
