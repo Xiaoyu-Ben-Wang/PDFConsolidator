@@ -328,6 +328,622 @@ def test_colour_is_stable_and_source_specific():
     assert source_colour("a.docx") != source_colour("b.docx")
 
 
+def test_embedded_messages_are_drilled_into_by_default():
+    """A forwarded email is ordinary mail, so its contents are extracted."""
+    from consolidator import email_items
+
+    policy = email_items.ExtractionPolicy()
+    assert policy.embedded is True
+    assert policy.max_depth >= 2, "a forwarded email must not stop at the first level"
+    assert policy.max_depth == 4, "forwards of forwards are common enough to matter"
+
+
+def test_the_file_dialog_filter_covers_everything_that_converts():
+    """The dialog list is built from the converters, so it cannot drift."""
+    from consolidator import convert
+    from consolidator.gui.main_window import SUPPORTED_FILTER
+
+    for ext in convert.SUPPORTED_EXTS:
+        assert "*" + ext in SUPPORTED_FILTER, "%s missing from the file dialog" % ext
+    assert "*.xlsm" in SUPPORTED_FILTER, "the format that prompted this"
+    assert "*.htm" in SUPPORTED_FILTER and "*.html" in SUPPORTED_FILTER
+    assert "*.txt" in SUPPORTED_FILTER
+
+
+# ------------------------------------------------- nested messages in the UI
+
+
+def add_forwarded_message(model, tmp_path, outer: Path) -> str:
+    """Give ``model`` an email carrying a forwarded message.
+
+    The forwarded message has a body of two pages and an attachment of one, so
+    the tests can tell the levels of the nesting apart by page counts.
+    """
+    inner = "staged/forwarded.msg"
+    model.add_segment(outer, "outer - body", make_pdf(tmp_path / "outer.pdf", 1), True,
+                      kind="body", page_count=1, group=str(outer),
+                      group_label="outer.msg")
+    model.add_segment(outer, "forwarded - body",
+                      make_pdf(tmp_path / "inner_body.pdf", 2), True,
+                      kind="body", page_count=2, group=inner, parent=str(outer),
+                      group_label="forwarded.msg", depth=1)
+    model.add_segment(outer, "forwarded - note.pdf",
+                      make_pdf(tmp_path / "inner_note.pdf", 1), True,
+                      kind="attachment", page_count=1, group=inner, parent=str(outer),
+                      group_label="forwarded.msg", depth=1)
+    return inner
+
+
+@pytest.fixture
+def nested_model(tmp_path):
+    outer = Path("outer.msg")
+    model = DocumentModel()
+    inner = add_forwarded_message(model, tmp_path, outer)
+    return model, outer, inner
+
+
+def test_a_forwarded_message_is_its_own_node(nested_model):
+    model, outer, inner = nested_model
+    top_level, messages = model.navigator(outer)
+
+    assert [s.group for s in top_level] == [str(outer)], \
+        "the carrier's own pages stay at its level"
+    assert len(messages) == 1
+    message = messages[0]
+    assert message.label == "forwarded.msg"
+    assert message.parent == str(outer)
+    assert [s.group for s in message.segments] == [inner, inner]
+    assert message.children == []
+    assert message.page_count == 3, "a node counts every page inside it"
+    assert [s.group for s in message.descendants()] == [inner, inner]
+
+
+def test_a_forwarded_message_gets_a_colour_of_its_own(nested_model):
+    from consolidator.gui.main_window import node_colour
+
+    model, outer, _inner = nested_model
+    top_level, messages = model.navigator(outer)
+    carrier = top_level[0]
+    body, note = messages[0].segments
+
+    carrier_colour = node_colour(carrier, model.group_owner(carrier))
+    body_colour = node_colour(body, model.group_owner(body))
+
+    assert carrier_colour != body_colour, "a nested message must not blend into its carrier"
+    assert node_colour(note, model.group_owner(note)) == body_colour, \
+        "every page of one message shares its colour"
+
+
+def test_a_nested_row_names_the_messages_it_was_found_inside(nested_model):
+    from consolidator.gui.main_window import row_description
+
+    model, outer, _inner = nested_model
+    _top_level, messages = model.navigator(outer)
+    body = messages[0].segments[0]
+
+    text = row_description(body, PageRef(0, 0), 2, model.group_trail(body))
+    assert text.startswith("2.  outer.msg")
+    assert "forwarded.msg" in text and "body" in text
+    assert "\u203a" in text, "the nesting has to be visible in the row"
+
+
+def test_the_navigator_nests_a_forwarded_message(window, tmp_path):
+    outer = Path("outer.msg")
+    window.selected_sources = [outer]
+    add_forwarded_message(window.model, tmp_path, outer)
+    window.refresh_tree()
+
+    root = window.tree.topLevelItem(0)
+    assert root.text(0) == "outer.msg"
+    assert root.childCount() == 2, "the carrier's body, then the forwarded message"
+    assert root.child(0).text(0).strip() == "body"
+
+    message = root.child(1)
+    assert message.text(0).strip() == "forwarded.msg"
+    assert message.childCount() == 2, "the nested body and its attachment"
+    assert message.text(1) == "3"
+
+
+def test_unticking_a_nested_message_leaves_out_everything_inside_it(window, tmp_path):
+    from PySide6.QtCore import Qt
+
+    outer = Path("outer.msg")
+    window.selected_sources = [outer]
+    add_forwarded_message(window.model, tmp_path, outer)
+    window.refresh_tree()
+    window.refresh_pages()
+    assert window.model.page_count == 4
+
+    window.tree.topLevelItem(0).child(1).setCheckState(0, Qt.Unchecked)
+
+    assert window.model.page_count == 1, "only the carrier's own body should remain"
+    assert window.page_list.count() == 1
+
+
+# ------------------------------------------------------- scale and progress
+
+
+def test_indexes_keep_up_with_removal(tmp_path):
+    """The lookup indexes must not go stale when segments come and go."""
+    model = DocumentModel()
+    a = model.add_segment(Path("a.docx"), "a", make_pdf(tmp_path / "a.pdf", 2),
+                          True, page_count=2)
+    b = model.add_segment(Path("b.docx"), "b", make_pdf(tmp_path / "b.pdf", 1),
+                          True, page_count=1)
+
+    assert model.segment(b.id) is b
+    model.drop_source(Path("a.docx"))
+    assert model.segment(a.id) is None
+    assert model.segment(b.id) is b
+    assert model.page_count == 1
+
+    model.remove_failed_for(Path("b.docx"))
+    assert model.segment(b.id) is b, "a successful segment survives a retry cleanup"
+
+    model.clear()
+    assert model.segment(b.id) is None and model.page_count == 0
+
+
+def test_progress_bar_counts_files_and_shows_what_is_happening(window):
+    # isHidden() rather than isVisible(): the test window is never shown, so
+    # every child would report itself invisible.
+    window._begin_progress(4, "Converting 4 file(s)\u2026")
+    assert not window.progress.isHidden()
+    assert (window.progress.minimum(), window.progress.maximum()) == (0, 4)
+    assert not window.btn_cancel.isHidden(), "a long batch has to be stoppable"
+
+    window._on_progress(3, 4, "third.pdf")
+    assert window.progress.value() == 3
+    assert window.progress.text() == "3 / 4"
+    assert "third.pdf" in window.status.currentMessage()
+
+    window._end_progress()
+    assert window.progress.isHidden()
+    assert window.btn_cancel.isHidden()
+
+
+def test_thumbnails_survive_two_threads_and_a_tiny_document_cache(tmp_path):
+    """The reported bug: a page that "fails to render" on a large folder.
+
+    The thumbnail worker renders on one thread while the preview renders on the
+    GUI thread. The document cache evicts and *closes* documents once it is full -
+    which a large folder always fills - so without a lock a document could be
+    closed midway through rendering it. pypdfium2 raises, the failure was
+    swallowed, and those thumbnails simply never appeared.
+    """
+    import threading
+    from consolidator.gui.thumbs import ThumbnailCache
+
+    pdfs = [make_pdf(tmp_path / ("doc%d.pdf" % i), 3) for i in range(8)]
+    cache = ThumbnailCache(document_cache=2, image_cache=8)
+    errors: list[str] = []
+
+    def hammer(offset: int) -> None:
+        for round_number in range(6):
+            for index, pdf in enumerate(pdfs):
+                for page in range(3):
+                    image = cache.image(pdf, page)
+                    if image is None:
+                        errors.append("worker %d: %s page %d" % (offset, pdf.name, page))
+
+    def preview() -> None:
+        for round_number in range(6):
+            for pdf in pdfs:
+                cache.render(pdf, 0, 400)
+
+    threads = [threading.Thread(target=hammer, args=(n,)) for n in range(3)]
+    threads.append(threading.Thread(target=preview))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors, "renders failed while the cache was evicting: %s" % errors[:5]
+    assert cache.failed == 0, cache.last_error
+
+
+def test_a_failed_thumbnail_is_reported_not_hidden(window, tmp_path):
+    """A silent gap cannot be told from a page that was never there."""
+    pdf = make_pdf(tmp_path / "alpha.pdf", 1)
+    window.model.add_segment(Path("alpha.docx"), "alpha", pdf, True, page_count=1)
+    window.refresh_pages()
+
+    window.thumbs.failed = 3
+    window.thumbs.last_error = "ValueError: page is closed"
+    window._on_thumbnails_finished()
+
+    message = window.status.currentMessage()
+    assert "3 page(s) could not be rendered" in message
+    assert "unaffected" in message
+
+
+def test_a_clean_thumbnail_run_says_nothing(window, tmp_path):
+    pdf = make_pdf(tmp_path / "alpha.pdf", 1)
+    window.model.add_segment(Path("alpha.docx"), "alpha", pdf, True, page_count=1)
+    window.refresh_pages()
+
+    window.thumbs.failed = 0
+    window.status.showMessage("unchanged")
+    window._on_thumbnails_finished()
+
+    assert window.status.currentMessage() == "unchanged"
+
+
+def test_only_the_visible_pages_are_rendered(window, tmp_path):
+    """Several hundred files must not mean several hundred rendered thumbnails."""
+    from consolidator.gui.main_window import (
+        THUMBNAIL_MARGIN, VISIBLE_PAGES,
+    )
+
+    pdf = make_pdf(tmp_path / "big.pdf", 1)
+    for index in range(300):
+        window.model.add_segment(Path("file%d.docx" % index), "file%d" % index,
+                                 pdf, True, page_count=1)
+    window.refresh_pages()
+
+    assert window.page_list.count() == 300, "every page still gets a row"
+    first, last = window._thumb_range
+    limit = VISIBLE_PAGES + 2 * THUMBNAIL_MARGIN
+    assert 0 <= first < last <= 300
+    assert last - first <= limit, \
+        "asked to render %d thumbnails for a %d-row list" % (last - first, 300)
+
+
+def test_cancel_stops_a_batch_part_way(window):
+    """Cancelling asks the running worker to stop at the next file."""
+    asked = []
+
+    class FakeWorker:
+        def cancel(self):
+            asked.append(True)
+
+        def isRunning(self):
+            return True
+
+        def wait(self, *_args):     # consulted by MainWindow.closeEvent
+            return True
+
+    window.btn_cancel.setVisible(True)
+    window.btn_cancel.setEnabled(True)
+    window._conversion = FakeWorker()
+
+    window.cancel_conversion()
+
+    assert asked == [True]
+    assert not window.btn_cancel.isEnabled(), "no second cancel while stopping"
+    assert "Stopping" in window.status.currentMessage()
+
+
+def test_a_cancelled_run_is_reported_as_stopped_not_as_failures(window):
+    """Whatever did not get converted was cancelled, not broken."""
+    from types import SimpleNamespace
+
+    report = SimpleNamespace(sources=[], all_segments=[], segments=[], cancelled=True)
+    window._on_converted(report)
+
+    assert "Stopped." in window.status.currentMessage()
+
+
+def test_a_second_pass_is_reported_so_the_user_can_act_on_it(window):
+    """If LibreOffice needed a single-file pass, say so and suggest the remedy."""
+    from types import SimpleNamespace
+
+    report = SimpleNamespace(sources=[], all_segments=[], segments=[],
+                             cancelled=False, retried_batches=3)
+    window._on_converted(report)
+
+    message = window.status.currentMessage()
+    assert "second, single-file pass on 3 batch(es)" in message
+    assert "CONSOLIDATOR_WORKERS=2" in message
+
+
+def test_a_clean_run_says_nothing_about_a_second_pass(window):
+    from types import SimpleNamespace
+
+    report = SimpleNamespace(sources=[], all_segments=[], segments=[],
+                             cancelled=False, retried_batches=0)
+    window._on_converted(report)
+
+    assert "CONSOLIDATOR_WORKERS" not in window.status.currentMessage()
+
+
+def test_a_merge_that_skipped_something_says_so(window, monkeypatch):
+    """A document that is quietly short is worse than one that fails."""
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: 0)
+
+    report = SimpleNamespace(pages=7, separators=0,
+                             skipped=[("locked.pdf", "PDF is encrypted"),
+                                      ("secret.pdf", "needs a password")])
+    window._on_merged(report)
+
+    assert "2 item(s) could not be merged" in window.status.currentMessage()
+    assert not window.banner.isHidden()
+    assert "locked.pdf" in window.lbl_banner.text()
+    assert window._merge_skips == report.skipped
+
+
+def test_a_merge_without_skips_hides_the_banner(window, monkeypatch):
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: 0)
+
+    window.banner.setVisible(True)
+    window._on_merged(SimpleNamespace(pages=3, separators=1, skipped=[]))
+
+    assert window.banner.isHidden()
+    assert "Wrote 3 page(s) including 1 separator(s)" in window.status.currentMessage()
+
+
+# --------------------------------------------------------- failure reporting
+
+
+def test_failures_are_reported_without_blocking_the_window(window):
+    """A few failures in a big batch must not stop the interface to announce it."""
+    from consolidator.model import ATTACHMENT, Segment
+
+    failures = [
+        Segment(Path("a.msg"), "a - body", ATTACHMENT, None, False,
+                "LibreOffice timed out"),
+        Segment(Path("b.msg"), "b - body", ATTACHMENT, None, False,
+                "no output produced"),
+    ]
+    window._report_failures(failures)
+
+    assert not window.banner.isHidden()
+    assert "2 item(s)" in window.lbl_banner.text()
+    assert "a.msg" in window.lbl_banner.text()
+    assert window.failure_lines() == [
+        "a - body\n    LibreOffice timed out",
+        "b - body\n    no output produced",
+    ]
+
+
+def test_retry_from_the_banner_covers_each_source_once(window):
+    """Retrying a message with three broken parts must not convert it three times."""
+    from consolidator.model import ATTACHMENT, Segment
+
+    asked = []
+    window.retry_sources = lambda sources: asked.append(list(sources))
+    window._failures = [
+        Segment(Path("a.msg"), "a - body", ATTACHMENT, None, False, "x"),
+        Segment(Path("a.msg"), "a - note.pdf", ATTACHMENT, None, False, "y"),
+        Segment(Path("b.msg"), "b - body", ATTACHMENT, None, False, "z"),
+    ]
+    window.banner.setVisible(True)
+
+    window.retry_failed()
+
+    assert asked == [[Path("a.msg"), Path("b.msg")]]
+    assert window.banner.isHidden(), "the banner goes away once its retry is running"
+
+
+def test_a_long_failure_list_stays_readable(window):
+    from consolidator.model import ATTACHMENT, Segment
+
+    window._report_failures([
+        Segment(Path("f%d.msg" % index), "f%d - body" % index, ATTACHMENT, None,
+                False, "boom")
+        for index in range(250)
+    ])
+
+    lines = window.failure_lines()
+    assert len(lines) == 201, "the list is capped, with a count of the remainder"
+    assert "and 50 more" in lines[-1]
+
+
+# ---------------------------------------------------------------- licensing
+
+
+def test_about_text_states_the_licence_and_the_warranty_position():
+    from consolidator.gui.licences import about_text
+
+    text = about_text()
+    assert "GNU General Public License, version 3 or later" in text
+    assert "WITHOUT ANY WARRANTY" in text
+    assert "2026 Xiaoyu-Ben-Wang" in text
+
+
+def test_licences_are_found_beside_a_frozen_executable(qapp, tmp_path, monkeypatch):
+    """In the bundle the texts sit beside the exe, not in a checkout."""
+    from consolidator.gui import licences
+
+    bundle = tmp_path / "PDFConsolidator"
+    (bundle / "libreoffice").mkdir(parents=True)
+    (bundle / "LICENSE").write_text("gpl text", encoding="utf-8")
+    (bundle / "THIRD-PARTY-NOTICES.md").write_text("notices text", encoding="utf-8")
+    (bundle / "libreoffice" / "license.txt").write_text("libreoffice text",
+                                                        encoding="utf-8")
+
+    monkeypatch.setattr(licences.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(licences.sys, "executable", str(bundle / "PDFConsolidator.exe"))
+
+    assert [title for title, _path in licences.documents()] == [
+        "Third-party notices", "GNU General Public License v3.0", "LibreOffice",
+    ]
+
+    dialog = licences.LicencesDialog()
+    assert dialog.view.toPlainText().strip() == "notices text"
+    dialog.show_document("GNU General Public License v3.0", bundle / "LICENSE")
+    assert dialog.view.toPlainText().strip() == "gpl text"
+
+
+def test_the_window_offers_the_licences(qapp):
+    """The About button and the Help menu both have to exist and be wired."""
+    from consolidator.gui.main_window import MainWindow
+
+    win = MainWindow()
+    try:
+        assert win.btn_about.text() == "About"
+        assert win.act_about.text().startswith("About")
+        assert win.act_licences.text().startswith("Licences")
+        help_menu = win.menuBar().actions()[0].menu()
+        assert [action.text() for action in help_menu.actions()] == [
+            win.act_about.text(), win.act_licences.text(),
+        ]
+    finally:
+        win.close()
+
+
+# ------------------------------------------------- navigator to page row
+
+
+def _tree_row(window, text: str):
+    """The navigator row whose label contains *text*."""
+    queue = [window.tree.topLevelItem(i) for i in range(window.tree.topLevelItemCount())]
+    while queue:
+        item = queue.pop(0)
+        if text in item.text(0):
+            return item
+        queue.extend(item.child(i) for i in range(item.childCount()))
+    raise AssertionError("no navigator row matching %r" % text)
+
+
+def _jump(window, text: str) -> bool:
+    """Select a navigator row and press the jump button."""
+    window.tree.setCurrentItem(_tree_row(window, text))
+    return window.jump_to_selected()
+
+
+def test_the_jump_is_an_icon_button_not_a_row_click(window, tmp_path):
+    """Clicking a row must not move the page list; the button is the action."""
+    from PySide6.QtWidgets import QStyle
+
+    assert window.btn_jump.toolTip().startswith("Show the selected item's pages")
+    assert not window.btn_jump.icon().isNull(), "the button is an icon"
+    assert window.btn_jump.autoRaise(), "a bare icon, not a chunky button"
+
+    pdf = make_pdf(tmp_path / "alpha.pdf", 2)
+    window.selected_sources = [Path("alpha.pdf")]
+    window.model.add_segment(Path("alpha.pdf"), "alpha", pdf, True, page_count=2)
+    window.refresh_tree()
+    window.refresh_pages()
+    window.page_list.setCurrentRow(1)
+
+    window.tree.setCurrentItem(_tree_row(window, "alpha.pdf"))
+    window.tree.itemClicked.emit(_tree_row(window, "alpha.pdf"), 0)
+
+    assert window.page_list.currentRow() == 1, "clicking a row must not jump"
+
+
+def test_the_jump_button_needs_a_selection(window):
+    window.tree.clearSelection()
+    assert window.jump_to_selected() is False
+    assert "Select a source" in window.status.currentMessage()
+
+
+def test_clicking_a_source_jumps_to_its_first_page(window, tmp_path):
+    first, second = Path("alpha.pdf"), Path("beta.pdf")
+    window.selected_sources = [first, second]
+    window.model.add_segment(first, "alpha", make_pdf(tmp_path / "a.pdf", 2),
+                             True, page_count=2)
+    window.model.add_segment(second, "beta", make_pdf(tmp_path / "b.pdf", 1),
+                             True, page_count=1)
+    window.refresh_tree()
+    window.refresh_pages()
+
+    assert _jump(window, "beta.pdf") is True
+
+    assert window.page_list.currentRow() == 2
+    assert [window.page_list.row(i) for i in window.page_list.selectedItems()] == [2]
+
+
+def test_clicking_a_part_jumps_to_that_part_not_the_next_one(window, tmp_path):
+    source = Path("mail.msg")
+    window.selected_sources = [source]
+    window.model.add_segment(source, "mail - body", make_pdf(tmp_path / "b.pdf", 1),
+                             True, kind="body", page_count=1,
+                             group=str(source), group_label="mail.msg")
+    window.model.add_segment(source, "mail - invoice.pdf",
+                             make_pdf(tmp_path / "i.pdf", 3), True,
+                             kind="attachment", page_count=3,
+                             group=str(source), group_label="mail.msg")
+    window.refresh_tree()
+    window.refresh_pages()
+
+    _jump(window, "invoice.pdf")
+
+    assert window.page_list.currentRow() == 1, "the attachment starts at row 1"
+
+
+def test_clicking_a_forwarded_message_lands_on_its_own_body(window, tmp_path):
+    outer = Path("outer.msg")
+    window.selected_sources = [outer]
+    add_forwarded_message(window.model, tmp_path, outer)
+    window.refresh_tree()
+    window.refresh_pages()
+    assert window.model.page_count == 4
+
+    _jump(window, "forwarded.msg")
+    assert window.page_list.currentRow() == 1, "the carrier's body is row 0"
+
+    _jump(window, "note.pdf")
+    assert window.page_list.currentRow() == 3, "the nested attachment is last"
+
+
+def test_the_jump_follows_pages_the_user_has_moved(window, tmp_path):
+    """The jump lands where the page is now, not where it was converted."""
+    outer = Path("outer.msg")
+    window.selected_sources = [outer]
+    add_forwarded_message(window.model, tmp_path, outer)
+    window.refresh_pages()
+
+    moved = window.model.pages.pop(3)          # the nested attachment's page
+    window.model.pages.insert(0, moved)
+    window.refresh_tree()
+    window.refresh_pages()
+
+    _jump(window, "note.pdf")
+    assert window.page_list.currentRow() == 0
+
+
+def test_the_jump_scrolls_the_page_into_view(window, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QAbstractItemView
+
+    pdf = make_pdf(tmp_path / "long.pdf", 200)
+    source = Path("long.pdf")
+    window.selected_sources = [source]
+    window.model.add_segment(source, "long", pdf, True, page_count=200)
+    window.refresh_tree()
+    window.refresh_pages()
+
+    scrolled = []
+    monkeypatch.setattr(window.page_list, "scrollToItem",
+                        lambda item, hint=None: scrolled.append((item, hint)))
+
+    window.go_to_page(150)
+
+    assert window.page_list.currentRow() == 150
+    assert scrolled and scrolled[0][0] is window.page_list.item(150)
+    assert scrolled[0][1] == QAbstractItemView.PositionAtCenter
+
+
+def test_the_jump_has_a_keyboard_shortcut(window):
+    """Ctrl+J from either list does the same as the button."""
+    from PySide6.QtGui import QKeySequence, QShortcut
+
+    sequences = {
+        shortcut.key().toString()
+        for widget in (window.tree, window.page_list)
+        for shortcut in widget.findChildren(QShortcut)
+    }
+    assert QKeySequence("Ctrl+J").toString() in sequences
+
+
+def test_jumping_to_a_row_with_no_pages_says_so(window):
+    source = Path("broken.pdf")
+    window.selected_sources = [source]
+    window.model.add_segment(source, "broken", None, False, detail="boom")
+    window.refresh_tree()
+    window.refresh_pages()
+
+    assert _jump(window, "broken") is False
+    assert "no pages" in window.status.currentMessage()
+
+
 # ------------------------------------------------ per-email extraction policy
 
 
@@ -364,22 +980,22 @@ def test_each_email_keeps_its_own_policy(window_with_emails):
     window = window_with_emails
 
     _select_source(window, "first.eml")
-    window.policy_checks["office"].setChecked(False)
+    window.policy_checks["documents"].setChecked(False)
     first = window.policy_for(Path("first.eml"))
-    assert first.office is False
+    assert first.documents is False
 
     _select_source(window, "second.eml")
     # The second email must still have the default.
-    assert window.policy_for(Path("second.eml")).office is True
-    assert window.policy_checks["office"].isChecked() is True
+    assert window.policy_for(Path("second.eml")).documents is True
+    assert window.policy_checks["documents"].isChecked() is True
 
-    window.policy_checks["embedded"].setChecked(True)
+    window.policy_checks["embedded"].setChecked(False)
     second = window.policy_for(Path("second.eml"))
-    assert second.embedded is True
+    assert second.embedded is False
 
     # And the first email is unchanged.
-    assert window.policy_for(Path("first.eml")).office is False
-    assert window.policy_for(Path("first.eml")).embedded is False
+    assert window.policy_for(Path("first.eml")).documents is False
+    assert window.policy_for(Path("first.eml")).embedded is True
 
 
 def test_selecting_an_email_loads_its_policy_into_the_checkboxes(window_with_emails):
@@ -412,7 +1028,7 @@ def test_apply_to_all_emails_resets_overrides(window_with_emails):
     window = window_with_emails
 
     _select_source(window, "first.eml")
-    window.policy_checks["office"].setChecked(False)
+    window.policy_checks["documents"].setChecked(False)
     assert window.source_policies
 
     _select_source(window, "second.eml")
@@ -508,6 +1124,7 @@ def test_retry_uses_a_separate_scratch_subdirectory(window, tmp_path, monkeypatc
                 pass
 
         progressed = _Sig()
+        advanced = _Sig()
         completed = _Sig()
         crashed = _Sig()
 
@@ -532,8 +1149,49 @@ def test_adding_files_schedules_conversion(window, tmp_path):
     assert window._autoconvert.isActive(), "conversion should be queued"
 
 
+def test_autoconvert_timer_runs_the_incremental_path(window, tmp_path, monkeypatch):
+    """Regression: the timer was wired to the full re-convert.
+
+    That would have discarded page edits every time a file was added, which is
+    the exact thing the incremental design exists to prevent. This asserts the
+    wiring rather than just the method.
+    """
+    calls = []
+    monkeypatch.setattr(
+        window, "_run_conversion",
+        lambda sources, replace: calls.append((list(sources), replace)),
+    )
+
+    pdf = make_pdf(tmp_path / "a.pdf", 1)
+    window.selected_sources = [pdf]
+    window._converted_sources = set()
+    window._autoconvert.start()
+    window._autoconvert.timeout.emit()      # fire it without waiting
+
+    assert calls, "the timer should have started a conversion"
+    sources, replace = calls[0]
+    assert replace is False, "auto-convert must be incremental, not a full rebuild"
+    assert sources == [pdf]
+
+
+def test_convert_button_is_still_a_full_reconvert(window, tmp_path, monkeypatch):
+    """The Convert button stays, and does rebuild everything."""
+    calls = []
+    monkeypatch.setattr(
+        window, "_run_conversion",
+        lambda sources, replace: calls.append((list(sources), replace)),
+    )
+    pdf = make_pdf(tmp_path / "a.pdf", 1)
+    window.selected_sources = [pdf]
+    window._converted_sources = {str(pdf)}
+
+    window.start_conversion()
+
+    assert calls and calls[0][1] is True
+    assert window._converted_sources == set(), "a full rebuild forgets what was done"
+
+
 def test_only_new_sources_are_converted(window, tmp_path, monkeypatch):
-    """Adding a file must not throw away edits made to existing pages."""
     from consolidator.gui import main_window as mw
 
     captured = {}
@@ -553,6 +1211,7 @@ def test_only_new_sources_are_converted(window, tmp_path, monkeypatch):
                 pass
 
         progressed = _Sig()
+        advanced = _Sig()
         completed = _Sig()
         crashed = _Sig()
 

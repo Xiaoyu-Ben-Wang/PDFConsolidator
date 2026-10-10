@@ -20,8 +20,13 @@ from . import (
     pipeline,
 )
 
-# What is pulled out of an email item unless told otherwise.
-DEFAULT_EXTRACT = ("pdf", "images", "office")
+# What is pulled out of an email item unless told otherwise. Attached messages are
+# included: a forwarded email is ordinary mail, and its contents are the point.
+DEFAULT_EXTRACT = ("pdf", "images", "documents", "embedded")
+
+# Older spelling of the "documents" category, still accepted so a script or a
+# habit built on it keeps working.
+CATEGORY_ALIASES = {"office": "documents"}
 
 
 def _cmd_build(args: argparse.Namespace) -> int:
@@ -33,7 +38,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
     supported = [s for s in sources if convert.is_supported(s)]
     unsupported = [s for s in sources if not convert.is_supported(s)]
 
-    chosen = {c.strip().lower() for c in args.extract.split(",") if c.strip()}
+    chosen = {CATEGORY_ALIASES.get(c.strip().lower(), c.strip().lower())
+              for c in args.extract.split(",") if c.strip()}
     unknown = chosen - set(email_items.CATEGORIES)
     if unknown:
         print("Unknown extract category: %s" % ", ".join(sorted(unknown)), file=sys.stderr)
@@ -44,7 +50,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         body=not args.no_body,
         pdf="pdf" in chosen,
         images="images" in chosen,
-        office="office" in chosen,
+        documents="documents" in chosen,
         embedded="embedded" in chosen,
         other="other" in chosen,
         max_attachment_bytes=int(args.max_attachment_mb * 1024 * 1024),
@@ -304,7 +310,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="omit the message body page")
     email.add_argument("--max-attachment-mb", type=float, default=64.0,
                        help="skip attachments larger than this (default: %(default)s)")
-    email.add_argument("--max-depth", type=int, default=3,
+    email.add_argument("--max-depth", type=int,
+                       default=email_items.ExtractionPolicy.max_depth,
                        help="maximum nested-message depth (default: %(default)s)")
 
     layout = build.add_argument_group("layout")

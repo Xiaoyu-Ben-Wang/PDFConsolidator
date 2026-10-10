@@ -260,29 +260,57 @@ def _title_page(width: float, height: float, label: str, index: int) -> object:
 # --------------------------------------------------------------------- merge
 
 
+def open_pdf(path: Path):
+    """Open a PDF for merging, unlocking one that only *looks* locked.
+
+    Plenty of real attachments are "protected" with no user password at all: a
+    scanner or a bank sets an owner password and prints permissions, and every
+    reader opens the file for anyone who asks. Refusing those dropped the whole
+    attachment from the output, which is how a section of a document goes missing
+    without a word. Returns ``(reader, reason)``; ``reader`` is None when the file
+    really does need a password.
+    """
+    reader = PdfReader(str(path))
+    if not reader.is_encrypted:
+        return reader, ""
+    try:
+        unlocked = reader.decrypt("")
+    except Exception:
+        unlocked = 0
+    if not unlocked:
+        return None, "PDF is encrypted and needs a password"
+    return reader, ""
+
+
 def merge(
     entries: list[MergeEntry],
     dest: Path,
     page_size: tuple[float, float] | None = None,
     margin: float = 0.0,
-    bookmarks: bool = True,
+    bookmarks: bool | None = None,
     title: str | None = None,
     options: MergeOptions | None = None,
 ) -> MergeReport:
     """Merge ``entries`` in order into ``dest``, written atomically.
 
     ``options`` carries the richer settings (numbering, headers, separators);
-    the individual keyword arguments are kept for simple callers and tests.
+    the individual keyword arguments are kept for simple callers and tests. Each
+    of those arguments overrides ``options`` **only when given**: ``bookmarks``
+    used to default to ``True`` and be assigned unconditionally, so a caller who
+    passed ``options`` with bookmarks switched off got them anyway - which is why
+    ``--no-bookmarks`` produced a document full of bookmarks.
     """
     if options is None:
         options = MergeOptions(page_size=page_size, margin=margin,
-                               bookmarks=bookmarks, title=title or "")
+                               bookmarks=True if bookmarks is None else bookmarks,
+                               title=title or "")
     else:
         if page_size is not None:
             options.page_size = page_size
         if margin:
             options.margin = margin
-        options.bookmarks = bookmarks
+        if bookmarks is not None:
+            options.bookmarks = bookmarks
         if title:
             options.title = title
 
@@ -296,17 +324,27 @@ def merge(
     for entry in entries:
         path = Path(entry.path)
         try:
-            reader = PdfReader(str(path))
-            if reader.is_encrypted:
-                report.skipped.append((entry.label or path.name, "PDF is encrypted"))
+            reader, reason = open_pdf(path)
+            if reader is None:
+                report.skipped.append((entry.label or path.name, reason))
                 continue
             specs = entry.pages
             if specs is None:
                 specs = [PageSpec(i) for i in range(len(reader.pages))]
+            requested = len(specs)
             specs = [s for s in specs if 0 <= s.index < len(reader.pages)]
             if not specs:
                 report.skipped.append((entry.label or path.name, "no pages selected"))
                 continue
+            if len(specs) != requested:
+                # Pages were asked for that the file does not have. Saying so is
+                # the difference between "the document is shorter than it looks"
+                # and a mystery.
+                report.skipped.append(
+                    (entry.label or path.name,
+                     "%d page(s) requested beyond the end of the file"
+                     % (requested - len(specs)))
+                )
             planned.append((entry, specs))
             total_pages += len(specs)
             if options.separator == "title" and len(planned) > 1:
@@ -342,7 +380,12 @@ def merge(
             report.separators += 1
             page_number += 1
 
-        reader = PdfReader(str(path))
+        reader, reason = open_pdf(path)
+        if reader is None:
+            # It opened in the planning pass, so this is unexpected - report it
+            # rather than writing a document that is quietly short.
+            report.skipped.append((label, reason or "could not be opened"))
+            continue
         start_index = len(writer.pages)
 
         for position, spec in enumerate(specs, start=1):

@@ -5,7 +5,7 @@ Two things shape this module:
 * **A source can yield several segments.** An Outlook item produces a body
   segment plus one per extracted attachment, and those all become pages. So the
   pipeline works in segments, not files.
-* **LibreOffice start-up dominates.** Plain Office documents are staged under
+* **LibreOffice start-up dominates.** Documents it lays out - Office files and web
   unique names and converted in a single batched invocation, which is far faster
   than one invocation each. Staging with an index prefix also removes any chance
   of two files with the same name colliding, since ``soffice`` always names its
@@ -23,6 +23,7 @@ import re
 import shutil
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -30,6 +31,114 @@ from . import assemble, convert, email_items, libreoffice, pages
 from .model import DOCUMENT, Segment, SourceResult
 
 OFFICE_BATCH_TIMEOUT = 900
+
+# How many LibreOffice conversions to run at once. Most of the wall clock for many
+# small documents is start-up, and start-ups overlap perfectly; what does not scale
+# is memory, because each invocation gets its own profile and a loaded document.
+# Measured on a sixteen-core machine converting 48 documents: one at a time 63s,
+# four at a time 23s (2.7x). Eight was faster still (17s) but is deliberately not
+# used. CONSOLIDATOR_WORKERS can only lower this, for a machine that dislikes
+# several soffice processes.
+MAX_CONVERT_WORKERS = 4
+
+
+def conversion_workers() -> int:
+    """How many LibreOffice invocations to allow at once."""
+    override = os.environ.get("CONSOLIDATOR_WORKERS", "").strip()
+    if override.isdigit():
+        return max(1, min(MAX_CONVERT_WORKERS, int(override)))
+    cores = os.cpu_count() or 1
+    return max(1, min(MAX_CONVERT_WORKERS, cores // 2))
+
+
+# LibreOffice reports nothing until it exits, so handing it every file at once
+# means a progress bar that does not move for minutes - which on a folder of a
+# thousand files is indistinguishable from a crash. The batch is split into a
+# handful of chunks instead: each costs one extra start-up (about five seconds
+# measured here) and buys a progress update. The floor avoids pointless
+# start-ups on small batches; the ceiling keeps the ticks frequent enough on
+# huge ones.
+BATCH_TARGET_CHUNKS = 15
+BATCH_CHUNK_MIN = 25
+BATCH_CHUNK_MAX = 100
+
+# How long to wait before re-running a conversion chunk that produced nothing.
+RETRY_PAUSE_SECONDS = 2.0
+
+
+def _chunk_size(total: int, smallest: int = BATCH_CHUNK_MIN,                largest: int = BATCH_CHUNK_MAX,
+                target: int = BATCH_TARGET_CHUNKS) -> int:
+    """How many files to hand one LibreOffice invocation."""
+    if total <= smallest:
+        return max(total, 1)
+    return max(smallest, min(largest, total // target or smallest))
+
+
+def _chunks(items: list, size: int) -> list[list]:
+    return [items[start:start + size] for start in range(0, len(items), size)]
+
+
+def _convert_jobs(jobs: list[tuple[list, Path]], timeout: int,
+                  workers: int, on_done=None, on_fallback=None) -> list:
+    """Run LibreOffice batches, several at a time, and return the results in order.
+
+    Each invocation is a separate ``soffice`` process with its own profile and its
+    own output directory, so they do not collide - they just cost memory.
+
+    A chunk that produces *nothing at all* is the signature of an **invocation**
+    that failed rather than of documents that failed, and running several at once
+    is the likeliest reason: LibreOffice is known to fall over when several of its
+    processes work at the same time on the same machine. Those chunks are
+    therefore not retried on the spot. They are set aside and re-run **one at a
+    time, after every other invocation has finished** - the point being that the
+    retry then has no concurrency to lose to. It costs a second pass on the
+    affected chunks and turns "the whole batch failed" into "the batch took
+    slightly longer".
+    """
+    results: list = [None] * len(jobs)
+
+    def convert(index: int):
+        group, outdir = jobs[index]
+        return libreoffice.convert_batch(group, outdir, timeout=timeout)
+
+    def finish(index: int, result) -> None:
+        results[index] = result
+        if on_done:
+            on_done(index, result)
+
+    def convert_with_retry(index: int):
+        """One invocation, and one quiet second attempt if it produced nothing."""
+        result = convert(index)
+        if jobs[index][0] and not result.produced:
+            time.sleep(RETRY_PAUSE_SECONDS)
+            retry = convert(index)
+            if retry.produced:
+                return retry
+        return result
+
+    if workers <= 1 or len(jobs) <= 1:
+        for index in range(len(jobs)):
+            finish(index, convert_with_retry(index))
+        return results
+
+    deferred: list[int] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(convert, index): index for index in range(len(jobs))}
+        for future in as_completed(futures):
+            index = futures[future]
+            result = future.result()
+            if jobs[index][0] and not result.produced:
+                deferred.append(index)
+            else:
+                finish(index, result)
+
+    if deferred:
+        if on_fallback:
+            on_fallback(len(deferred), len(jobs))
+        for index in sorted(deferred):
+            finish(index, convert_with_retry(index))
+
+    return results
 
 
 @dataclass
@@ -39,6 +148,11 @@ class BuildReport:
     output: Path | None = None
     seconds: float = 0.0
     policy: email_items.ExtractionPolicy | None = None
+    cancelled: bool = False
+    # Batches LibreOffice produced nothing for while running concurrently, and
+    # which therefore had to be redone one at a time. Non-zero is worth telling
+    # the user about: it means their machine dislikes several soffice at once.
+    retried_batches: int = 0
 
     @property
     def segments(self) -> list[Segment]:
@@ -143,6 +257,8 @@ def convert_sources(
     page_size: tuple[float, float] | None = None,
     on_event=None,
     policy_for=None,
+    on_progress=None,
+    should_stop=None,
 ) -> BuildReport:
     """Convert sources into segments without assembling anything.
 
@@ -152,6 +268,12 @@ def convert_sources(
 
     ``policy_for`` optionally supplies a per-source policy, so what gets extracted
     can be decided separately for each email rather than globally for the batch.
+
+    ``on_progress`` is called as ``(done, total, label)``: how many sources have
+    finished, how many there are, and what is happening now. A folder of several
+    hundred files takes long enough that a still window is indistinguishable from
+    a hung one. ``should_stop`` is polled between sources so that work can be
+    abandoned part-way - a batch that big has to be interruptible.
     """
     policy = policy or email_items.ExtractionPolicy()
     workdir = Path(workdir)
@@ -169,6 +291,28 @@ def convert_sources(
         if on_event:
             on_event(message)
 
+    total = len(sources)
+    done = 0
+
+    def progress(label: str = "", step: bool = False) -> bool:
+        """Report progress. Returns True when the caller should stop."""
+        nonlocal done
+        if step:
+            done += 1
+        if on_progress:
+            try:
+                on_progress(done, total, label)
+            except Exception:
+                pass
+        if should_stop:
+            try:
+                return bool(should_stop())
+            except Exception:
+                return False
+        return False
+
+    stopped = False
+
     started = time.monotonic()
     report = BuildReport(policy=policy)
     staging = workdir / "staging"
@@ -177,10 +321,11 @@ def convert_sources(
     work.mkdir(parents=True, exist_ok=True)
 
     results: dict[int, SourceResult] = {}
-    office_batch: list[tuple[int, Path, Path]] = []
+    document_batch: list[tuple[int, Path, Path]] = []
     email_list: list[tuple[int, Path]] = []
     simple_list: list[tuple[int, Path]] = []
 
+    progress("Sorting %d file(s)\u2026" % total)
     for index, raw in enumerate(sources):
         src = Path(raw)
         ext = src.suffix.lower()
@@ -195,11 +340,11 @@ def convert_sources(
             )
         elif ext in convert.EMAIL_EXTS:
             email_list.append((index, src))
-        elif ext in convert.OFFICE_EXTS:
+        elif ext in convert.LIBREOFFICE_EXTS:
             staged = staging / ("%04d_%s%s" % (index, src.stem, ext))
             try:
                 shutil.copyfile(src, staged)
-                office_batch.append((index, src, staged))
+                document_batch.append((index, src, staged))
             except OSError as exc:
                 results[index] = SourceResult(
                     src, [Segment(src, src.stem, DOCUMENT, None, False, "could not stage: %s" % exc)]
@@ -212,35 +357,68 @@ def convert_sources(
                               "unsupported file type %r" % (ext or "(none)"))]
             )
 
-    # ---- Office documents: one LibreOffice invocation for the whole batch ----
-    if office_batch:
-        emit("Converting %d Office document(s) with LibreOffice..." % len(office_batch))
-        batch = libreoffice.convert_batch(
-            [staged for _, _, staged in office_batch], work, timeout=OFFICE_BATCH_TIMEOUT
+    # ---- Documents (Office, web): chunked LibreOffice invocations ----
+    if document_batch and not stopped:
+        total_documents = len(document_batch)
+        size = _chunk_size(total_documents)
+        groups = _chunks(document_batch, size)
+        # The staged copy is what LibreOffice is pointed at; the triples in
+        # ``groups`` are what maps a produced file back to the source it came from.
+        jobs = [([staged for _index, _src, staged in group],
+                 work / ("office%03d" % index))
+                for index, group in enumerate(groups)]
+        for _group, outdir in jobs:
+            outdir.mkdir(parents=True, exist_ok=True)
+
+        emit("Converting %d document(s) with LibreOffice, %d at a time..."
+             % (total_documents, conversion_workers()))
+        stopped = progress(
+            "Converting %d document(s)\u2026" % total_documents
         )
-        per_file = batch.seconds / max(len(office_batch), 1)
-        for index, src, staged in office_batch:
-            produced = batch.produced.get(str(staged))
-            if produced:
-                results[index] = SourceResult(
-                    src, [Segment(src, src.stem, DOCUMENT, Path(produced), True, "", per_file)]
-                )
-                emit("  ok   %s" % src.name)
-            else:
-                reason = batch.failed.get(str(staged), "conversion failed")
-                results[index] = SourceResult(
-                    src, [Segment(src, src.stem, DOCUMENT, None, False, reason, per_file)]
-                )
-                emit("  FAIL %s - %s" % (src.name, reason))
+
+        done_documents = 0
+
+        def finished(index: int, batch) -> None:
+            nonlocal done_documents, stopped
+            group = groups[index]
+            per_file = batch.seconds / max(len(group), 1)
+            for index_, src, staged in group:
+                produced = batch.produced.get(str(staged))
+                if produced:
+                    results[index_] = SourceResult(
+                        src, [Segment(src, src.stem, DOCUMENT, Path(produced),
+                                      True, "", per_file)]
+                    )
+                    emit("  ok   %s" % src.name)
+                else:
+                    reason = batch.failed.get(str(staged), "conversion failed")
+                    results[index_] = SourceResult(
+                        src, [Segment(src, src.stem, DOCUMENT, None, False,
+                                      reason, per_file)]
+                    )
+                    emit("  FAIL %s - %s" % (src.name, reason))
+                done_documents += 1
+                stopped = progress(src.name, step=True)
+
+        def office_fallback(count: int, total: int) -> None:
+            report.retried_batches += count
+            emit("LibreOffice produced nothing for %d of %d batch(es) when run "
+                 "concurrently; retrying them one at a time." % (count, total))
+
+        _convert_jobs(jobs, OFFICE_BATCH_TIMEOUT, conversion_workers(),
+                      on_done=finished, on_fallback=office_fallback)
 
     # ---- Email items: parse, render all bodies in one batch, then expand ----
-    if email_list:
+    if email_list and not stopped:
         emit("Reading %d email item(s)..." % len(email_list))
+        stopped = progress("Reading %d email item(s)\u2026" % len(email_list))
         parsed: list[tuple[int, Path, object, Path | None]] = []
         body_dir = work / "bodies"
         body_dir.mkdir(parents=True, exist_ok=True)
 
         for index, src in email_list:
+            if stopped:
+                break
             try:
                 item = email_items.read_message(src)
             except Exception as exc:
@@ -250,6 +428,7 @@ def convert_sources(
                              "could not read message: %s: %s" % (type(exc).__name__, exc))],
                 )
                 emit("  FAIL %s - unreadable message" % src.name)
+                stopped = progress(src.name, step=True)
                 continue
 
             html_path = None
@@ -260,38 +439,109 @@ def convert_sources(
             parsed.append((index, src, item, html_path))
             emit("  read %s (%d attachment(s))" % (src.name, len(item.attachments)))
 
-        # One LibreOffice invocation for every body: start-up dominates, and
+        # Message bodies are rendered in batches too: start-up dominates, and
         # rendering them one at a time costs seconds per message.
         bodies: dict[str, str] = {}
         body_errors: dict[str, str] = {}
         htmls = [h for _, _, _, h in parsed if h is not None]
-        if htmls:
-            emit("Rendering %d message body/bodies..." % len(htmls))
-            batch = libreoffice.convert_batch(htmls, body_dir, timeout=OFFICE_BATCH_TIMEOUT)
-            bodies = batch.produced
-            body_errors = batch.failed
+        if htmls and not stopped:
+            size = _chunk_size(len(htmls))
+            groups = _chunks(htmls, size)
+            jobs = [(list(group), body_dir / ("chunk%03d" % index))
+                    for index, group in enumerate(groups)]
+            for _group, outdir in jobs:
+                outdir.mkdir(parents=True, exist_ok=True)
 
-        for index, src, item, html_path in parsed:
+            rendered = 0
+
+            def rendered_body(index: int, batch) -> None:
+                nonlocal rendered, stopped
+                bodies.update(batch.produced)
+                body_errors.update(batch.failed)
+                rendered += len(groups[index])
+                stopped = progress("Rendering message bodies (%d/%d)\u2026"
+                                   % (min(rendered, len(htmls)), len(htmls)))
+
+            stopped = progress("Rendering %d message body/bodies\u2026" % len(htmls))
+            def body_fallback(count: int, total: int) -> None:
+                report.retried_batches += count
+                emit("LibreOffice produced nothing for %d of %d body batch(es) when "
+                     "run concurrently; retrying them one at a time." % (count, total))
+
+            _convert_jobs(jobs, OFFICE_BATCH_TIMEOUT, conversion_workers(),
+                          on_done=rendered_body, on_fallback=body_fallback)
+
+        def expand_one(job) -> None:
+            nonlocal stopped
+            index, src, item, html_path = job
             key = str(html_path) if html_path else ""
-            segments = email_items.expand_to_segments(
-                item,
-                work / ("email%04d" % index),
-                policy_of(src),
-                page_size=page_size,
-                body_pdf=Path(bodies[key]) if key in bodies else None,
-                body_error=body_errors.get(key) if key and key not in bodies else None,
-                on_event=emit,
-            )
+            try:
+                segments = email_items.expand_to_segments(
+                    item,
+                    work / ("email%04d" % index),
+                    policy_of(src),
+                    page_size=page_size,
+                    body_pdf=Path(bodies[key]) if key in bodies else None,
+                    body_error=body_errors.get(key) if key and key not in bodies else None,
+                    on_event=emit,
+                )
+            except Exception as exc:
+                segments = [Segment(src, src.stem, DOCUMENT, None, False,
+                                    "%s: %s" % (type(exc).__name__, exc))]
             results[index] = SourceResult(src, segments)
+            stopped = progress(src.name, step=True)
+
+        # Expanding is where an email's *attachments* get converted, and an Office
+        # attachment is one LibreOffice run of its own, as is a nested message's
+        # body. A mailbox of messages carrying documents is therefore the slowest
+        # shape there is, and each message is independent of the others - so they
+        # run several at a time, bounded by the same limit.
+        workers = conversion_workers()
+        if workers > 1 and len(parsed) > 1 and not stopped:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(expand_one, parsed))
+        else:
+            for job in parsed:
+                if stopped:
+                    break
+                expand_one(job)
 
     # ---- Everything else, one file at a time ----
     for index, src in simple_list:
+        if stopped:
+            break
         out_pdf = work / ("%04d_%s.pdf" % (index, src.stem))
         segment = _convert_one_to_segment(src, out_pdf, staging, page_size)
         results[index] = SourceResult(src, [segment])
         emit("  %s   %s" % ("ok  " if segment.ok else "FAIL", src.name))
+        stopped = progress(src.name, step=True)
+
+    # ---- every produced PDF is opened once, and only then believed ----
+    #
+    # A converter that "succeeded" and left behind a PDF nobody can read used to
+    # become a segment with zero pages: the item appeared in the list and simply
+    # contributed nothing, which is how a document goes missing without a word.
+    # A PDF cut short is exactly this case - the pages before the cut may read
+    # while the file as a whole does not - so it is reported, with the reason,
+    # instead of quietly becoming a shorter document.
+    #
+    # Reading the files back here also gives the interface its page counts, so it
+    # never has to reopen every one of them.
+    for result in results.values():
+        for segment in result.segments:
+            if not (segment.ok and segment.pdf):
+                continue
+            pages = count_pages(segment.pdf)
+            if pages <= 0:
+                segment.ok = False
+                segment.detail = ("the PDF produced for this item could not be read "
+                                  "- it may be truncated or incomplete")
+                emit("  FAIL %s - unreadable PDF" % segment.label)
+            else:
+                segment.page_count = pages
 
     report.sources = [results[i] for i in sorted(results)]
+    report.cancelled = stopped
     report.seconds = time.monotonic() - started
     return report
 
@@ -307,6 +557,8 @@ def build(
     on_event=None,
     keep_scratch: bool = False,
     scratch_dir: str | None = None,
+    on_progress=None,
+    should_stop=None,
 ) -> BuildReport:
     """Convert every source into PDF segments, then merge them into ``dest``."""
 
@@ -337,7 +589,8 @@ def build(
         owned_scratch = True
 
     report = convert_sources(sources, scratch, policy=policy,
-                             page_size=target, on_event=on_event)
+                             page_size=target, on_event=on_event,
+                             on_progress=on_progress, should_stop=should_stop)
 
     entries = [
         assemble.MergeEntry(segment.pdf, segment.label)

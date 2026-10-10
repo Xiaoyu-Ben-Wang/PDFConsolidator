@@ -3,7 +3,9 @@
 Each converter takes a source path and a destination path and either produces a
 PDF or raises :class:`ConversionError` with a message worth showing a user.
 
-Office documents are delegated to LibreOffice (see :mod:`consolidator.libreoffice`).
+Office documents and web pages are delegated to LibreOffice (see
+:mod:`consolidator.libreoffice`), which lays out an HTML page the same way it
+renders an email body.
 Images go through ``img2pdf`` so JPEGs are copied losslessly rather than
 re-encoded. Plain text - including Markdown, which is deliberately *not*
 interpreted - is escaped and laid out with ReportLab.
@@ -21,10 +23,29 @@ from . import libreoffice, pages
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
 TEXT_EXTS = {".txt", ".md", ".markdown", ".log", ".csv"}
 PDF_EXTS = {".pdf"}
-OFFICE_EXTS = {".docx", ".doc", ".rtf", ".odt", ".xlsx", ".xls", ".ods", ".pptx", ".ppt", ".odp"}
+# Word, Excel and PowerPoint, plus the macro-enabled and template variants of the
+# same containers: LibreOffice reads them all through the same filters, and
+# refusing an .xlsm because it was not on a list was simply a gap.
+OFFICE_EXTS = {
+    ".docx", ".doc", ".docm", ".dot", ".dotx", ".dotm",
+    ".xlsx", ".xls", ".xlsm", ".xltx", ".xltm",
+    ".pptx", ".ppt", ".pptm", ".potx", ".potm", ".pps", ".ppsx",
+    ".rtf", ".odt", ".ods", ".odp", ".odg", ".odf",
+}
+# Web pages are rendered by LibreOffice, the same way an email body is - not read
+# as literal text, which would put markup on the page.
+WEB_EXTS = {".html", ".htm", ".xhtml"}
 MSG_EXTS = {".msg"}
 EML_EXTS = {".eml"}
 EMAIL_EXTS = MSG_EXTS | EML_EXTS
+
+# What one LibreOffice invocation can be handed: the same engine, batched.
+LIBREOFFICE_EXTS = OFFICE_EXTS | WEB_EXTS
+# Everything that becomes pages as a document: laid out by LibreOffice or, for
+# plain text, by the text renderer.
+DOCUMENT_EXTS = LIBREOFFICE_EXTS | TEXT_EXTS
+# Everything the application accepts as a source file.
+SUPPORTED_EXTS = (PDF_EXTS | IMAGE_EXTS | DOCUMENT_EXTS | EMAIL_EXTS)
 
 # Formats we knowingly do not handle, so the error is a clear message rather
 # than a confusing "unsupported extension".
@@ -32,6 +53,7 @@ KNOWN_UNSUPPORTED = {
     ".pub": "Microsoft Publisher is not supported",
     ".heic": "HEIC images need an extra codec that is not bundled",
     ".heif": "HEIF images need an extra codec that is not bundled",
+    ".xlsb": "Excel binary workbooks (.xlsb) are not supported; save as .xlsx or .xlsm",
 }
 
 
@@ -43,7 +65,8 @@ def _is_office(ext: str) -> bool:
     return ext in OFFICE_EXTS
 
 
-def convert_office(src: Path, dest: Path, workdir: Path) -> None:
+def convert_with_libreoffice(src: Path, dest: Path, workdir: Path) -> None:
+    """Lay a document out with LibreOffice: Office formats and web pages alike."""
     try:
         libreoffice.convert_one(src, dest, workdir=workdir)
     except libreoffice.LibreOfficeError as exc:
@@ -51,7 +74,12 @@ def convert_office(src: Path, dest: Path, workdir: Path) -> None:
 
 
 def convert_pdf(src: Path, dest: Path, workdir: Path) -> None:
-    """Existing PDFs are copied through untouched - never re-encoded."""
+    """Existing PDFs are copied through untouched - never re-encoded.
+
+    The copy is verified by the pipeline, which opens every PDF it is handed: a
+    file that cannot be read is reported as a failure rather than becoming a
+    segment that silently contributes no pages.
+    """
     try:
         shutil.copyfile(src, dest)
     except OSError as exc:
@@ -189,8 +217,8 @@ def convert(src: Path, dest: Path, workdir: Path, page_size: tuple | None = None
         convert_image(src, dest, workdir, page_size)
     elif ext in TEXT_EXTS:
         convert_text(src, dest, workdir, page_size)
-    elif ext in OFFICE_EXTS:
-        convert_office(src, dest, workdir)
+    elif ext in LIBREOFFICE_EXTS:
+        convert_with_libreoffice(src, dest, workdir)
     elif ext in EMAIL_EXTS:
         raise ConversionError(
             "email items expand into several segments; use "
@@ -206,6 +234,4 @@ def convert(src: Path, dest: Path, workdir: Path, page_size: tuple | None = None
 
 
 def is_supported(path: Path) -> bool:
-    return Path(path).suffix.lower() in (
-        PDF_EXTS | IMAGE_EXTS | TEXT_EXTS | OFFICE_EXTS | EMAIL_EXTS
-    )
+    return Path(path).suffix.lower() in SUPPORTED_EXTS

@@ -215,8 +215,16 @@ def convert_batch(
     if not sources:
         return BatchResult()
 
-    profile = _profile_dir(workdir)
-    lo_tmp = workdir / "lo_tmp"
+    # LibreOffice cannot cope with a relative source path or a relative --outdir:
+    # it reports "Error: source file could not be loaded" and produces nothing,
+    # with no hint that the path was the problem. Everything it is told about is
+    # therefore absolute. The result dictionaries stay keyed by the paths the
+    # caller passed, so callers can still look up their own paths.
+    outdir = workdir.resolve()
+    targets = [(src, src.resolve()) for src in sources]
+
+    profile = _profile_dir(outdir)
+    lo_tmp = outdir / "lo_tmp"
 
     cmd = [
         str(exe),
@@ -230,12 +238,12 @@ def convert_batch(
         "--convert-to",
         "pdf",
         "--outdir",
-        str(workdir),
-    ] + [str(s) for s in sources]
+        str(outdir),
+    ] + [str(target) for _src, target in targets]
 
     # A stale output would masquerade as success, so clear expected names first.
     for src in sources:
-        stale = workdir / (src.stem + ".pdf")
+        stale = outdir / (src.stem + ".pdf")
         if stale.exists():
             stale.unlink()
 
@@ -260,17 +268,30 @@ def convert_batch(
     crashed = (profile / "crash" / "dump.ini").exists()
 
     # Never trust the exit code - verify each expected artifact.
+    missing = []
     for src in sources:
-        out = workdir / (src.stem + ".pdf")
+        out = outdir / (src.stem + ".pdf")
         if out.exists() and out.stat().st_size > 0:
             result.produced[str(src)] = str(out)
-        elif timed_out:
-            result.failed[str(src)] = "LibreOffice timed out after %ds" % timeout
-        elif crashed:
-            result.failed[str(src)] = "LibreOffice crashed while converting this file"
         else:
-            detail = (stderr or stdout or "").strip().splitlines()
-            result.failed[str(src)] = detail[-1] if detail else "no output produced"
+            missing.append(src)
+
+    if missing:
+        # LibreOffice leaves a crash dump behind on an ordinary exit as well as a
+        # real one, so "there is a dump" only explains a failure when the whole
+        # invocation produced nothing. Blaming a crash for one file in a batch
+        # that otherwise converted was simply wrong, and hid the real reason -
+        # which is usually on stderr.
+        detail = (stderr or stdout or "").strip().splitlines()
+        fallback = detail[-1] if detail else "no output produced"
+        if timed_out:
+            reason = "LibreOffice timed out after %ds" % timeout
+        elif crashed and not result.produced:
+            reason = "LibreOffice crashed while converting this file"
+        else:
+            reason = fallback
+        for src in missing:
+            result.failed[str(src)] = reason
 
     # The profile is large and belongs to this run only.
     _remove_tree(profile)

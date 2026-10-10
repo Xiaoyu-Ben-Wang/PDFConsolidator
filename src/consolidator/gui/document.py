@@ -30,6 +30,35 @@ class SegmentNode:
     detail: str = ""
     enabled: bool = True
     page_count: int = 0
+    # Message nesting, copied from the pipeline's segment. See model.Segment.
+    group: str = ""
+    parent: str = ""
+    group_label: str = ""
+    depth: int = 0
+
+
+@dataclass
+class MessageNode:
+    """A message inside another message, as the navigator shows it.
+
+    A message attached to a message is its own group of pages, hanging inside the
+    group that carried it. It is not a segment: it contributes no pages of its
+    own, only the ones its body and attachments do.
+    """
+
+    key: str
+    label: str
+    parent: str = ""
+    segments: list[SegmentNode] = field(default_factory=list)
+    children: list["MessageNode"] = field(default_factory=list)
+    page_count: int = 0
+
+    def descendants(self) -> list[SegmentNode]:
+        """Every segment in this message, nested ones included."""
+        found = list(self.segments)
+        for child in self.children:
+            found.extend(child.descendants())
+        return found
 
 
 @dataclass
@@ -53,6 +82,32 @@ class DocumentModel:
         self.segments: list[SegmentNode] = []
         self.pages: list[PageRef] = []
         self._next_id = 0
+        # Lookup indexes, rebuilt on demand. Every row the interface draws asks
+        # for its segment and its message group, and rescanning the segment list
+        # for each of those turns a few hundred files into tens of millions of
+        # comparisons - which is the difference between a responsive window and
+        # a frozen one.
+        self._by_id: dict[int, SegmentNode] = {}
+        self._by_group: dict[str, SegmentNode] = {}
+        self._by_source: dict[str, list[SegmentNode]] = {}
+        self._indexed = True
+
+    def _index(self) -> None:
+        if self._indexed:
+            return
+        self._by_id = {node.id: node for node in self.segments}
+        self._by_group = {}
+        self._by_source = {}
+        for node in self.segments:
+            if node.group:
+                # First segment of a group wins: it is the one that knows the
+                # group's label and its parent.
+                self._by_group.setdefault(node.group, node)
+            self._by_source.setdefault(str(node.source), []).append(node)
+        self._indexed = True
+
+    def _changed(self) -> None:
+        self._indexed = False
 
     # ------------------------------------------------------------- segments
 
@@ -65,6 +120,10 @@ class DocumentModel:
         kind: str = "document",
         detail: str = "",
         page_count: int = 0,
+        group: str = "",
+        parent: str = "",
+        group_label: str = "",
+        depth: int = 0,
     ) -> SegmentNode:
         node = SegmentNode(
             id=self._next_id,
@@ -75,24 +134,33 @@ class DocumentModel:
             ok=ok,
             detail=detail,
             page_count=page_count,
+            group=group,
+            parent=parent,
+            group_label=group_label,
+            depth=depth,
         )
         self._next_id += 1
         self.segments.append(node)
         if ok and node.pdf:
             for index in range(page_count):
                 self.pages.append(PageRef(node.id, index))
+        self._changed()
         return node
 
     def segment(self, segment_id: int) -> SegmentNode | None:
-        for node in self.segments:
-            if node.id == segment_id:
-                return node
-        return None
+        self._index()
+        return self._by_id.get(segment_id)
+
+    def segments_of(self, source: Path) -> list[SegmentNode]:
+        """Every segment a source contributed, in conversion order."""
+        self._index()
+        return list(self._by_source.get(str(Path(source)), []))
 
     def clear(self) -> None:
         self.segments.clear()
         self.pages.clear()
         self._next_id = 0
+        self._changed()
 
     def set_segment_enabled(self, segment_id: int, enabled: bool) -> None:
         """Show or hide a segment's pages without discarding them."""
@@ -117,6 +185,87 @@ class DocumentModel:
 
     def enabled_segments(self) -> list[SegmentNode]:
         return [s for s in self.segments if s.enabled and s.ok]
+
+    # ----------------------------------------------------- message nesting
+
+    def group_owner(self, node: SegmentNode | None) -> SegmentNode | None:
+        """The segment belonging to the message that carried ``node``.
+
+        Used to keep a nested message's colour clearly different from the colour
+        of the message it arrived inside.
+        """
+        if node is None or not node.parent:
+            return None
+        self._index()
+        return self._by_group.get(node.parent)
+
+    def group_trail(self, node: SegmentNode | None) -> list[str]:
+        """Message names from the source down to ``node``'s own message.
+
+        The first entry names the source file itself and is dropped: the row
+        already leads with it.
+        """
+        if node is None or not node.group:
+            return []
+        self._index()
+        names: list[str] = []
+        key = node.group
+        seen: set[str] = set()
+        while key and key not in seen:
+            seen.add(key)
+            owner = self._by_group.get(key)
+            if owner is None:
+                break
+            names.append(owner.group_label or Path(owner.source).name)
+            key = owner.parent
+        names.reverse()
+        return names[1:]
+
+    def navigator(self, source: Path) -> tuple[list[SegmentNode], list[MessageNode]]:
+        """Split one source's segments into what hangs off it and its messages.
+
+        Returns the segments belonging to the source itself, in conversion order,
+        and the forest of nested messages, each holding its own segments and the
+        messages found inside it.
+        """
+        top: list[SegmentNode] = []
+        nodes: dict[str, MessageNode] = {}
+        roots: list[MessageNode] = []
+
+        for node in self.segments_of(source):
+            if node.depth <= 0 or not node.group:
+                top.append(node)
+                continue
+            group = nodes.get(node.group)
+            if group is None:
+                group = MessageNode(node.group,
+                                    node.group_label or Path(node.group).name,
+                                    node.parent)
+                nodes[node.group] = group
+                owner = nodes.get(node.parent)
+                if owner is None:
+                    roots.append(group)
+                else:
+                    owner.children.append(group)
+            group.segments.append(node)
+
+        # A message that contributed no segment of its own is only discovered when
+        # its contents arrive, so it can be seen before its carrier. Re-attach
+        # those now that every group is known.
+        for group in list(roots):
+            owner = nodes.get(group.parent)
+            if owner is not None and owner is not group and group not in owner.children:
+                roots.remove(group)
+                owner.children.append(group)
+
+        def total(group: MessageNode) -> int:
+            group.page_count = sum(s.page_count for s in group.segments)
+            group.page_count += sum(total(child) for child in group.children)
+            return group.page_count
+
+        for group in roots:
+            total(group)
+        return top, roots
 
     # ---------------------------------------------------------- page edits
 
@@ -167,14 +316,13 @@ class DocumentModel:
 
     def drop_source(self, source: Path) -> int:
         """Forget everything a source contributed, including its pages."""
-        source = Path(source)
-        removed = [s.id for s in self.segments if s.source == source]
-        if not removed:
+        doomed = {node.id for node in self.segments_of(source)}
+        if not doomed:
             return 0
-        doomed = set(removed)
         self.segments = [s for s in self.segments if s.id not in doomed]
         self.pages = [p for p in self.pages if p.segment_id not in doomed]
-        return len(removed)
+        self._changed()
+        return len(doomed)
 
     def remove_failed_for(self, source: Path) -> int:
         """Drop the failed segments belonging to one source, before a retry.
@@ -187,6 +335,7 @@ class DocumentModel:
         self.segments = [
             s for s in self.segments if not (s.source == source and not s.ok)
         ]
+        self._changed()
         return before - len(self.segments)
 
     def group_by_source(self) -> None:

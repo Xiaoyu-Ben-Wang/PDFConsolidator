@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFileIconProvider,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -36,7 +37,9 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSplitter,
+    QStyle,
     QToolBar,
+    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -45,6 +48,7 @@ from PySide6.QtWidgets import (
 
 from .. import assemble, convert, email_items, pages, pipeline
 from .document import DocumentModel
+from .licences import show_about, show_licences
 from .thumbs import ThumbnailCache
 from .worker import ConversionWorker, MergeWorker, ThumbnailWorker
 
@@ -58,8 +62,32 @@ PREVIEW_HEIGHT = 640
 TREE_ROW_HEIGHT = 20
 TREE_ICON = 16
 
+# Thumbnails are rendered for the rows on screen plus this much either side, so
+# that scrolling reveals finished rows rather than placeholders. Bounding this is
+# what keeps a batch of several hundred files - tens of thousands of pages - from
+# trying to render every page before the window becomes usable.
+VISIBLE_PAGES = 40
+THUMBNAIL_MARGIN = 25
+
 # How each kind of segment is described in a row.
 KIND_SUFFIX = {"body": "body", "attachment": "attachment", "document": ""}
+
+# Which role a navigator row plays, so a checkbox knows what it is toggling.
+# Segment ids are ints and source paths are strings, so guessing from the payload
+# stops being safe once nested messages introduce a third kind of row.
+ROW_ROLE = Qt.UserRole + 1
+
+# Every navigator row can take the page column to what it holds; the tooltip is
+# where that is discoverable.
+JUMP_HINT = "\n\nSelect it and press the jump button (Ctrl+J) to see its pages."
+
+
+# Every extension the converters know about, built from the sets themselves so
+# the file dialog cannot drift from what actually converts - which is how .xlsm
+# and .htm came to be missing from it.
+SUPPORTED_FILTER = " ".join(
+    "*" + ext for ext in sorted(convert.SUPPORTED_EXTS)
+)
 
 
 def is_policy_exclusion(segment) -> bool:
@@ -71,43 +99,78 @@ def is_policy_exclusion(segment) -> bool:
     return POLICY_EXCLUSION in (segment.detail or "")
 
 
-def source_colour(key: str) -> QColor:
-    """A stable pastel colour per source file.
+def group_hue(key: str) -> int:
+    """A stable hue per message or file, derived from its identity."""
+    digest = hashlib.md5(str(key).encode("utf-8", "replace")).digest()
+    return digest[0] * 359 // 255
+
+
+def group_colour(key: str, parent_hue: int | None = None) -> QColor:
+    """A stable pastel colour per source file or nested message.
 
     Every page originating from the same file shares a colour, which is what
     makes grouping visible at a glance - an email's body and its attachments all
-    carry the same tint.
+    carry the same tint. A nested message gets its own colour, nudged away from
+    the colour of the message it arrived inside, so a forwarded email never
+    blends into its carrier.
     """
-    digest = hashlib.md5(str(key).encode("utf-8", "replace")).digest()
-    hue = digest[0] * 359 // 255
+    hue = group_hue(key)
+    if parent_hue is not None:
+        distance = (hue - parent_hue) % 360
+        if distance < 45 or distance > 315:
+            hue = (hue + 150) % 360
     return QColor.fromHsv(hue, 55, 246)
 
 
+def source_colour(key: str) -> QColor:
+    """A stable pastel colour per source file."""
+    return group_colour(key)
+
+
+def node_colour(node, parent=None) -> QColor:
+    """The colour of a segment's pages: its message's colour, not its file's."""
+    if node is None:
+        return source_colour("?")
+    key = node.group or str(node.source)
+    owner = parent if parent is not None else None
+    parent_hue = None
+    if owner is not None:
+        parent_hue = group_hue(owner.group or str(owner.source))
+    return group_colour(key, parent_hue)
+
+
 def part_name(node) -> str:
-    """The part of a segment, without the repeated source stem.
+    """The part of a segment, without the repeated message name.
 
     ``with_pdf.eml`` plus the label ``with_pdf - invoice.pdf`` yields
-    ``invoice.pdf``, which is what the row should show.
+    ``invoice.pdf``, which is what the row should show. A nested message's label
+    leads with the name of the attachment that carried it instead.
     """
     label = node.label or ""
-    prefix = node.source.stem + " - "
+    group_label = getattr(node, "group_label", "") or ""
+    stem = Path(group_label).stem if group_label else node.source.stem
+    prefix = stem + " - "
     if label.startswith(prefix):
         return label[len(prefix):]
     return label
 
 
-def row_description(node, page, position: int) -> str:
+def row_description(node, page, position: int, trail: list[str] | None = None) -> str:
     """One line naming a page and the file it came from.
 
     The original filename always leads, so the column sorts and scans by source,
-    with the particular part of an email appended after an arrow.
+    with the particular part of an email appended after an arrow. A page from a
+    message attached to that email carries the nesting with it: the trail names
+    the messages it was found inside.
     """
     if node is None:
         return "%d.  (unknown)" % position
 
     text = "%d.  %s" % (position, node.source.name)
-    if node.kind != "document":
-        text += "  \u2192  %s" % part_name(node)
+    route = list(trail or [])
+    if node.kind != "document" or route:
+        route.append(part_name(node))
+        text += "  \u2192  " + " \u203a ".join(part for part in route if part)
     if page.rotation:
         text += "   [%d\u00b0]" % page.rotation
     return text
@@ -122,6 +185,7 @@ class MainWindow(QMainWindow):
         self.model = DocumentModel()
         self.thumbs = ThumbnailCache()
         self.icon_provider = QFileIconProvider()
+        self._icons: dict[str, QIcon] = {}
         self.selected_sources: list[Path] = []
         self.scratch: Path | None = None
         self.output_path: Path | None = None
@@ -139,6 +203,15 @@ class MainWindow(QMainWindow):
         self._conversion: ConversionWorker | None = None
         self._merge: MergeWorker | None = None
         self._thumbs: ThumbnailWorker | None = None
+        self._thumb_range: tuple[int, int] | None = None
+
+        # Scrolling asks for the thumbnails that just came into view, once the
+        # user stops moving: rendering while they are still dragging would fight
+        # the scrollbar.
+        self._thumb_timer = QTimer(self)
+        self._thumb_timer.setSingleShot(True)
+        self._thumb_timer.setInterval(120)
+        self._thumb_timer.timeout.connect(self._start_thumbnails)
 
         # Adding files converts automatically, shortly after the user stops
         # adding. It must be the *incremental* entry point: a full re-convert
@@ -149,6 +222,7 @@ class MainWindow(QMainWindow):
         self._autoconvert.setInterval(350)
         self._autoconvert.timeout.connect(self._convert_new_sources)
 
+        self._build_menu()
         self._build_toolbar()
         self._build_body()
         self._build_options()
@@ -158,6 +232,29 @@ class MainWindow(QMainWindow):
         self._update_actions()
 
     # ------------------------------------------------------------------ UI
+
+    def _build_menu(self) -> None:
+        """A Help menu for the notices the GPL asks a GUI to offer.
+
+        The About box is the conventional home for a licence summary, and the
+        LGPL wants the texts themselves reachable rather than merely on disk.
+        """
+        menu = self.menuBar().addMenu("&Help")
+
+        self.act_about = QAction("About PDF Consolidator", self)
+        self.act_about.setToolTip(
+            "Version, copyright and the licences this program is under."
+        )
+        self.act_about.triggered.connect(lambda: show_about(self))
+        menu.addAction(self.act_about)
+
+        self.act_licences = QAction("Licences\u2026", self)
+        self.act_licences.setToolTip(
+            "The licence texts for this program and the third-party\n"
+            "components it is built from."
+        )
+        self.act_licences.triggered.connect(lambda: show_licences(self))
+        menu.addAction(self.act_licences)
 
     def _build_toolbar(self) -> None:
         bar = QToolBar("Main")
@@ -199,7 +296,22 @@ class MainWindow(QMainWindow):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(6, 6, 6, 6)
-        left_layout.addWidget(QLabel("Sources"))
+        # The sources heading carries the jump button, so going to a row's pages
+        # is an explicit action rather than a side effect of clicking a row.
+        heading = QHBoxLayout()
+        heading.addWidget(QLabel("Sources"))
+        heading.addStretch(1)
+        self.btn_jump = QToolButton()
+        self.btn_jump.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown)
+        )
+        self.btn_jump.setToolTip(
+            "Show the selected item's pages in the page list (Ctrl+J)"
+        )
+        self.btn_jump.setAutoRaise(True)
+        self.btn_jump.clicked.connect(self.jump_to_selected)
+        heading.addWidget(self.btn_jump)
+        left_layout.addLayout(heading)
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Source", "Pages"])
         self.tree.setColumnWidth(0, 250)
@@ -259,6 +371,7 @@ class MainWindow(QMainWindow):
         self.page_list.setWordWrap(False)
         self.page_list.model().rowsMoved.connect(self._on_pages_reordered)
         self.page_list.itemSelectionChanged.connect(self._on_page_selection_changed)
+        self.page_list.verticalScrollBar().valueChanged.connect(self._on_pages_scrolled)
         pages_split.addWidget(self.page_list)
 
         preview_panel = QWidget()
@@ -288,8 +401,47 @@ class MainWindow(QMainWindow):
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_banner())
         layout.addWidget(splitter, 1)
         self.setCentralWidget(central)
+
+    def _build_banner(self) -> QWidget:
+        """A non-blocking strip for reporting what went wrong.
+
+        A modal dialog is the wrong shape for this: a batch of several hundred
+        files is expected to contain a few failures, and stopping the interface
+        to announce them - right after an eleven-minute wait - is both an
+        interruption and a dead end. The banner says what happened, offers the
+        details and the retry, and gets out of the way.
+        """
+        self.banner = QFrame()
+        self.banner.setFrameShape(QFrame.StyledPanel)
+        self.banner.setStyleSheet(
+            "QFrame { background: #fff4e5; border: 1px solid #e0b070; }"
+            "QLabel { color: #5a3d0b; }"
+        )
+        row = QHBoxLayout(self.banner)
+        row.setContentsMargins(8, 4, 8, 4)
+        self.lbl_banner = QLabel("")
+        self.lbl_banner.setWordWrap(True)
+        row.addWidget(self.lbl_banner, 1)
+
+        self.btn_banner_details = QPushButton("Details\u2026")
+        self.btn_banner_details.clicked.connect(self.show_failure_details)
+        row.addWidget(self.btn_banner_details)
+
+        self.btn_banner_retry = QPushButton("Retry failed")
+        self.btn_banner_retry.clicked.connect(self.retry_failed)
+        row.addWidget(self.btn_banner_retry)
+
+        dismiss = QPushButton("Dismiss")
+        dismiss.clicked.connect(lambda: self.banner.setVisible(False))
+        row.addWidget(dismiss)
+
+        self.banner.setVisible(False)
+        self._failures: list = []
+        self._merge_skips: list = []
+        return self.banner
 
     def _build_options(self) -> None:
         central = self.centralWidget()
@@ -314,8 +466,8 @@ class MainWindow(QMainWindow):
             ("body", "Message body"),
             ("pdf", "PDF documents"),
             ("images", "Images (excludes inline)"),
-            ("office", "Office documents"),
-            ("embedded", "Embedded messages"),
+            ("documents", "Documents (Office, text, web)"),
+            ("embedded", "Embedded messages (drilled into)"),
             ("other", "Other attachments (listed only)"),
         ):
             check = QCheckBox(label)
@@ -389,11 +541,69 @@ class MainWindow(QMainWindow):
     def _build_status(self) -> None:
         self.status = self.statusBar()
         self.progress = QProgressBar()
-        self.progress.setMaximumWidth(220)
+        self.progress.setMaximumWidth(260)
+        self.progress.setMinimumWidth(180)
         self.progress.setRange(0, 0)
+        self.progress.setTextVisible(True)
         self.progress.setVisible(False)
         self.status.addPermanentWidget(self.progress)
+        # A batch of several hundred files is long enough to need a way out of.
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setVisible(False)
+        self.btn_cancel.setToolTip("Stop converting after the file in progress")
+        self.btn_cancel.clicked.connect(self.cancel_conversion)
+        self.status.addPermanentWidget(self.btn_cancel)
+        # A visible About button, so the licensing is one click away without
+        # hunting through a menu.
+        self.btn_about = QPushButton("About")
+        self.btn_about.setToolTip(
+            "Version, copyright and the licences this program is under."
+        )
+        self.btn_about.clicked.connect(lambda: show_about(self))
+        self.status.addPermanentWidget(self.btn_about)
         self.status.showMessage("Add files or a folder to begin.")
+
+    # ------------------------------------------------------------- progress
+
+    def _begin_progress(self, total: int, label: str) -> None:
+        """Show a determinate bar: converting is a list of files, so count them."""
+        self.progress.setRange(0, max(total, 1))
+        self.progress.setValue(0)
+        self.progress.setFormat("0 / %d" % total)
+        self.progress.setVisible(True)
+        self.btn_cancel.setVisible(True)
+        self.btn_cancel.setEnabled(True)
+        self.status.showMessage(label)
+
+    def _on_progress(self, done: int, total: int, label: str) -> None:
+        if self.progress.maximum() != max(total, 1):
+            self.progress.setRange(0, max(total, 1))
+        self.progress.setValue(done)
+        self.progress.setFormat("%d / %d" % (done, total))
+        if label:
+            self.status.showMessage(label)
+
+    def _begin_busy(self, label: str) -> None:
+        """Show an indeterminate bar for work whose size is not known up front."""
+        self.progress.setRange(0, 0)
+        self.progress.setFormat("")
+        self.progress.setVisible(True)
+        self.btn_cancel.setVisible(False)
+        self.status.showMessage(label)
+
+    def _end_progress(self) -> None:
+        self.progress.setVisible(False)
+        self.btn_cancel.setVisible(False)
+
+    def cancel_conversion(self) -> None:
+        """Stop after the file in progress; whatever is converted is kept."""
+        worker = self._conversion
+        if worker is None or not worker.isRunning():
+            return
+        worker.cancel()
+        self.btn_cancel.setEnabled(False)
+        self.status.showMessage("Stopping after the current file\u2026")
+
 
     def _install_shortcuts(self) -> None:
         """Delete and Backspace remove what the focused list has selected."""
@@ -405,6 +615,13 @@ class MainWindow(QMainWindow):
                 shortcut = QShortcut(sequence, widget)
                 shortcut.setContext(Qt.WidgetWithChildrenShortcut)
                 shortcut.activated.connect(slot)
+
+        # Ctrl+J is the keyboard half of the jump button: pick a row in the
+        # navigator, then go to its pages without reaching for the mouse.
+        for widget in (self.tree, self.page_list):
+            jump = QShortcut(QKeySequence("Ctrl+J"), widget)
+            jump.setContext(Qt.WidgetWithChildrenShortcut)
+            jump.activated.connect(self.jump_to_selected)
 
     # ------------------------------------------------- extraction policies
 
@@ -474,18 +691,27 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- sources
 
     def file_icon(self, path: Path) -> QIcon:
-        """The real Windows icon for this file type, via the shell."""
-        try:
-            return self.icon_provider.icon(QFileInfo(str(path)))
-        except Exception:
-            return QIcon()
+        """The real Windows icon for this file type, via the shell.
+
+        Cached by extension. The shell lookup is the expensive part, and a folder
+        of a thousand files has only a handful of distinct extensions - without
+        this, drawing the navigator costs one shell round-trip per row, which at
+        ten thousand rows is seconds of the user's time per rebuild.
+        """
+        key = path.suffix.lower()
+        icon = self._icons.get(key)
+        if icon is None:
+            try:
+                icon = self.icon_provider.icon(QFileInfo(str(path)))
+            except Exception:
+                icon = QIcon()
+            self._icons[key] = icon
+        return icon
 
     def add_files(self) -> None:
         names, _ = QFileDialog.getOpenFileNames(
             self, "Add files", "",
-            "All supported (*.pdf *.docx *.doc *.rtf *.odt *.xlsx *.xls *.ods "
-            "*.pptx *.ppt *.odp *.msg *.eml *.jpg *.jpeg *.png *.tif *.tiff "
-            "*.bmp *.gif *.webp *.txt *.md *.log *.csv);;All files (*)",
+            "All supported (%s);;All files (*)" % SUPPORTED_FILTER,
         )
         self._add([Path(n) for n in names])
 
@@ -582,66 +808,183 @@ class MainWindow(QMainWindow):
         self.tree.blockSignals(True)
         self.tree.clear()
 
-        by_source: dict[str, list] = {}
-        for segment in self.model.segments:
-            by_source.setdefault(str(segment.source), []).append(segment)
-
+        shown: set[str] = set()
         for path in sorted(self.selected_sources, key=self._sort_key):
+            shown.add(str(path))
             root = QTreeWidgetItem(self.tree, [path.name, ""])
-            root.setToolTip(0, str(path))
+            root.setToolTip(0, str(path) + JUMP_HINT)
             root.setIcon(0, self.file_icon(path))
             root.setData(0, Qt.UserRole, str(path))
+            root.setData(0, ROW_ROLE, "source")
             root.setFlags(root.flags() | Qt.ItemIsUserCheckable)
             root.setCheckState(0, Qt.Checked)
-
-            for segment in by_source.pop(str(path), []):
-                if segment.ok:
-                    label = "  " + part_name(segment)
-                    child = QTreeWidgetItem(root, [label, str(segment.page_count)])
-                    child.setToolTip(0, segment.label)
-                    child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
-                    child.setCheckState(0, Qt.Checked if segment.enabled else Qt.Unchecked)
-                    child.setData(0, Qt.UserRole, segment.id)
-                else:
-                    child = QTreeWidgetItem(
-                        root, ["  %s (%s)" % (part_name(segment), segment.detail or "failed"), "\u2014"]
-                    )
-                    child.setForeground(0, Qt.gray)
-                    child.setToolTip(0, segment.detail)
+            self._fill_source(root, path)
             root.setExpanded(True)
 
         # Segments left over (their source was removed) still need showing.
-        for source, segments in by_source.items():
+        leftovers: dict[str, list] = {}
+        for segment in self.model.segments:
+            if str(segment.source) not in shown:
+                leftovers.setdefault(str(segment.source), []).append(segment)
+        for source, segments in leftovers.items():
             root = QTreeWidgetItem(self.tree, [Path(source).name, ""])
+            root.setData(0, Qt.UserRole, source)
+            root.setData(0, ROW_ROLE, "source")
             root.setForeground(0, Qt.gray)
             for segment in segments:
-                QTreeWidgetItem(root, ["  " + part_name(segment), str(segment.page_count)])
+                self._add_segment_item(root, segment)
             root.setExpanded(True)
 
         self.tree.blockSignals(False)
         self._on_tree_selection_changed()
 
+    def _fill_source(self, root: QTreeWidgetItem, path: Path) -> None:
+        """Put a source's own parts and its nested messages under its row."""
+        top_level, messages = self.model.navigator(path)
+        for segment in top_level:
+            self._add_segment_item(root, segment)
+        for message in messages:
+            self._add_message_item(root, message)
+
+    def _add_message_item(self, parent_item: QTreeWidgetItem, message) -> None:
+        """One nested message: a node of its own, holding its parts.
+
+        This is what makes a forwarded email navigable: its body and its own
+        attachments hang inside it rather than appearing as siblings of the
+        carrier's, with the message's own colour on every row.
+        """
+        item = QTreeWidgetItem(parent_item, ["  " + message.label,
+                                             str(message.page_count)])
+        item.setData(0, Qt.UserRole, message.key)
+        item.setData(0, ROW_ROLE, "message")
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        contents = message.descendants()
+        enabled = [node for node in contents if node.enabled]
+        item.setCheckState(0, Qt.Checked if len(enabled) == len(contents)
+                           else Qt.Unchecked if not enabled else Qt.PartiallyChecked)
+        item.setToolTip(0, "Message attached to the message above - %d page(s)%s"
+                        % (message.page_count, JUMP_HINT))
+        if message.label:
+            item.setIcon(0, self.file_icon(Path(message.label)))
+        for segment in message.segments:
+            self._add_segment_item(item, segment)
+        for child in message.children:
+            self._add_message_item(item, child)
+        item.setExpanded(True)
+
+    def _add_segment_item(self, parent_item: QTreeWidgetItem, segment) -> None:
+        if segment.ok:
+            label = "  " + part_name(segment)
+            child = QTreeWidgetItem(parent_item, [label, str(segment.page_count)])
+            child.setToolTip(0, segment.label + JUMP_HINT)
+            child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
+            child.setCheckState(0, Qt.Checked if segment.enabled else Qt.Unchecked)
+            child.setData(0, Qt.UserRole, segment.id)
+            child.setData(0, ROW_ROLE, "segment")
+            # Same tint as the pages, so the navigator and the page column agree
+            # about which message a row came from.
+            child.setBackground(
+                0, QBrush(node_colour(segment, self.model.group_owner(segment)))
+            )
+        else:
+            child = QTreeWidgetItem(
+                parent_item,
+                ["  %s (%s)" % (part_name(segment), segment.detail or "failed"), "\u2014"],
+            )
+            child.setForeground(0, Qt.gray)
+            child.setToolTip(0, segment.detail)
+            child.setData(0, Qt.UserRole, segment.id)
+            child.setData(0, ROW_ROLE, "segment")
+
     def _on_tree_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
-        # A source-level checkbox toggles all of its segments at once.
-        segment_id = item.data(0, Qt.UserRole)
-        if isinstance(segment_id, int):
-            self.model.set_segment_enabled(segment_id, item.checkState(0) == Qt.Checked)
-            self.refresh_pages()
+        role = item.data(0, ROW_ROLE)
+        if role == "segment":
+            segment_id = item.data(0, Qt.UserRole)
+            if isinstance(segment_id, int):
+                self.model.set_segment_enabled(
+                    segment_id, item.checkState(0) == Qt.Checked
+                )
+                self.refresh_pages()
             return
 
-        path = item.data(0, Qt.UserRole)
-        if path is None:
-            return
+        # A source, or a message nested inside one: its checkbox governs the whole
+        # subtree, so unticking a forwarded email leaves out everything inside it.
         wanted = item.checkState(0) == Qt.Checked
         self.tree.blockSignals(True)
-        for index in range(item.childCount()):
-            child = item.child(index)
-            child_id = child.data(0, Qt.UserRole)
-            if isinstance(child_id, int):
-                child.setCheckState(0, Qt.Checked if wanted else Qt.Unchecked)
-                self.model.set_segment_enabled(child_id, wanted)
+        self._set_subtree_enabled(item, wanted)
         self.tree.blockSignals(False)
         self.refresh_pages()
+
+    def _set_subtree_enabled(self, item: QTreeWidgetItem, wanted: bool) -> None:
+        for index in range(item.childCount()):
+            child = item.child(index)
+            if child.data(0, ROW_ROLE) == "segment":
+                segment_id = child.data(0, Qt.UserRole)
+                child.setCheckState(0, Qt.Checked if wanted else Qt.Unchecked)
+                if isinstance(segment_id, int):
+                    self.model.set_segment_enabled(segment_id, wanted)
+            else:
+                child.setCheckState(0, Qt.Checked if wanted else Qt.Unchecked)
+                self._set_subtree_enabled(child, wanted)
+
+    # ------------------------------------------------- navigator to pages
+
+    def _item_segment_ids(self, item: QTreeWidgetItem) -> list[int]:
+        """Every segment a navigator row stands for, itself or its subtree."""
+        if item.data(0, ROW_ROLE) == "segment":
+            segment_id = item.data(0, Qt.UserRole)
+            return [segment_id] if isinstance(segment_id, int) else []
+        found: list[int] = []
+        for index in range(item.childCount()):
+            found.extend(self._item_segment_ids(item.child(index)))
+        return found
+
+    def first_page_of(self, item: QTreeWidgetItem) -> int | None:
+        """The row of the earliest page belonging to a navigator row.
+
+        Earliest in the *page list*, not in the source: the user may have moved
+        pages around, and the point of the jump is to land on the page where it
+        lives now rather than where it started.
+        """
+        wanted = set(self._item_segment_ids(item))
+        if not wanted:
+            return None
+        for position, page in enumerate(self.model.pages):
+            if page.segment_id in wanted:
+                return position
+        return None
+
+    def jump_to_selected(self) -> bool:
+        """Take the page column to whatever the navigator has selected.
+
+        Returns whether it moved, so a caller - or a test - can tell the
+        difference between "jumped" and "there was nothing to jump to".
+        """
+        items = self.tree.selectedItems()
+        if not items:
+            self.status.showMessage("Select a source or an item to jump to its pages.")
+            return False
+        position = self.first_page_of(items[0])
+        if position is None:
+            self.status.showMessage(
+                "%s contributes no pages." % items[0].text(0).strip()
+            )
+            return False
+        self.go_to_page(position)
+        return True
+
+    def go_to_page(self, position: int) -> None:
+        """Show and select one page row, scrolling it into view."""
+        row = self.page_list.item(position)
+        if row is None:
+            return
+        self.page_list.clearSelection()
+        row.setSelected(True)
+        self.page_list.setCurrentItem(row)
+        self.page_list.scrollToItem(row, QAbstractItemView.PositionAtCenter)
+        # A selection that did not change produces no signal, so refresh the
+        # preview directly rather than relying on it.
+        self._update_preview()
 
     # ---------------------------------------------------------------- pages
 
@@ -655,21 +998,25 @@ class MainWindow(QMainWindow):
 
         for position, page in enumerate(self.model.pages, start=1):
             node = self.model.segment(page.segment_id)
-            tint = source_colour(str(node.source) if node else "?")
-            item = QListWidgetItem(row_description(node, page, position))
+            tint = node_colour(node, self.model.group_owner(node))
+            trail = self.model.group_trail(node)
+            item = QListWidgetItem(row_description(node, page, position, trail))
             item.setData(Qt.UserRole, (page.segment_id, page.index, page.rotation))
             item.setToolTip("%s\npage %d of %d"
                             % (node.label if node else "?",
                                page.index + 1,
                                node.page_count if node else 0))
-            # The row tint identifies the originating file, so pages from one
-            # document read as a block even before they are grouped.
+            # The row tint identifies the message the page came from, so an
+            # email's own pages read as one block and a forwarded message inside
+            # it reads as a block of a different colour.
             item.setBackground(QBrush(tint))
             item.setForeground(QBrush(QColor("#202020")))
             item.setSizeHint(QSize(0, ROW_HEIGHT))
             self.page_list.addItem(item)
 
         self.page_list.blockSignals(False)
+        # The list was rebuilt, so every row is a placeholder again.
+        self._thumb_range = None
         self._start_thumbnails()
         self._update_preview()
         self.status.showMessage(self.model.summary())
@@ -685,12 +1032,25 @@ class MainWindow(QMainWindow):
         )
 
     def _start_thumbnails(self) -> None:
+        """Render the thumbnails near the viewport, not the whole document.
+
+        A folder of several hundred files can run to tens of thousands of pages.
+        Rendering a thumbnail for every one of them, every time the list is
+        rebuilt, is what makes a large batch unusable - so only what the user can
+        actually see (plus a margin, so scrolling stays ahead of the rendering) is
+        asked for, and scrolling asks for more.
+        """
         if self._thumbs is not None and self._thumbs.isRunning():
+            if self._thumb_range == self._visible_page_range():
+                return
             self._thumbs.cancel()
             self._thumbs.wait(2000)
 
+        first, last = self._visible_page_range()
+        self._thumb_range = (first, last)
         jobs = []
-        for position, page in enumerate(self.model.pages):
+        for position in range(first, last):
+            page = self.model.pages[position]
             node = self.model.segment(page.segment_id)
             if node and node.pdf:
                 jobs.append((position, node.pdf, page.index))
@@ -699,7 +1059,44 @@ class MainWindow(QMainWindow):
 
         self._thumbs = ThumbnailWorker(jobs, self.thumbs, self)
         self._thumbs.ready.connect(self._on_thumbnail)
+        self._thumbs.finished.connect(self._on_thumbnails_finished)
         self._thumbs.start()
+
+    def _on_thumbnails_finished(self) -> None:
+        """Say so if any page could not be rendered as a thumbnail.
+
+        A missing thumbnail is otherwise invisible, and an invisible gap cannot be
+        told apart from a page that was never there.
+        """
+        failures = getattr(self.thumbs, "failed", 0)
+        if failures:
+            self.status.showMessage(
+                "%d page(s) could not be rendered as thumbnails (%s). "
+                "The pages themselves are unaffected."
+                % (failures, getattr(self.thumbs, "last_error", "") or "unknown")
+            )
+
+    def _visible_page_range(self) -> tuple[int, int]:
+        """The rows worth rendering: what is on screen, padded either side."""
+        count = self.page_list.count()
+        if count == 0:
+            return 0, 0
+        viewport = self.page_list.viewport()
+        top = self.page_list.indexAt(viewport.rect().topLeft())
+        bottom = self.page_list.indexAt(viewport.rect().bottomLeft())
+        first = top.row() if top.isValid() else 0
+        last = bottom.row() if bottom.isValid() else min(count, first + VISIBLE_PAGES)
+        first = max(0, first - THUMBNAIL_MARGIN)
+        last = min(count, max(last, first) + THUMBNAIL_MARGIN + 1)
+        # A single screenful is the floor, so the first paint is never empty even
+        # before the widget has been laid out.
+        if last - first < VISIBLE_PAGES:
+            last = min(count, first + VISIBLE_PAGES)
+        return first, last
+
+    def _on_pages_scrolled(self) -> None:
+        """Ask for more thumbnails once scrolling settles."""
+        self._thumb_timer.start()
 
     def _on_thumbnail(self, position: int, image) -> None:
         if 0 <= position < self.page_list.count():
@@ -883,12 +1280,12 @@ class MainWindow(QMainWindow):
             self.thumbs.clear()
             self.refresh_pages()
 
-        self.progress.setVisible(True)
-        self.progress.setRange(0, 0)
+        # Whatever the last run failed on has been superseded by this one.
+        self.banner.setVisible(False)
+        self._failures = []
+
+        self._begin_progress(len(sources), "Converting %d file(s)\u2026" % len(sources))
         self.act_convert.setEnabled(False)
-        self.status.showMessage(
-            "Converting %d file(s)\u2026" % len(sources) if sources else ""
-        )
 
         self._conversion = ConversionWorker(
             [Path(s) for s in sources],
@@ -898,6 +1295,7 @@ class MainWindow(QMainWindow):
             policy_for=self.policy_for,
         )
         self._conversion.progressed.connect(self.status.showMessage)
+        self._conversion.advanced.connect(self._on_progress)
         self._conversion.completed.connect(self._on_converted)
         self._conversion.crashed.connect(self._on_worker_crash)
         self._conversion.start()
@@ -909,8 +1307,9 @@ class MainWindow(QMainWindow):
             self._autoconvert.start()
 
     def _on_converted(self, report) -> None:
-        self.progress.setVisible(False)
+        self._end_progress()
         self.act_convert.setEnabled(True)
+        cancelled = getattr(report, "cancelled", False)
 
         for result in report.sources:
             self._converted_sources.add(str(result.source))
@@ -922,14 +1321,30 @@ class MainWindow(QMainWindow):
                     segment.ok,
                     kind=segment.kind,
                     detail=segment.detail,
-                    page_count=pipeline.count_pages(segment.pdf)
-                    if segment.ok and segment.pdf else 0,
+                    # The pipeline verified this when it produced the segment;
+                    # count it here only if it came from somewhere that did not.
+                    page_count=segment.page_count or (
+                        pipeline.count_pages(segment.pdf)
+                        if segment.ok and segment.pdf else 0),
+                    group=segment.group,
+                    parent=segment.parent,
+                    group_label=segment.group_label,
+                    depth=segment.depth,
                 )
 
         self.refresh_tree()
         self.refresh_pages()
         self._update_actions()
         self._resume_pending_conversion()
+
+        if cancelled:
+            # The user asked to stop; listing what did not get converted would be
+            # reporting the thing they just cancelled.
+            self.status.showMessage(
+                "Stopped. %d segment(s), %d page(s) kept."
+                % (len(report.segments), self.model.page_count)
+            )
+            return
 
         failures = [s for s in report.all_segments if not s.ok and not is_policy_exclusion(s)]
         excluded = [s for s in report.all_segments if not s.ok and is_policy_exclusion(s)]
@@ -940,32 +1355,57 @@ class MainWindow(QMainWindow):
                        % (len(report.segments), self.model.page_count))
             if excluded:
                 message += " %d item(s) excluded by the extraction settings." % len(excluded)
+            retried = getattr(report, "retried_batches", 0)
+            if retried:
+                # Worth saying out loud: it means this machine dislikes several
+                # LibreOffice processes at once, and the second pass cost time.
+                message += (" LibreOffice needed a second, single-file pass on %d "
+                            "batch(es) - set CONSOLIDATOR_WORKERS=2 if that keeps "
+                            "happening." % retried)
             self.status.showMessage(message)
 
     def _report_failures(self, failures: list) -> None:
-        lines = []
-        for segment in failures[:14]:
-            lines.append("%s\n    %s" % (segment.display, segment.detail or "failed"))
-        if len(failures) > 14:
-            lines.append("\u2026 and %d more" % (len(failures) - 14))
+        """Say what failed without stopping the interface to do it."""
+        self._failures = list(failures)
+        first = self._failures[0]
+        self.lbl_banner.setText(
+            "%d item(s) could not be converted, starting with %s. "
+            "Everything else was converted."
+            % (len(self._failures), first.source.name)
+        )
+        # A conversion failure is retryable, unlike a merge that had to skip
+        # something, so the button comes back.
+        self.btn_banner_retry.setVisible(True)
+        self.banner.setVisible(True)
 
+    def failure_lines(self) -> list[str]:
+        """One line per failure, for the details view."""
+        lines = []
+        for segment in self._failures[:200]:
+            lines.append("%s\n    %s" % (segment.display, segment.detail or "failed"))
+        if len(self._failures) > 200:
+            lines.append("\u2026 and %d more" % (len(self._failures) - 200))
+        return lines
+
+    def show_failure_details(self) -> None:
+        """The list of failures, on request rather than on top of everything."""
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
-        box.setWindowTitle("Some items could not be converted")
-        box.setText("%d item(s) failed. The rest were converted." % len(failures))
-        box.setDetailedText("\n\n".join(lines))
-        retry = box.addButton("Retry failed", QMessageBox.AcceptRole)
-        box.addButton("Continue", QMessageBox.RejectRole)
+        box.setWindowTitle("Items that could not be converted")
+        box.setText("%d item(s) failed. The rest were converted." % len(self._failures))
+        box.setDetailedText("\n\n".join(self.failure_lines()))
         box.exec()
 
-        if box.clickedButton() is retry:
-            unique: list[Path] = []
-            seen = set()
-            for segment in failures:
-                if str(segment.source) not in seen:
-                    seen.add(str(segment.source))
-                    unique.append(segment.source)
-            self.retry_sources(unique)
+    def retry_failed(self) -> None:
+        """Convert just the failed sources again, keeping everything else."""
+        unique: list[Path] = []
+        seen = set()
+        for segment in self._failures:
+            if str(segment.source) not in seen:
+                seen.add(str(segment.source))
+                unique.append(segment.source)
+        self.banner.setVisible(False)
+        self.retry_sources(unique)
 
     def retry_sources(self, sources: list[Path]) -> None:
         """Convert just the failed sources again, leaving everything else alone.
@@ -980,21 +1420,20 @@ class MainWindow(QMainWindow):
         attempts = len(list(Path(self.scratch).glob("retry*")))
         retry_root = Path(self.scratch) / ("retry%d" % attempts)
 
-        self.progress.setVisible(True)
-        self.progress.setRange(0, 0)
+        self._begin_progress(len(sources), "Retrying %d file(s)\u2026" % len(sources))
         self.act_convert.setEnabled(False)
-        self.status.showMessage("Retrying %d file(s)\u2026" % len(sources))
 
         self._conversion = ConversionWorker(
             sources, retry_root, self.default_policy, self, policy_for=self.policy_for
         )
         self._conversion.progressed.connect(self.status.showMessage)
+        self._conversion.advanced.connect(self._on_progress)
         self._conversion.completed.connect(self._on_retried)
         self._conversion.crashed.connect(self._on_worker_crash)
         self._conversion.start()
 
     def _on_retried(self, report) -> None:
-        self.progress.setVisible(False)
+        self._end_progress()
         self.act_convert.setEnabled(True)
 
         recovered = 0
@@ -1010,8 +1449,15 @@ class MainWindow(QMainWindow):
                     segment.ok,
                     kind=segment.kind,
                     detail=segment.detail,
-                    page_count=pipeline.count_pages(segment.pdf)
-                    if segment.ok and segment.pdf else 0,
+                    # The pipeline verified this when it produced the segment;
+                    # count it here only if it came from somewhere that did not.
+                    page_count=segment.page_count or (
+                        pipeline.count_pages(segment.pdf)
+                        if segment.ok and segment.pdf else 0),
+                    group=segment.group,
+                    parent=segment.parent,
+                    group_label=segment.group_label,
+                    depth=segment.depth,
                 )
 
         self.refresh_tree()
@@ -1029,11 +1475,12 @@ class MainWindow(QMainWindow):
         if still_failing:
             self._report_failures(still_failing)
         elif recovered:
-            QMessageBox.information(self, "Retry succeeded",
-                                    "%d segment(s) were recovered." % recovered)
+            # The user asked for this, and the status bar already says it worked;
+            # a dialog to confirm a click is just one more thing to dismiss.
+            self.banner.setVisible(False)
 
     def _on_worker_crash(self, detail: str) -> None:
-        self.progress.setVisible(False)
+        self._end_progress()
         self.act_convert.setEnabled(True)
         self._resume_pending_conversion()
         box = QMessageBox(self)
@@ -1076,8 +1523,7 @@ class MainWindow(QMainWindow):
             return
 
         options = self._merge_options(self.output_path)
-        self.progress.setVisible(True)
-        self.progress.setRange(0, 0)
+        self._begin_busy("Assembling %d page(s)\u2026" % len(self.model.pages))
         self.btn_create.setEnabled(False)
 
         self._merge = MergeWorker(entries, self.output_path, options, self)
@@ -1104,15 +1550,42 @@ class MainWindow(QMainWindow):
         )
 
     def _on_merged(self, report) -> None:
-        self.progress.setVisible(False)
+        self._end_progress()
         self.btn_create.setEnabled(True)
         message = "Wrote %d page(s)" % report.pages
         if report.separators:
             message += " including %d separator(s)" % report.separators
         self.status.showMessage(message + ".")
-        QMessageBox.information(
-            self, "Done", "%s.\n\n%s" % (message, self.output_path)
-        )
+
+        skipped = list(getattr(report, "skipped", []) or [])
+        if skipped:
+            # Anything the merge left out has to be said out loud: a document that
+            # is quietly short is worse than one that fails.
+            self.status.showMessage(
+                "%s. %d item(s) could not be merged." % (message, len(skipped))
+            )
+            self._merge_skips = skipped
+            self.lbl_banner.setText(
+                "%d item(s) could not be merged and are not in the output: %s."
+                % (len(skipped), ", ".join(label for label, _why in skipped[:3]))
+            )
+            self.btn_banner_retry.setVisible(False)
+            self.banner.setVisible(True)
+        else:
+            self._merge_skips = []
+            self.btn_banner_retry.setVisible(True)
+            self.banner.setVisible(False)
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning if skipped else QMessageBox.Information)
+        box.setWindowTitle("Done")
+        box.setText("%s.\n\n%s" % (message, self.output_path))
+        if skipped:
+            box.setDetailedText(
+                "These were left out of the merged PDF:\n\n"
+                + "\n".join("%s\n    %s" % (label, why) for label, why in skipped)
+            )
+        box.exec()
 
     def _on_merge_crash(self, detail: str) -> None:
         self.progress.setVisible(False)

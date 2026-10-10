@@ -48,6 +48,514 @@ def test_gather_skips_directories_but_recurses(tmp_path):
     assert found == {"top.txt", "deep.txt"}
 
 
+# -------------------------------------------------------------- big batches ---
+
+
+def _blank_pdfs(tmp_path, count: int) -> list[Path]:
+    """PDFs copy through byte-for-byte, so these need no converter."""
+    from pypdf import PdfWriter
+
+    sources = []
+    for index in range(count):
+        writer = PdfWriter()
+        writer.add_blank_page(width=612, height=792)
+        path = tmp_path / ("doc%02d.pdf" % index)
+        with open(path, "wb") as handle:
+            writer.write(handle)
+        sources.append(path)
+    return sources
+
+
+def test_progress_is_reported_for_every_file(tmp_path):
+    """A few hundred files need a progress bar, so the count has to be real."""
+    sources = _blank_pdfs(tmp_path, 6)
+    seen: list[tuple[int, int, str]] = []
+
+    report = pipeline.convert_sources(
+        sources, tmp_path / "work",
+        on_progress=lambda done, total, label: seen.append((done, total, label)),
+    )
+
+    assert len(report.sources) == 6
+    assert seen, "progress must be reported at all"
+    assert all(total == 6 for _done, total, _label in seen)
+    done = [value for value, _total, _label in seen]
+    assert done == sorted(done), "progress must never go backwards"
+    assert done[-1] == 6, "the last report must say the batch is finished"
+
+
+def test_web_pages_are_supported_documents_not_text():
+    """A page is laid out by LibreOffice, not read as literal markup."""
+    from consolidator import convert
+
+    for ext in (".html", ".htm", ".xhtml"):
+        assert convert.is_supported(Path("page" + ext)), ext
+        assert ext in convert.WEB_EXTS
+        assert ext in convert.LIBREOFFICE_EXTS, "it batches with the Office files"
+        assert ext in convert.DOCUMENT_EXTS
+        assert ext not in convert.TEXT_EXTS, "rendering it as text would show markup"
+        assert ext not in convert.OFFICE_EXTS
+
+
+def test_plain_text_is_a_supported_document():
+    from consolidator import convert
+
+    for ext in (".txt", ".md", ".log", ".csv"):
+        assert convert.is_supported(Path("notes" + ext)), ext
+        assert ext in convert.TEXT_EXTS
+        assert ext in convert.DOCUMENT_EXTS
+
+
+@requires_lo
+def test_a_web_page_becomes_a_rendered_page(tmp_path):
+    """The markup must be laid out, and its text must survive."""
+    from pypdf import PdfReader
+
+    from consolidator import convert
+
+    page = tmp_path / "page.htm"
+    page.write_text(
+        "<html><body><h1>Quarterly report</h1>"
+        "<p>Rendered by <b>LibreOffice</b>, not by a text fallback.</p></body></html>",
+        encoding="utf-8",
+    )
+    out = tmp_path / "page.pdf"
+    convert.convert(page, out, tmp_path)
+
+    assert out.exists() and out.stat().st_size > 0
+    text = "\n".join(p.extract_text() or "" for p in PdfReader(str(out)).pages)
+    assert "Quarterly report" in text and "LibreOffice" in text
+    assert "<h1>" not in text, "the markup itself must not be on the page"
+
+
+@requires_lo
+def test_an_html_source_converts_end_to_end(tmp_path):
+    """Through the pipeline, so it is the real path a dropped file takes."""
+    page = tmp_path / "saved-page.html"
+    page.write_text("<html><body><h2>Saved page</h2><p>Body text.</p></body></html>",
+                    encoding="utf-8")
+
+    report = pipeline.build([page], tmp_path / "out.pdf")
+
+    assert report.merged is not None and report.merged.pages >= 1
+    assert any(s.ok for s in report.segments)
+
+
+def test_bookmarks_can_actually_be_switched_off(tmp_path):
+    """--no-bookmarks produced a document full of bookmarks.
+
+    ``merge`` had its own ``bookmarks`` argument defaulting to True and assigned it
+    to the options unconditionally, so a caller passing options with bookmarks off
+    was overruled.
+    """
+    from pypdf import PdfReader, PdfWriter
+
+    from consolidator import assemble
+
+    source = tmp_path / "two.pdf"
+    writer = PdfWriter()
+    for _ in range(2):
+        writer.add_blank_page(width=612, height=792)
+    with open(source, "wb") as handle:
+        writer.write(handle)
+
+    def outline_count(path):
+        outline = PdfReader(str(path)).outline
+        return sum(1 for item in outline if not isinstance(item, list))
+
+    entries = [assemble.MergeEntry(source, "first"), assemble.MergeEntry(source, "second")]
+
+    off = tmp_path / "off.pdf"
+    report = assemble.merge(entries, off,
+                            options=assemble.MergeOptions(bookmarks=False))
+    assert report.outline_items == 0, "the option must be honoured"
+    assert outline_count(off) == 0, "and the file must have no outline"
+
+    on = tmp_path / "on.pdf"
+    report = assemble.merge(entries, on, options=assemble.MergeOptions(bookmarks=True))
+    assert report.outline_items == 2 and outline_count(on) == 2
+
+    # The keyword still works for callers that pass no options object.
+    keyword = tmp_path / "keyword.pdf"
+    report = assemble.merge(entries, keyword, bookmarks=False)
+    assert report.outline_items == 0 and outline_count(keyword) == 0
+
+
+def test_a_permissions_only_pdf_is_merged_not_dropped(tmp_path):
+    """A "protected" PDF with no user password must still contribute its pages.
+
+    Scanners and banks set an owner password and print permissions; every reader
+    opens those for anyone who asks. Treating them as encrypted removed the whole
+    attachment from the output, silently - a section of the document simply gone.
+    """
+    from pypdf import PdfReader, PdfWriter
+
+    from consolidator import assemble
+
+    source = tmp_path / "locked.pdf"
+    writer = PdfWriter()
+    for _ in range(3):
+        writer.add_blank_page(width=612, height=792)
+    writer.encrypt(user_password="", owner_password="owner", permissions_flag=4)
+    with open(source, "wb") as handle:
+        writer.write(handle)
+    assert PdfReader(str(source)).is_encrypted, "the fixture must look locked"
+
+    dest = tmp_path / "merged.pdf"
+    report = assemble.merge(
+        [assemble.MergeEntry(source, "locked")], dest,
+        options=assemble.MergeOptions(page_size=(612.0, 792.0)),
+    )
+
+    assert report.pages == 3, "all three pages should be in the output"
+    assert not report.skipped, report.skipped
+    assert len(PdfReader(str(dest)).pages) == 3
+
+
+def test_a_password_protected_pdf_is_reported_not_ignored(tmp_path):
+    """If it genuinely needs a password, say so rather than writing a short file."""
+    from pypdf import PdfReader, PdfWriter
+
+    from consolidator import assemble
+
+    source = tmp_path / "secret.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.encrypt(user_password="letmein", owner_password="owner")
+    with open(source, "wb") as handle:
+        writer.write(handle)
+    assert PdfReader(str(source)).is_encrypted
+
+    dest = tmp_path / "merged.pdf"
+    report = assemble.merge([assemble.MergeEntry(source, "secret")], dest)
+
+    assert report.pages == 0
+    assert report.skipped and "password" in report.skipped[0][1], report.skipped
+
+
+def test_pages_sharing_one_object_keep_their_place(tmp_path):
+    """Some PDFs point two page entries at one object; both must survive."""
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import NameObject
+
+    from consolidator import assemble
+
+    source = tmp_path / "repeated.pdf"
+    writer = PdfWriter()
+    for _ in range(4):
+        writer.add_blank_page(width=612, height=792)
+    kids = writer._root_object["/Pages"][NameObject("/Kids")]
+    kids.insert(2, kids[1])                    # five entries, one object twice
+    with open(source, "wb") as handle:
+        writer.write(handle)
+
+    reader = PdfReader(str(source))
+    assert len(reader.pages) == 5
+    assert (reader.pages[1].indirect_reference.idnum
+            == reader.pages[2].indirect_reference.idnum), "the fixture should share"
+
+    dest = tmp_path / "merged.pdf"
+    report = assemble.merge([assemble.MergeEntry(source, "repeated")], dest)
+
+    assert report.pages == 5, "a repeated page must not collapse into one"
+    assert len(PdfReader(str(dest)).pages) == 5
+
+
+def test_asking_for_pages_beyond_the_end_of_a_file_is_reported(tmp_path):
+    """A page count that disagrees with the file must not be lost in silence."""
+    from pypdf import PdfReader, PdfWriter
+
+    from consolidator import assemble
+
+    source = tmp_path / "two.pdf"
+    writer = PdfWriter()
+    for _ in range(2):
+        writer.add_blank_page(width=612, height=792)
+    with open(source, "wb") as handle:
+        writer.write(handle)
+
+    dest = tmp_path / "merged.pdf"
+    report = assemble.merge(
+        [assemble.MergeEntry(source, "two",
+                             [assemble.PageSpec(0), assemble.PageSpec(1),
+                              assemble.PageSpec(2), assemble.PageSpec(3)])],
+        dest,
+    )
+
+    assert report.pages == 2
+    assert any("beyond the end" in why for _label, why in report.skipped), report.skipped
+    assert len(PdfReader(str(dest)).pages) == 2
+
+
+def test_macro_enabled_and_template_office_formats_are_supported():
+    """An .xlsm is the same container as an .xlsx; refusing it was just a gap."""
+    from consolidator import convert
+
+    for ext in (".xlsm", ".docm", ".pptm", ".xltx", ".dotx", ".potx",
+                ".xlsx", ".docx", ".pptx"):
+        assert convert.is_supported(Path("file" + ext)), ext
+        assert ext in convert.OFFICE_EXTS
+
+
+def test_binary_workbooks_say_what_to_do_instead():
+    from consolidator import convert
+
+    assert not convert.is_supported(Path("book.xlsb"))
+    assert "xlsb" in convert.KNOWN_UNSUPPORTED[".xlsb"].lower()
+
+
+@requires_lo
+def test_a_macro_enabled_workbook_converts(tmp_path):
+    """LibreOffice reads the .xlsm container through the same Calc filter."""
+    from openpyxl import Workbook
+
+    from consolidator import convert
+
+    book = tmp_path / "book.xlsx"
+    sheet = Workbook()
+    sheet.active["A1"] = "macro-enabled"
+    sheet.save(book)
+    target = tmp_path / "book.xlsm"
+    target.write_bytes(book.read_bytes())
+
+    out = tmp_path / "book.pdf"
+    convert.convert(target, out, tmp_path)
+
+    assert out.exists() and out.stat().st_size > 0
+
+
+def test_batch_chunk_sizes_are_adaptive():
+    from consolidator.pipeline import BATCH_CHUNK_MAX, BATCH_CHUNK_MIN, _chunk_size
+
+    assert _chunk_size(0) == 1
+    assert _chunk_size(10) == 10, "a small batch is one invocation"
+    assert _chunk_size(BATCH_CHUNK_MIN) == BATCH_CHUNK_MIN
+    assert _chunk_size(60) == BATCH_CHUNK_MIN, "a floor keeps start-ups down"
+    assert _chunk_size(1000) <= BATCH_CHUNK_MAX, "a ceiling keeps the ticks frequent"
+    assert _chunk_size(100000) == BATCH_CHUNK_MAX
+
+
+def test_conversion_worker_count_is_adaptive(monkeypatch):
+    """Half the cores, capped - and overridable for machines that dislike it."""
+    from consolidator import pipeline
+
+    monkeypatch.delenv("CONSOLIDATOR_WORKERS", raising=False)
+    monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 2)
+    assert pipeline.conversion_workers() == 1, "two cores get one converter"
+    monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 8)
+    assert pipeline.conversion_workers() == 4
+    monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 64)
+    assert pipeline.conversion_workers() == pipeline.MAX_CONVERT_WORKERS
+
+    monkeypatch.setenv("CONSOLIDATOR_WORKERS", "1")
+    assert pipeline.conversion_workers() == 1, "the escape hatch has to be honoured"
+    monkeypatch.setenv("CONSOLIDATOR_WORKERS", "3")
+    assert pipeline.conversion_workers() == 3
+    monkeypatch.setenv("CONSOLIDATOR_WORKERS", "64")
+    assert pipeline.conversion_workers() == pipeline.MAX_CONVERT_WORKERS, \
+        "the cap holds even for an explicit override"
+    monkeypatch.setenv("CONSOLIDATOR_WORKERS", "nonsense")
+    assert pipeline.conversion_workers() >= 1, "a typo must not disable conversion"
+
+
+def test_a_chunk_that_fails_only_while_concurrent_is_redone_alone(tmp_path, monkeypatch):
+    """The reported failure: LibreOffice falls over when several run at once.
+
+    Simulated by making the converter produce nothing whenever another call is in
+    flight. The retry must happen *after* the parallel wave, one at a time -
+    retrying immediately, with the other processes still running, would fail the
+    same way and lose the whole batch.
+    """
+    from consolidator import libreoffice as lo
+    from consolidator import pipeline
+
+    monkeypatch.setattr(pipeline, "RETRY_PAUSE_SECONDS", 0)
+    jobs = [([tmp_path / ("f%d.docx" % i)], tmp_path / ("out%d" % i)) for i in range(4)]
+
+    active = 0
+    peak = 0
+    fallbacks: list[tuple[int, int]] = []
+
+    def fake_batch(files, workdir, timeout=0):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            result = lo.BatchResult()
+            if active > 1:                      # a second process is running
+                for src in files:
+                    result.failed[str(src)] = "LibreOffice crashed"
+                return result
+            for src in files:
+                out = Path(workdir) / (Path(src).stem + ".pdf")
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(b"%PDF-1.4 fake")
+                result.produced[str(src)] = str(out)
+            return result
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(lo, "convert_batch", fake_batch)
+
+    results = pipeline._convert_jobs(
+        jobs, 60, 4, on_fallback=lambda count, total: fallbacks.append((count, total))
+    )
+
+    assert peak > 1, "the test must actually have run things at once"
+    for index, result in enumerate(results):
+        assert result.produced, "chunk %d was lost" % index
+    assert fallbacks and fallbacks[0][1] == 4, "the fallback should be reported"
+
+
+def test_concurrent_jobs_keep_their_order_and_retry_empty_chunks(tmp_path, monkeypatch):
+    """Results come back per job, and a chunk that produced nothing is retried."""
+    from consolidator import libreoffice as lo
+    from consolidator import pipeline
+
+    jobs = [([tmp_path / ("a%d.docx" % i), tmp_path / ("b%d.docx" % i)],
+             tmp_path / ("out%d" % i)) for i in range(4)]
+
+    calls: list[str] = []
+    retried: list[int] = []
+
+    def fake_batch(files, workdir, timeout=0):
+        # The first attempt at job 2 converts nothing, as if the invocation died.
+        workdir = Path(workdir)
+        attempt = (str(workdir), len(calls))
+        calls.append(str(workdir))
+        result = lo.BatchResult()
+        empty = "out2" in str(workdir) and calls.count(str(workdir)) == 1
+        for src in files:
+            if empty:
+                result.failed[str(src)] = "LibreOffice crashed"
+                continue
+            out = workdir / (Path(src).stem + ".pdf")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"%PDF-1.4 fake")
+            result.produced[str(src)] = str(out)
+        if empty:
+            retried.append(2)
+        return result
+
+    monkeypatch.setattr(lo, "convert_batch", fake_batch)
+    monkeypatch.setattr(pipeline, "RETRY_PAUSE_SECONDS", 0)
+
+    done: list[int] = []
+    results = pipeline._convert_jobs(jobs, 60, 4, on_done=lambda i, r: done.append(i))
+
+    assert len(results) == 4
+    assert sorted(done) == [0, 1, 2, 3], "every job reports exactly once"
+    for index, result in enumerate(results):
+        assert len(result.produced) == 2, "job %d should have converted both" % index
+    assert retried == [2], "only the chunk that produced nothing was retried"
+
+
+def test_a_failed_document_is_not_retried_as_a_failed_chunk(tmp_path, monkeypatch):
+    """Per-document failure is normal; only an empty invocation looks like a crash."""
+    from consolidator import libreoffice as lo
+    from consolidator import pipeline
+
+    attempts = []
+
+    def fake_batch(files, workdir, timeout=0):
+        attempts.append(len(files))
+        result = lo.BatchResult()
+        result.produced[str(files[0])] = str(tmp_path / "ok.pdf")
+        result.failed[str(files[1])] = "unsupported content"
+        return result
+
+    monkeypatch.setattr(lo, "convert_batch", fake_batch)
+
+    jobs = [([tmp_path / "good.docx", tmp_path / "bad.docx"], tmp_path / "out")]
+    results = pipeline._convert_jobs(jobs, 60, 4)
+
+    assert len(attempts) == 1, "a half-successful chunk must not be re-run"
+    assert len(results[0].produced) == 1 and len(results[0].failed) == 1
+
+
+def test_a_big_office_batch_reports_progress_while_it_runs(tmp_path, monkeypatch):
+    """One invocation for the whole batch would freeze the bar for minutes."""
+    from consolidator import libreoffice as lo
+
+    sources = []
+    for index in range(60):
+        path = tmp_path / ("doc%03d.docx" % index)
+        path.write_bytes(b"never opened - the converter is stubbed")
+        sources.append(path)
+
+    calls: list[int] = []
+
+    def fake_batch(files, workdir, timeout=0):
+        calls.append(len(files))
+        result = lo.BatchResult()
+        for src in files:
+            out = Path(workdir) / (Path(src).stem + ".pdf")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"%PDF-1.4 fake")
+            result.produced[str(src)] = str(out)
+        return result
+
+    monkeypatch.setattr(lo, "convert_batch", fake_batch)
+    seen: list[tuple[int, int]] = []
+
+    report = pipeline.convert_sources(
+        sources, tmp_path / "work",
+        on_progress=lambda done, total, label: seen.append((done, total)),
+    )
+
+    assert len(calls) > 1, "60 files must not be one invocation"
+    assert len(report.sources) == 60
+    assert seen[-1] == (60, 60)
+    assert len({done for done, _total in seen}) > 2, "the bar has to move during the run"
+
+
+@requires_lo
+def test_batch_conversion_survives_relative_paths(tmp_path, monkeypatch):
+    """LibreOffice fails silently on a relative path; the builder must not.
+
+    Found by converting from a script that used relative paths: every file came
+    back "LibreOffice crashed while converting this file", with
+    "Error: source file could not be loaded" on stderr and nothing else.
+    """
+    source = tmp_path / "note.html"
+    source.write_text("<html><body><p>relative paths</p></body></html>",
+                      encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    result = libreoffice.convert_batch([Path("note.html")], Path("out"))
+
+    assert result.produced.get("note.html"), result.failed
+    assert (tmp_path / "out" / "note.pdf").exists()
+
+
+def test_a_batch_can_be_stopped_part_way(tmp_path):
+    """500 files is a long wait; stopping has to keep what was converted."""
+    sources = _blank_pdfs(tmp_path, 5)
+    converted: list[Path] = []
+
+    def stop_after_two():
+        return len(converted) >= 2
+
+    # should_stop is polled after each source, so count them as they land.
+    original = pipeline._convert_one_to_segment
+
+    def counting(src, *args, **kwargs):
+        converted.append(src)
+        return original(src, *args, **kwargs)
+
+    pipeline._convert_one_to_segment = counting
+    try:
+        report = pipeline.convert_sources(
+            sources, tmp_path / "work", should_stop=stop_after_two,
+        )
+    finally:
+        pipeline._convert_one_to_segment = original
+
+    assert report.cancelled is True
+    assert 0 < len(report.sources) < len(sources), \
+        "stopping must keep the files already converted, not discard them"
+
+
 # ------------------------------------------------------------------ pages ----
 
 

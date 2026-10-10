@@ -19,6 +19,9 @@ class ConversionWorker(QThread):
     """Runs Phase A: turn the selected files into PDF segments."""
 
     progressed = Signal(str)
+    # done, total, what is happening now. A folder of several hundred files takes
+    # long enough that silence looks like a hang.
+    advanced = Signal(int, int, str)
     completed = Signal(object)   # pipeline.BuildReport
     crashed = Signal(str)
 
@@ -33,7 +36,17 @@ class ConversionWorker(QThread):
         self._cancelled = False
 
     def cancel(self) -> None:
+        """Ask for the run to stop.
+
+        Checked between sources rather than mid-file: LibreOffice conversions and
+        message parses are not interruptible, and killing one mid-write would
+        leave a half-written PDF behind.
+        """
         self._cancelled = True
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
 
     def run(self) -> None:  # noqa: D102
         try:
@@ -47,6 +60,8 @@ class ConversionWorker(QThread):
                 page_size=None,
                 on_event=self.progressed.emit,
                 policy_for=self.policy_for,
+                on_progress=self.advanced.emit,
+                should_stop=lambda: self._cancelled,
             )
             self.completed.emit(report)
         except Exception:

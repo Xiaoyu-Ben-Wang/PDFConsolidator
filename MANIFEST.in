@@ -1,0 +1,31 @@
+# Source distribution contents.
+#
+# The licence material is listed in pyproject.toml's license-files; these are the
+# parts of the tree that matter for rebuilding what was shipped, which is what
+# the GPL means by Corresponding Source.
+
+include LICENSE
+include THIRD-PARTY-NOTICES.md
+include README.md
+include PLAN.md
+include conftest.py
+
+graft LICENSES
+graft src
+graft tests
+graft tools
+
+include build/consolidator_gui.py
+include build/version_info.txt
+prune build/_work
+
+prune dist
+prune fixtures
+prune lo-profiles
+prune .venv
+
+global-exclude *.py[cod]
+global-exclude *.pdf
+global-exclude *.msg
+global-exclude *.eml
+prune __pycache__
