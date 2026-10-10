@@ -316,6 +316,20 @@ def sweep_stale_scratch(root: Path | None = None) -> int:
     return removed
 
 
+# Content sniffing reads the whole file only for containers (OLE, ZIP) that
+# need it; past this size a file without a usable name is left unidentified.
+SNIFF_LIMIT_BYTES = 256 * 1024 * 1024
+
+
+def _sniff_file(path: Path) -> str:
+    try:
+        if path.stat().st_size > SNIFF_LIMIT_BYTES:
+            return ""
+        return convert.sniff_extension(path.read_bytes())
+    except OSError:
+        return ""
+
+
 def _natural_key(path: Path):
     """Sort so that ``file2`` precedes ``file10``."""
     parts = re.split(r"(\d+)", path.name.lower())
@@ -442,6 +456,25 @@ def convert_sources(
     for index, raw in enumerate(sources):
         src = Path(raw)
         ext = src.suffix.lower()
+        convertible = src          # what the converters are pointed at
+
+        # A file whose name does not say what it is - no extension, or one we do
+        # not handle - is judged by its content, and converted from a copy that
+        # carries the right extension. The source keeps its own name throughout.
+        if (src.exists() and ext not in convert.SUPPORTED_EXTS
+                and ext not in convert.KNOWN_UNSUPPORTED):
+            sniffed = _sniff_file(src)
+            if sniffed:
+                ext = sniffed
+                if sniffed not in convert.EMAIL_EXTS | convert.LIBREOFFICE_EXTS:
+                    convertible = staging / ("%04d_%s%s" % (index, src.stem or "file", sniffed))
+                    try:
+                        shutil.copyfile(src, convertible)
+                    except OSError as exc:
+                        results[index] = SourceResult(src, [Segment(
+                            src, src.stem, DOCUMENT, None, False,
+                            "could not stage: %s" % exc)])
+                        continue
 
         if not src.exists():
             results[index] = SourceResult(
@@ -465,12 +498,12 @@ def convert_sources(
                 results[index] = SourceResult(
                     src, [Segment(src, src.stem, DOCUMENT, None, False, "could not stage: %s" % exc)]
                 )
-        elif convert.is_supported(src):
-            simple_list.append((index, src))
+        elif ext in convert.SUPPORTED_EXTS:
+            simple_list.append((index, src, convertible))
         else:
             results[index] = SourceResult(
                 src, [Segment(src, src.stem, DOCUMENT, None, False,
-                              "unsupported file type %r" % (ext or "(none)"))]
+                              convert.unsupported_reason(ext))]
             )
 
     # ---- Documents (Office, web): chunked LibreOffice invocations ----
@@ -628,11 +661,13 @@ def convert_sources(
                 expand_one(job)
 
     # ---- Everything else, one file at a time ----
-    for index, src in simple_list:
+    for index, src, convertible in simple_list:
         if stopped:
             break
         out_pdf = work / ("%04d_%s.pdf" % (index, src.stem))
-        segment = _convert_one_to_segment(src, out_pdf, staging, page_size)
+        segment = _convert_one_to_segment(convertible, out_pdf, staging, page_size,
+                                          label=src.stem)
+        segment.source = src
         results[index] = SourceResult(src, [segment])
         emit("  %s   %s" % ("ok  " if segment.ok else "FAIL", src.name))
         stopped = progress(src.name, step=True)

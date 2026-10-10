@@ -262,10 +262,154 @@ def convert(src: Path, dest: Path, workdir: Path, page_size: tuple | None = None
     elif ext in KNOWN_UNSUPPORTED:
         raise ConversionError(KNOWN_UNSUPPORTED[ext])
     else:
-        raise ConversionError("unsupported file type %r" % (ext or "(none)"))
+        raise ConversionError(unsupported_reason(ext))
 
     if not dest.exists() or dest.stat().st_size == 0:
         raise ConversionError("conversion produced no output")
+
+
+# --------------------------------------------------------------- sniffing
+
+_MIME_EXTS = {
+    "application/pdf": ".pdf",
+    "image/jpeg": ".jpg", "image/pjpeg": ".jpg", "image/png": ".png",
+    "image/gif": ".gif", "image/tiff": ".tif", "image/bmp": ".bmp",
+    "image/webp": ".webp",
+    "text/plain": ".txt", "text/html": ".html", "text/csv": ".csv",
+    "application/rtf": ".rtf", "text/rtf": ".rtf",
+    "message/rfc822": ".eml",
+    "application/vnd.ms-outlook": ".msg",
+    "application/msword": ".doc",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.ms-powerpoint": ".ppt",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/vnd.oasis.opendocument.text": ".odt",
+    "application/vnd.oasis.opendocument.spreadsheet": ".ods",
+    "application/vnd.oasis.opendocument.presentation": ".odp",
+}
+
+
+def _sniff_ole(data: bytes) -> str:
+    """Which Office container an OLE2 file is: Outlook item, Word, Excel, PowerPoint."""
+    import io
+
+    try:
+        import olefile
+
+        with olefile.OleFileIO(io.BytesIO(data)) as ole:
+            names = {"/".join(entry).lower() for entry in ole.listdir()}
+    except Exception:
+        return ""
+    if any(name.startswith("__substg1.0_") for name in names):
+        return ".msg"
+    if "worddocument" in names:
+        return ".doc"
+    if "workbook" in names or "book" in names:
+        return ".xls"
+    if "powerpoint document" in names:
+        return ".ppt"
+    return ""
+
+
+def _sniff_zip(data: bytes) -> str:
+    """Which document a ZIP container is: OOXML or OpenDocument."""
+    import io
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            names = set(archive.namelist())
+            if "mimetype" in names:
+                kind = archive.read("mimetype").decode("ascii", "replace").strip()
+                return _MIME_EXTS.get(kind, "")
+    except Exception:
+        return ""
+    if any(name.startswith("word/") for name in names):
+        return ".docx"
+    if any(name.startswith("xl/") for name in names):
+        return ".xlsx"
+    if any(name.startswith("ppt/") for name in names):
+        return ".pptx"
+    return ""
+
+
+def sniff_extension(data: bytes) -> str:
+    """The extension a file's *content* says it has, or "" if it is not recognised.
+
+    Mail routinely names attachments ``image001``, ``scan``, ``ATT00001`` or
+    ``file.dat`` and labels them ``application/octet-stream``. Judged by name
+    alone they were "unsupported file type" and contributed nothing, although
+    the bytes were a perfectly ordinary PDF or picture.
+    """
+    head = data[:2048]
+    if b"%PDF-" in head[:1024]:
+        return ".pdf"
+    signatures = (
+        (b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", ".jpg"),
+        (b"GIF87a", ".gif"), (b"GIF89a", ".gif"),
+        (b"II*\x00", ".tif"), (b"MM\x00*", ".tif"), (b"BM", ".bmp"),
+        (b"{\\rtf", ".rtf"),
+    )
+    for signature, extension in signatures:
+        if head.startswith(signature):
+            if extension == ".bmp":
+                # "BM" alone also starts plenty of text; a real bitmap's header
+                # is followed by one of the few defined info-header sizes.
+                if len(head) < 26 or int.from_bytes(head[14:18], "little") not in (
+                        12, 40, 52, 56, 64, 108, 124):
+                    continue
+            return extension
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    if head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return _sniff_ole(data)
+    if head.startswith(b"PK\x03\x04"):
+        return _sniff_zip(data)
+
+    # Text of some kind: decide between a web page, a message and plain text.
+    if b"\x00" in head and not head.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return ""
+    from .text_render import decode_text
+
+    text = decode_text(head).lstrip("﻿").lstrip()
+    lowered = text[:512].lower()
+    if lowered.startswith(("<!doctype html", "<html")) or "<html" in lowered[:256]:
+        return ".html"
+    lines = text.splitlines()
+    if (len(lines) > 1 and re.match(r"^[A-Za-z][A-Za-z0-9-]*:", lines[0])
+            and re.search(r"^(from|subject|date|message-id):", text[:4096],
+                          re.IGNORECASE | re.MULTILINE)):
+        return ".eml"
+    printable = sum(1 for c in text if c.isprintable() or c in "\r\n\t")
+    if text and printable / len(text) > 0.95:
+        return ".txt"
+    return ""
+
+
+def typed_name(name: str, data: bytes, mimetype: str = "") -> str:
+    """``name`` with an extension that matches what the file is, when it lacks one.
+
+    A name whose extension is already supported is trusted. Otherwise the
+    content decides, then the MIME type; the original name is kept in front so
+    the row still says what the sender called it (``scan`` becomes ``scan.pdf``).
+    """
+    name = name or "attachment"
+    if Path(name).suffix.lower() in SUPPORTED_EXTS:
+        return name
+    extension = sniff_extension(data) or _MIME_EXTS.get((mimetype or "").lower(), "")
+    if not extension:
+        return name
+    return name + extension
+
+
+def unsupported_reason(ext: str) -> str:
+    """Why a file could not be converted, in words a user can act on."""
+    if not ext:
+        return ("unsupported file type: the file has no extension, and its "
+                "content is not a type that can be converted")
+    return "unsupported file type (%s)" % ext
 
 
 def is_supported(path: Path) -> bool:

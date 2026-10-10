@@ -448,6 +448,10 @@ def _msg_attachment(att, live: set[str], depth: int) -> Attachment:
 
     data = _attachment_bytes(att)
     name = name or "attachment"
+    if data:
+        # image001, scan, ATT00001, file.dat: the name may say nothing, so the
+        # bytes decide what the attachment is.
+        name = convert.typed_name(name, data, mimetype)
     if not data:
         return Attachment(name, b"", mimetype, cid,
                           category=categorise(name, mimetype),
@@ -654,7 +658,9 @@ def _name_for_unnamed(mimetype: str, index: int) -> str:
     extension = {
         "application/pdf": ".pdf", "text/plain": ".txt", "text/html": ".html",
         "image/jpeg": ".jpg", "image/png": ".png", "image/tiff": ".tif",
-    }.get(mimetype) or mimetypes.guess_extension(mimetype or "") or ".bin"
+    }.get(mimetype) or mimetypes.guess_extension(mimetype or "") or ""
+    if extension == ".bin":
+        extension = ""          # says nothing; the content will decide
     return "part%d%s" % (index + 1, extension)
 
 
@@ -723,12 +729,16 @@ def _read_eml(path: Path) -> EmailItem:
                 continue
             filename = _name_for_unnamed(mimetype, len(attachments))
 
+        data = _decode_part(part)
+        if not mimetype.startswith("message/"):
+            filename = convert.typed_name(filename, data, mimetype)
+
         # Note: a *named* part with an inline disposition is still an attachment.
         # Real mail is inconsistent about this, and dropping it would lose data.
         attachments.append(
             Attachment(
                 filename=filename,
-                data=_decode_part(part),
+                data=data,
                 mimetype=mimetype,
                 content_id=content_id,
                 inline=False,

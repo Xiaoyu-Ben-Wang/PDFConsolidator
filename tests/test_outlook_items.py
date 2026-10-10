@@ -219,3 +219,96 @@ def test_outlook_items_nested_three_deep_keep_every_page(tmp_path):
         ("top - top.pdf", 0, True, 2),
         ("sheet - body", 1, True, 1),
     ]
+
+
+# ------------------------------------------------- names that say nothing ---
+
+
+def _docx_bytes() -> bytes:
+    import io
+
+    docx = pytest.importorskip("docx")
+    document = docx.Document()
+    document.add_paragraph("sniffed")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def _png_bytes() -> bytes:
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), (0, 90, 200)).save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+@pytest.mark.parametrize("make, expected", [
+    (lambda: PDF, ".pdf"),
+    (_png_bytes, ".png"),
+    (_docx_bytes, ".docx"),
+    (lambda: mb.build(mb.Item(subject="x", body="y")), ".msg"),
+    (lambda: b"From: a@example.com\r\nSubject: hi\r\n\r\nbody\r\n", ".eml"),
+    (lambda: b"<!DOCTYPE html><html><body>x</body></html>", ".html"),
+    (lambda: "plain notes, café\n".encode("utf-8"), ".txt"),
+    (lambda: rb"{\rtf1\ansi hello}", ".rtf"),
+    (lambda: b"BMW quarterly report\nfigures follow", ".txt"),
+    (lambda: bytes(range(256)) * 8, ""),
+])
+def test_content_decides_the_type_when_the_name_cannot(make, expected):
+    from consolidator import convert
+
+    assert convert.sniff_extension(make()) == expected
+
+
+@pytest.mark.parametrize("name", ["image001", "scan", "ATT00001", "file.dat"])
+def test_an_attachment_named_without_a_type_is_typed_by_its_content(tmp_path, name):
+    path = _write(tmp_path, "m.msg", mb.Item(
+        subject="Top", body="b",
+        attachments=[mb.Att(name, PDF, mimetype="application/octet-stream")]))
+
+    attachment = email_items.read_message(path).attachments[0]
+
+    assert attachment.filename == name + ".pdf"
+    assert attachment.category == "pdf"
+
+
+def test_a_supported_name_is_trusted(tmp_path):
+    from consolidator import convert
+
+    assert convert.typed_name("report.pdf", b"anything") == "report.pdf"
+    assert convert.typed_name("blob", b"\x00\x01\x02" * 50,
+                              "application/octet-stream") == "blob"
+
+
+def test_an_eml_part_without_name_or_type_is_typed_by_content(tmp_path):
+    from email.message import EmailMessage
+
+    message = EmailMessage()
+    message["Subject"] = "octet"
+    message.set_content("see attached")
+    message.add_attachment(PDF, maintype="application", subtype="octet-stream")
+    del message.get_payload()[1]["Content-Disposition"]
+    path = tmp_path / "m.eml"
+    path.write_bytes(message.as_bytes())
+
+    item = email_items.read_message(path)
+
+    assert [(a.filename, a.category) for a in item.attachments] == [("part1.pdf", "pdf")]
+
+
+def test_an_added_file_without_an_extension_is_converted_by_content(tmp_path):
+    scan = tmp_path / "scan"
+    scan.write_bytes(PDF)
+    unknown = tmp_path / "mystery"
+    unknown.write_bytes(bytes(range(256)) * 8)
+
+    report = pipeline.convert_sources([scan, unknown], tmp_path / "work")
+
+    first, second = report.sources
+    assert first.source == scan and first.segments[0].ok
+    assert first.segments[0].page_count == 2
+    assert not second.segments[0].ok
+    assert "no extension" in second.segments[0].detail
