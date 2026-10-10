@@ -14,6 +14,12 @@ from PySide6.QtCore import QThread, Signal
 
 from .. import assemble, email_items, pipeline
 
+# Worker threads get a generous stack. Parsing a hostile or merely deeply nested
+# PDF or message recurses deeply, and Windows gives a new thread 1 MB by default:
+# running out of that is not an exception Python can catch but the end of the
+# process. Address space is reserved, not committed, so this costs nothing.
+WORKER_STACK_BYTES = 16 * 1024 * 1024
+
 
 class ConversionWorker(QThread):
     """Runs Phase A: turn the selected files into PDF segments."""
@@ -29,6 +35,7 @@ class ConversionWorker(QThread):
                  policy: email_items.ExtractionPolicy, parent=None,
                  policy_for=None) -> None:
         super().__init__(parent)
+        self.setStackSize(WORKER_STACK_BYTES)
         self.sources = [Path(s) for s in sources]
         self.scratch = Path(scratch)
         self.policy = policy
@@ -77,6 +84,7 @@ class MergeWorker(QThread):
     def __init__(self, entries: list[assemble.MergeEntry], dest: Path,
                  options: assemble.MergeOptions, parent=None) -> None:
         super().__init__(parent)
+        self.setStackSize(WORKER_STACK_BYTES)
         self.entries = entries
         self.dest = Path(dest)
         self.options = options
@@ -96,10 +104,14 @@ class ThumbnailWorker(QThread):
     construct a pixmap.
     """
 
-    ready = Signal(int, object)   # page index, QImage
+    # Row position, the (pdf, page) that was rendered, and the QImage. The page is
+    # sent back so the receiver can check the row still shows that page: a list
+    # rebuilt mid-render would otherwise get another page's picture.
+    ready = Signal(int, object, object)
 
     def __init__(self, jobs: list[tuple[int, Path, int]], cache, parent=None) -> None:
         super().__init__(parent)
+        self.setStackSize(WORKER_STACK_BYTES)
         self.jobs = jobs
         self.cache = cache
         self._cancelled = False
@@ -112,5 +124,5 @@ class ThumbnailWorker(QThread):
             if self._cancelled:
                 return
             image = self.cache.image(pdf, index_in_pdf)
-            if image is not None:
-                self.ready.emit(page_index, image)
+            if image is not None and not self._cancelled:
+                self.ready.emit(page_index, (str(pdf), index_in_pdf), image)

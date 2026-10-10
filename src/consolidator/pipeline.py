@@ -79,7 +79,8 @@ def _chunks(items: list, size: int) -> list[list]:
 
 
 def _convert_jobs(jobs: list[tuple[list, Path]], timeout: int,
-                  workers: int, on_done=None, on_fallback=None) -> list:
+                  workers: int, on_done=None, on_fallback=None,
+                  should_stop=None) -> list:
     """Run LibreOffice batches, several at a time, and return the results in order.
 
     Each invocation is a separate ``soffice`` process with its own profile and its
@@ -94,10 +95,26 @@ def _convert_jobs(jobs: list[tuple[list, Path]], timeout: int,
     retry then has no concurrency to lose to. It costs a second pass on the
     affected chunks and turns "the whole batch failed" into "the batch took
     slightly longer".
+
+    Once ``should_stop`` says so, or the application is closing, no further chunk
+    is started and nothing is retried: a chunk not started is left without a
+    result, exactly as if the run had not reached it. Without this a cancelled
+    batch carried on through every remaining chunk, and a closing window waited
+    for retries of chunks whose soffice it had just ended.
     """
     results: list = [None] * len(jobs)
 
+    def stopping() -> bool:
+        if libreoffice.stopping():
+            return True
+        try:
+            return bool(should_stop and should_stop())
+        except Exception:
+            return False
+
     def convert(index: int):
+        if stopping():
+            return None
         group, outdir = jobs[index]
         return libreoffice.convert_batch(group, outdir, timeout=timeout)
 
@@ -109,16 +126,18 @@ def _convert_jobs(jobs: list[tuple[list, Path]], timeout: int,
     def convert_with_retry(index: int):
         """One invocation, and one quiet second attempt if it produced nothing."""
         result = convert(index)
-        if jobs[index][0] and not result.produced:
+        if result is not None and jobs[index][0] and not result.produced and not stopping():
             time.sleep(RETRY_PAUSE_SECONDS)
             retry = convert(index)
-            if retry.produced:
+            if retry is not None and retry.produced:
                 return retry
         return result
 
     if workers <= 1 or len(jobs) <= 1:
         for index in range(len(jobs)):
-            finish(index, convert_with_retry(index))
+            result = convert_with_retry(index)
+            if result is not None:
+                finish(index, result)
         return results
 
     deferred: list[int] = []
@@ -127,7 +146,9 @@ def _convert_jobs(jobs: list[tuple[list, Path]], timeout: int,
         for future in as_completed(futures):
             index = futures[future]
             result = future.result()
-            if jobs[index][0] and not result.produced:
+            if result is None:
+                continue            # stopped before it started
+            if jobs[index][0] and not result.produced and not stopping():
                 deferred.append(index)
             else:
                 finish(index, result)
@@ -136,7 +157,9 @@ def _convert_jobs(jobs: list[tuple[list, Path]], timeout: int,
         if on_fallback:
             on_fallback(len(deferred), len(jobs))
         for index in sorted(deferred):
-            finish(index, convert_with_retry(index))
+            result = convert_with_retry(index)
+            if result is not None:
+                finish(index, result)
 
     return results
 
@@ -210,6 +233,87 @@ def choose_scratch(preferred_parent: Path | None = None) -> Path:
         "no writable scratch directory found (tried: %s)"
         % ", ".join(str(c) for c in candidates)
     )
+
+
+OWNER_FILE = ".owner"
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether a process exists. Never signals it (os.kill would end it on Windows)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE,
+                                                ctypes.POINTER(wintypes.DWORD))
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel32.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFORMATION
+        if not handle:
+            # Access denied still means it exists; anything else means it does not.
+            return ctypes.get_last_error() == 5
+        try:
+            code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == 259                    # STILL_ACTIVE
+            return True
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def claim_scratch(directory: Path) -> None:
+    """Mark a scratch directory as belonging to this process."""
+    try:
+        (Path(directory) / OWNER_FILE).write_text(str(os.getpid()), encoding="ascii")
+    except OSError:
+        pass
+
+
+def sweep_stale_scratch(root: Path | None = None) -> int:
+    """Remove scratch left by runs of the application that are no longer running.
+
+    A run that ended abruptly - closed mid-conversion, killed, a power cut -
+    leaves its scratch behind, and on a portable install that is a growing pile
+    beside the executable. Only directories whose owner is gone are touched, so a
+    second instance running at the same time keeps its files. Returns how many
+    were removed.
+    """
+    removed = 0
+    roots = []
+    try:
+        roots.append(Path(root) if root else choose_scratch())
+    except Exception:
+        pass
+    for scratch_root in roots:
+        for candidate in scratch_root.glob("gui_*"):
+            try:
+                owner = int((candidate / OWNER_FILE).read_text(encoding="ascii").strip())
+            except (OSError, ValueError):
+                continue        # unowned: not ours to judge
+            if not _pid_alive(owner):
+                libreoffice._remove_tree(candidate)
+                removed += not candidate.exists()
+    profiles = libreoffice.app_root() / "lo-profiles"
+    for profile in profiles.glob("p*-*") if profiles.exists() else []:
+        try:
+            owner = int(profile.name[1:].split("-", 1)[0])
+        except ValueError:
+            continue
+        if not _pid_alive(owner):
+            libreoffice._remove_tree(profile)
+            removed += not profile.exists()
+    return removed
 
 
 def _natural_key(path: Path):
@@ -313,6 +417,15 @@ def convert_sources(
 
     stopped = False
 
+    def _asked_to_stop() -> bool:
+        """The caller's stop request, read directly rather than at the next tick."""
+        if libreoffice.stopping():
+            return True
+        try:
+            return bool(should_stop and should_stop())
+        except Exception:
+            return False
+
     started = time.monotonic()
     report = BuildReport(policy=policy)
     staging = workdir / "staging"
@@ -409,7 +522,8 @@ def convert_sources(
                  "concurrently; retrying them one at a time." % (count, total))
 
         _convert_jobs(jobs, OFFICE_BATCH_TIMEOUT, conversion_workers(),
-                      on_done=finished, on_fallback=office_fallback)
+                      on_done=finished, on_fallback=office_fallback,
+                      should_stop=lambda: stopped or _asked_to_stop())
 
     # ---- Email items: parse, render all bodies in one batch, then expand ----
     if email_list and not stopped:
@@ -472,10 +586,14 @@ def convert_sources(
                      "run concurrently; retrying them one at a time." % (count, total))
 
             _convert_jobs(jobs, OFFICE_BATCH_TIMEOUT, conversion_workers(),
-                          on_done=rendered_body, on_fallback=body_fallback)
+                          on_done=rendered_body, on_fallback=body_fallback,
+                          should_stop=lambda: stopped or _asked_to_stop())
 
         def expand_one(job) -> None:
             nonlocal stopped
+            if stopped or _asked_to_stop():
+                stopped = True
+                return          # not reached, exactly as in a sequential run
             index, src, item, html_path = job
             key = str(html_path) if html_path else ""
             try:

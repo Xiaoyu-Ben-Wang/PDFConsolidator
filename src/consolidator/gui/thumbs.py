@@ -39,6 +39,18 @@ IMAGE_CACHE_SIZE = 600
 DOCUMENT_CACHE_SIZE = 24
 
 
+def fit_scale(page_size: tuple[float, float], height: int, width: int) -> float:
+    """The pdfium render scale that fits a page inside ``width`` x ``height``.
+
+    Fitting by height alone is fine for paper and dangerous for anything else: a
+    banner or a long drawing a few points tall asked pdfium for a bitmap millions
+    of pixels wide, which fails at best and takes the process down at worst.
+    """
+    page_width = max(float(page_size[0]), 1.0)
+    page_height = max(float(page_size[1]), 1.0)
+    return max(0.01, min(height / page_height, width / page_width))
+
+
 class ThumbnailCache:
     """Lazily renders and caches page thumbnails, keyed by (pdf, page index).
 
@@ -116,8 +128,8 @@ class ThumbnailCache:
                 if index < 0 or index >= len(document):
                     return None
                 page = document[index]
-                # Render at a scale that yields roughly the requested height.
-                scale = max(0.1, self.height / max(float(page.get_size()[1]) / 3.2, 1.0))
+                # Twice the displayed size, so the thumbnail is sharp when shrunk.
+                scale = fit_scale(page.get_size(), THUMB_HEIGHT * 2, THUMB_WIDTH * 2)
                 pil = page.render(scale=scale).to_pil()
                 pil.thumbnail((THUMB_WIDTH * 2, THUMB_HEIGHT * 2))
 
@@ -161,8 +173,8 @@ class ThumbnailCache:
                 if index < 0 or index >= len(document):
                     return None
                 page = document[index]
-                intrinsics = page.get_size()
-                scale = max(0.05, height / max(float(intrinsics[1]) / 3.2, 1.0))
+                # Bounded in width too: the preview pane is never wider than this.
+                scale = fit_scale(page.get_size(), height, height * 2)
                 pil = page.render(scale=scale).to_pil()
                 if pil.height > height:
                     ratio = height / float(pil.height)

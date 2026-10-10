@@ -28,6 +28,7 @@ import subprocess
 import itertools
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,87 @@ _profile_counter = itertools.count(1)
 
 # A start-up plus conversion budget for a batch. Large batches may need more.
 DEFAULT_TIMEOUT = 600
+
+
+# Every soffice this process has running, so they can all be stopped at once when
+# the application closes. A conversion is a blocking call that can last minutes;
+# without a way to end it, closing the window mid-run either waited that long or
+# left the worker thread running while Python shut down underneath it - which Qt
+# answers by aborting the whole process.
+_running: set[subprocess.Popen] = set()
+_running_lock = threading.Lock()
+_stopping = threading.Event()
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """End ``soffice`` *and* the ``soffice.bin`` it starts.
+
+    ``soffice.exe`` is only a launcher. Killing it alone - which is all
+    ``Popen.kill`` and ``subprocess.run``'s timeout do - leaves the real process
+    running, holding the files it was converting open.
+    """
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=15, creationflags=_NO_WINDOW)
+        except Exception:
+            pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def stop_all() -> None:
+    """Stop every running conversion, and refuse to start new ones.
+
+    For shutdown. The conversions in progress fail and report so; nothing is
+    half-written in their place, because outputs are verified before use.
+    """
+    _stopping.set()
+    with _running_lock:
+        running = list(_running)
+    for proc in running:
+        _kill_tree(proc)
+
+
+def stopping() -> bool:
+    """Whether :func:`stop_all` has been called and not yet undone."""
+    return _stopping.is_set()
+
+
+def resume() -> None:
+    """Allow conversions again after :func:`stop_all` (a window closed, the app did not)."""
+    _stopping.clear()
+
+
+def _run(cmd: list[str], timeout: int, env: dict[str, str]) -> tuple[str, str, bool]:
+    """Run ``soffice`` to completion. Returns stdout, stderr and whether it timed out."""
+    if _stopping.is_set():
+        return "", "the application is closing", False
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace",
+                            creationflags=_NO_WINDOW, env=env)
+    with _running_lock:
+        _running.add(proc)
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return stdout or "", stderr or "", False
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=30)
+            except Exception:
+                stdout, stderr = "", ""
+            return stdout or "", stderr or "", True
+    finally:
+        with _running_lock:
+            _running.discard(proc)
+        if proc.poll() is None:
+            _kill_tree(proc)
 
 
 class LibreOfficeError(RuntimeError):
@@ -265,17 +347,7 @@ def convert_batch(
         _remove_lock(outdir, stale.name)
 
     started = time.monotonic()
-    timed_out = False
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            creationflags=_NO_WINDOW, env=clean_env(lo_tmp),
-        )
-        stdout, stderr = proc.stdout or "", proc.stderr or ""
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        stdout = (exc.stdout or b"").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        stderr = (exc.stderr or b"").decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+    stdout, stderr, timed_out = _run(cmd, timeout, clean_env(lo_tmp))
 
     seconds = time.monotonic() - started
 

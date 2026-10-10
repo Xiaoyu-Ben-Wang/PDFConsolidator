@@ -209,6 +209,8 @@ class MainWindow(QMainWindow):
         self._conversion: ConversionWorker | None = None
         self._merge: MergeWorker | None = None
         self._thumbs: ThumbnailWorker | None = None
+        # Every thumbnail worker still alive, so shutdown can wait for them all.
+        self._thumb_workers: set[ThumbnailWorker] = set()
         self._thumb_range: tuple[int, int] | None = None
 
         # Scrolling asks for the thumbnails that just came into view, once the
@@ -1098,8 +1100,10 @@ class MainWindow(QMainWindow):
         if self._thumbs is not None and self._thumbs.isRunning():
             if self._thumb_range == self._visible_page_range():
                 return
+            # No waiting: the old worker stops after the page in hand, and the
+            # cache's lock keeps the two from rendering at once. Waiting here
+            # froze the window for up to two seconds per scroll on a slow page.
             self._thumbs.cancel()
-            self._thumbs.wait(2000)
 
         first, last = self._visible_page_range()
         self._thumb_range = (first, last)
@@ -1112,17 +1116,29 @@ class MainWindow(QMainWindow):
         if not jobs:
             return
 
-        self._thumbs = ThumbnailWorker(jobs, self.thumbs, self)
-        self._thumbs.ready.connect(self._on_thumbnail)
-        self._thumbs.finished.connect(self._on_thumbnails_finished)
-        self._thumbs.start()
+        worker = ThumbnailWorker(jobs, self.thumbs, self)
+        worker.ready.connect(self._on_thumbnail)
+        # A bound method of the window, so the slot is queued to the GUI thread.
+        worker.finished.connect(self._on_thumbnail_worker_finished)
+        self._thumb_workers.add(worker)
+        self._thumbs = worker
+        worker.start()
 
-    def _on_thumbnails_finished(self) -> None:
-        """Say so if any page could not be rendered as a thumbnail.
+    def _on_thumbnail_worker_finished(self) -> None:
+        self._on_thumbnails_finished(self.sender())
 
-        A missing thumbnail is otherwise invisible, and an invisible gap cannot be
-        told apart from a page that was never there.
+    def _on_thumbnails_finished(self, worker=None) -> None:
+        """Release a finished worker, and say so if any page could not be rendered.
+
+        Every scroll starts a worker, and each used to stay parented to the window
+        for the rest of the session. A missing thumbnail is otherwise invisible,
+        and an invisible gap cannot be told apart from a page that was never there.
         """
+        if worker is not None:
+            self._thumb_workers.discard(worker)
+            if self._thumbs is worker:
+                self._thumbs = None
+            worker.deleteLater()
         failures = getattr(self.thumbs, "failed", 0)
         if failures:
             self.status.showMessage(
@@ -1153,9 +1169,16 @@ class MainWindow(QMainWindow):
         """Ask for more thumbnails once scrolling settles."""
         self._thumb_timer.start()
 
-    def _on_thumbnail(self, position: int, image) -> None:
-        if 0 <= position < self.page_list.count():
-            self.page_list.item(position).setIcon(QIcon(QPixmap.fromImage(image)))
+    def _on_thumbnail(self, position: int, rendered, image) -> None:
+        """Show a thumbnail - if its row still shows the page it was made for."""
+        if not (0 <= position < self.page_list.count()
+                and position < len(self.model.pages)):
+            return
+        page = self.model.pages[position]
+        node = self.model.segment(page.segment_id)
+        if node is None or not node.pdf or (str(node.pdf), page.index) != tuple(rendered):
+            return
+        self.page_list.item(position).setIcon(QIcon(QPixmap.fromImage(image)))
 
     # -------------------------------------------------------------- preview
 
@@ -1292,6 +1315,8 @@ class MainWindow(QMainWindow):
             self.scratch = Path(
                 tempfile.mkdtemp(prefix="gui_", dir=str(pipeline.choose_scratch()))
             )
+            # So a later start can tell this directory from a live one.
+            pipeline.claim_scratch(self.scratch)
         return self.scratch
 
     def _next_run_dir(self) -> Path:
@@ -1470,6 +1495,9 @@ class MainWindow(QMainWindow):
         those are named by index within their batch.
         """
         if not sources or self.scratch is None:
+            return
+        if self._conversion is not None and self._conversion.isRunning():
+            self.status.showMessage("A conversion is already running; retry when it finishes.")
             return
 
         attempts = len(list(Path(self.scratch).glob("retry*")))
@@ -1660,6 +1688,22 @@ class MainWindow(QMainWindow):
         self.act_clear.setEnabled(has_sources)
         self.act_convert.setEnabled(has_sources)
 
+    def workers_running(self) -> bool:
+        """Whether any background thread is still going.
+
+        Checked on the way out: Python tearing down a QThread that is still
+        running makes Qt abort the process, so a run that will not stop in time
+        is left behind with ``os._exit`` instead (see ``app.run``).
+        """
+        workers = [self._conversion, self._merge, *self._thumb_workers]
+        for worker in workers:
+            try:
+                if worker is not None and worker.isRunning():
+                    return True
+            except RuntimeError:        # already deleted on the C++ side
+                continue
+        return False
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         """Shut down promptly.
 
@@ -1670,18 +1714,33 @@ class MainWindow(QMainWindow):
         """
         import threading
 
+        from .. import libreoffice
+
         self._autoconvert.stop()
 
-        workers = [w for w in (self._conversion, self._merge, self._thumbs) if w is not None]
+        workers = [w for w in (self._conversion, self._merge, *self._thumb_workers)
+                   if w is not None]
         for worker in workers:
             if worker.isRunning() and hasattr(worker, "cancel"):
                 worker.cancel()
 
-        deadline = time.monotonic() + 0.5
+        # A conversion blocks inside LibreOffice for as long as a batch takes, so
+        # asking it to stop is not enough: its soffice processes are ended, which
+        # makes the call return and the worker finish.
+        converting = self._conversion is not None and self._conversion.isRunning()
+        if converting:
+            libreoffice.stop_all()
+
+        deadline = time.monotonic() + (3.0 if converting else 0.5)
         for worker in workers:
             if worker.isRunning():
                 remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
                 worker.wait(remaining_ms)
+        if converting:
+            # Closing a window is not quitting the process (tests, and any host
+            # embedding the window, carry on). app.run stops LibreOffice again
+            # if it has to leave with a worker still running.
+            libreoffice.resume()
 
         scratch = self.scratch
         self.scratch = None

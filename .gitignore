@@ -60,6 +60,7 @@ run_*/
 selftest_*/
 selftest.log
 startup-error.log
+consolidator-errors.log
 
 # ---- Editor / OS ----
 .vscode/
