@@ -13,14 +13,14 @@ drawn onto a rotated page would itself appear rotated, because the viewer applie
 from __future__ import annotations
 
 import io
+import itertools
 import os
 import re
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
-from pypdf import PdfReader, PdfWriter, Transformation
-from pypdf.generic import RectangleObject
+from pypdf import PdfReader, PdfWriter
 
 
 @dataclass
@@ -94,69 +94,249 @@ class MergeReport:
     page_map: list = field(default_factory=list)
     # The page-by-page comparison of the output with its sources, if it ran.
     verification: object = None
+    # Pages that could not be copied and were included as pictures of themselves:
+    # (output page, label, source page, why).
+    as_images: list = field(default_factory=list)
     # The file actually written - not the one asked for, if that already existed.
     output: Path | None = None
     requested: Path | None = None
 
 
-def visual_size(page) -> tuple[float, float]:
-    """Page size as the reader sees it, accounting for the ``/Rotate`` entry."""
-    box = page.mediabox
-    width, height = float(box.width), float(box.height)
+# ------------------------------------------------- page geometry, unparsed
+#
+# Fitting, rotating and decorating a page all used to go through pypdf's content
+# stream parser (add_transformation, transfer_rotation_to_content, merge_page),
+# which reads and re-writes every drawing instruction on the page. It is strict
+# where viewers are lenient - a number longer than 64 characters, as some
+# generators write, raised LimitReachedError and aborted an entire 2000-page
+# export - and anything it misreads is silently lost. None of it is needed: a
+# page's own instructions can be left exactly as they are, byte for byte, with a
+# transformation placed *around* them and decorations drawn *after* them as a
+# separate form. That is what everything below does; nothing here parses a page.
+
+Matrix = tuple[float, float, float, float, float, float]
+
+
+def then(first: Matrix, second: Matrix) -> Matrix:
+    """The transformation that applies ``first`` and then ``second``."""
+    a1, b1, c1, d1, e1, f1 = first
+    a2, b2, c2, d2, e2, f2 = second
+    return (a1 * a2 + b1 * c2, a1 * b2 + b1 * d2,
+            c1 * a2 + d1 * c2, c1 * b2 + d1 * d2,
+            e1 * a2 + f1 * c2 + e2, e1 * b2 + f1 * d2 + f2)
+
+
+def apply(matrix: Matrix, x: float, y: float) -> tuple[float, float]:
+    a, b, c, d, e, f = matrix
+    return a * x + c * y + e, b * x + d * y + f
+
+
+def page_rotation(page) -> int:
     try:
-        rotate = int(page.get("/Rotate", 0) or 0) % 360
+        return int(page.get("/Rotate", 0) or 0) % 360
     except Exception:
-        rotate = 0
-    if rotate in (90, 270):
+        return 0
+
+
+def visible_box(page) -> tuple[float, float, float, float]:
+    """``(left, bottom, width, height)`` of what a viewer shows: crop box within media box.
+
+    A box that does not start at the origin is common (scanners, imposition
+    software). Fitting used to measure only width and height and assume (0, 0),
+    which shifted such pages and could push part of them off the sheet.
+    """
+    media = page.mediabox
+    try:
+        crop = page.cropbox
+    except Exception:
+        crop = media
+    left = max(float(media.left), float(crop.left))
+    bottom = max(float(media.bottom), float(crop.bottom))
+    right = min(float(media.right), float(crop.right))
+    top = min(float(media.top), float(crop.top))
+    if right - left <= 0 or top - bottom <= 0:
+        left, bottom = float(media.left), float(media.bottom)
+        right, top = float(media.right), float(media.top)
+    return left, bottom, right - left, top - bottom
+
+
+def visual_size(page) -> tuple[float, float]:
+    """Page size as the reader sees it: the visible box, turned by ``/Rotate``."""
+    _left, _bottom, width, height = visible_box(page)
+    if page_rotation(page) in (90, 270):
         width, height = height, width
     return width, height
 
 
-def bake_rotation(page) -> None:
-    """Fold ``/Rotate`` into the content stream and clear it.
+def rotation_matrix(box: tuple[float, float, float, float], degrees: int) -> Matrix:
+    """Turn the content of ``box`` clockwise by ``degrees`` onto a box at the origin."""
+    left, bottom, width, height = box
+    degrees %= 360
+    if degrees == 90:
+        return (0.0, -1.0, 1.0, 0.0, -bottom, width + left)
+    if degrees == 180:
+        return (-1.0, 0.0, 0.0, -1.0, left + width, bottom + height)
+    if degrees == 270:
+        return (0.0, 1.0, -1.0, 0.0, bottom + height, -left)
+    return (1.0, 0.0, 0.0, 1.0, -left, -bottom)
 
-    Done before any transformation so that scaling and overlays always operate in
-    the page's displayed orientation.
+
+def _writer_of(page):
+    return page.indirect_reference.pdf
+
+
+def _stream(writer, data: bytes, extra: dict | None = None):
+    from pypdf.generic import DecodedStreamObject
+
+    stream = DecodedStreamObject()
+    stream.set_data(data)
+    if extra:
+        stream.update(extra)
+    return writer._add_object(stream)
+
+
+def _contents(page) -> list:
+    """The page's content streams as references - located, never read."""
+    from pypdf.generic import ArrayObject, IndirectObject, NameObject
+
+    writer = _writer_of(page)
+    key = NameObject("/Contents")
+    if key not in page:
+        return []
+    raw = dict.__getitem__(page, key)
+    resolved = raw.get_object()
+    items = list(resolved) if isinstance(resolved, ArrayObject) else [raw]
+    references = []
+    for item in items:
+        if not isinstance(item, IndirectObject):
+            item = writer._add_object(item)      # a direct stream: give it a home
+        references.append(item)
+    return references
+
+
+def _number(value: float) -> bytes:
+    text = ("%.6f" % value).rstrip("0").rstrip(".")
+    return (text if text not in ("", "-0") else "0").encode("ascii")
+
+
+def wrap_contents(page, prefix: bytes = b"", suffix: bytes = b"") -> None:
+    """Put drawing instructions before and after the page's own, untouched."""
+    from pypdf.generic import ArrayObject, NameObject
+
+    writer = _writer_of(page)
+    parts = []
+    if prefix:
+        parts.append(_stream(writer, prefix))
+    parts.extend(_contents(page))
+    if suffix:
+        parts.append(_stream(writer, suffix))
+    page[NameObject("/Contents")] = ArrayObject(parts)
+
+
+def _transform_annotations(page, matrix: Matrix) -> None:
+    """Move link and other annotation rectangles along with the content.
+
+    Each annotation is copied for this page first: a page used twice shares its
+    annotations with its twin, which must not move as well.
     """
+    from pypdf.generic import ArrayObject, DictionaryObject, NameObject, RectangleObject
+
+    if "/Annots" not in page:
+        return
+    writer = _writer_of(page)
     try:
-        rotate = int(page.get("/Rotate", 0) or 0) % 360
+        annotations = list(page["/Annots"])
     except Exception:
-        rotate = 0
-    if rotate:
-        page.transfer_rotation_to_content()
+        return
+    moved = ArrayObject()
+    for reference in annotations:
+        try:
+            copy = DictionaryObject(dict.items(reference.get_object()))
+            copy.pop(NameObject("/P"), None)
+            if "/Rect" in copy:
+                x0, y0, x1, y1 = (float(v) for v in copy["/Rect"])
+                corners = [apply(matrix, x, y)
+                           for x, y in ((x0, y0), (x1, y0), (x0, y1), (x1, y1))]
+                xs, ys = [c[0] for c in corners], [c[1] for c in corners]
+                copy[NameObject("/Rect")] = RectangleObject(
+                    (min(xs), min(ys), max(xs), max(ys)))
+            moved.append(writer._add_object(copy))
+        except Exception:
+            continue                    # an unreadable annotation is dropped, not fatal
+    page[NameObject("/Annots")] = moved
+
+
+def place(page, matrix: Matrix, sheet: tuple[float, float],
+          clip: tuple[float, float, float, float]) -> None:
+    """Draw the page's content through ``matrix`` onto a sheet of size ``sheet``.
+
+    The content is clipped to ``clip`` - its visible box, in its own coordinates -
+    so whatever a viewer hid before (outside the crop box) stays hidden.
+    """
+    from pypdf.generic import NameObject, NumberObject, RectangleObject
+
+    left, bottom, width, height = clip
+    prefix = (b"q " + b" ".join(_number(v) for v in matrix) + b" cm "
+              + b" ".join(_number(v) for v in (left, bottom, width, height))
+              + b" re W n\n")
+    wrap_contents(page, prefix, b"\nQ\n")
+    _transform_annotations(page, matrix)
+    page[NameObject("/MediaBox")] = RectangleObject((0, 0, sheet[0], sheet[1]))
+    page[NameObject("/CropBox")] = RectangleObject((0, 0, sheet[0], sheet[1]))
+    for name in ("/TrimBox", "/BleedBox", "/ArtBox"):
+        page.pop(NameObject(name), None)
+    page[NameObject("/Rotate")] = NumberObject(0)
+
+
+def normalise(page, extra_rotation: int = 0,
+              target: tuple[float, float] | None = None, margin: float = 0.0) -> None:
+    """Turn the page upright and, given ``target``, scale and centre it onto it.
+
+    Upright means its own /Rotate plus ``extra_rotation`` (clockwise) folded into
+    its geometry. Afterwards the page has no /Rotate, its box starts at the
+    origin, and its content is exactly the original's, transformed - which is
+    what overlays need.
+    """
+    box = visible_box(page)
+    degrees = (page_rotation(page) + extra_rotation) % 360
+    matrix = rotation_matrix(box, degrees)
+    width, height = (box[3], box[2]) if degrees in (90, 270) else (box[2], box[3])
+    sheet = (width, height)
+    if target is not None and width > 0 and height > 0:
+        target_width, target_height = target
+        available_w = max(target_width - 2 * margin, 1.0)
+        available_h = max(target_height - 2 * margin, 1.0)
+        scale = min(available_w / width, available_h / height)
+        matrix = then(matrix, (scale, 0.0, 0.0, scale,
+                               (target_width - width * scale) / 2.0,
+                               (target_height - height * scale) / 2.0))
+        sheet = (target_width, target_height)
+    place(page, matrix, sheet, box)
 
 
 def rotate_page(page, degrees: int) -> None:
-    """Rotate a page clockwise by 90, 180 or 270 degrees, in place."""
+    """Rotate a page clockwise by 90, 180 or 270 degrees, by its /Rotate entry only."""
+    from pypdf.generic import NameObject, NumberObject
+
     degrees %= 360
-    if not degrees:
-        return
-    page.rotate(degrees)
+    if degrees:
+        page[NameObject("/Rotate")] = NumberObject((page_rotation(page) + degrees) % 360)
 
 
 def fit_to_page(page, target: tuple[float, float], margin: float = 0.0) -> None:
     """Scale and centre a page onto ``target``, preserving aspect ratio.
 
-    The transformation is written into the content stream: this scales vector
-    text and embedded images without re-encoding either.
+    The transformation is placed around the page's own drawing instructions,
+    which are never read: vector text and images scale without re-encoding,
+    and there is nothing for a parser to misread.
     """
-    tw, th = target
-    avail_w = max(tw - 2 * margin, 1.0)
-    avail_h = max(th - 2 * margin, 1.0)
+    normalise(page, 0, target, margin)
 
-    src_w, src_h = visual_size(page)
-    if src_w <= 0 or src_h <= 0:
-        return
 
-    scale = min(avail_w / src_w, avail_h / src_h)
-    unrot_w, unrot_h = float(page.mediabox.width), float(page.mediabox.height)
-
-    tx = (tw - unrot_w * scale) / 2.0
-    ty = (th - unrot_h * scale) / 2.0
-
-    page.add_transformation(Transformation().scale(scale, scale).translate(tx, ty))
-    page.mediabox = RectangleObject((0, 0, tw, th))
-    page.cropbox = RectangleObject((0, 0, tw, th))
+def bake_rotation(page) -> None:
+    """Fold ``/Rotate`` into the page's geometry, so overlays draw upright."""
+    if page_rotation(page):
+        normalise(page)
 
 
 # ------------------------------------------------------------------ overlays
@@ -209,12 +389,18 @@ def _make_overlay(width: float, height: float, draw) -> object:
     return PdfReader(buffer).pages[0]
 
 
-def _decorate(page, options: MergeOptions, number: int, total: int,
-              document: str, page_in_doc: int, pages_in_doc: int) -> None:
-    """Merge a header/footer overlay onto ``page`` if anything needs drawing."""
+def _wants_decoration(options: MergeOptions) -> bool:
     numbering = options.numbering
     wants_numbers = numbering.mode != "none" and bool(numbering.template)
-    if not (wants_numbers or options.header.any() or options.footer.any()):
+    return wants_numbers or options.header.any() or options.footer.any()
+
+
+def _decorate(page, options: MergeOptions, number: int, total: int,
+              document: str, page_in_doc: int, pages_in_doc: int) -> None:
+    """Draw the header/footer overlay onto ``page`` if anything needs drawing."""
+    numbering = options.numbering
+    wants_numbers = numbering.mode != "none" and bool(numbering.template)
+    if not _wants_decoration(options):
         return
 
     width = float(page.mediabox.width)
@@ -251,7 +437,45 @@ def _decorate(page, options: MergeOptions, number: int, total: int,
             _draw_slot(canvas, bottom[slot], slot, width, height, bottom_y,
                        numbering.font, numbering.size)
 
-    page.merge_page(_make_overlay(width, height, draw))
+    stamp(page, _make_overlay(width, height, draw))
+
+
+_stamp_counter = itertools.count(1)
+
+
+def stamp(page, overlay) -> None:
+    """Draw ``overlay`` (a page of our own making) on top of ``page``.
+
+    The overlay becomes a form XObject with its own resources, drawn after the
+    page's untouched content. ``merge_page`` instead parsed the page's content to
+    merge the two - the step a strict parser can fail on, losing the export -
+    and renamed resources to avoid collisions; a form needs neither.
+    """
+    from pypdf.generic import ArrayObject, DictionaryObject, FloatObject, NameObject
+
+    writer = _writer_of(page)
+    width = float(overlay.mediabox.width)
+    height = float(overlay.mediabox.height)
+    form = _stream(writer, overlay.get_contents().get_data(), {
+        NameObject("/Type"): NameObject("/XObject"),
+        NameObject("/Subtype"): NameObject("/Form"),
+        NameObject("/BBox"): ArrayObject([FloatObject(0), FloatObject(0),
+                                          FloatObject(width), FloatObject(height)]),
+        NameObject("/Resources"): overlay["/Resources"].clone(writer),
+    })
+    name = NameObject("/PCStamp%d" % next(_stamp_counter))
+
+    # A copy of the page's resources, so a dictionary other pages share is not
+    # changed under them.
+    existing = page.get("/Resources")
+    resources = DictionaryObject(dict.items(existing.get_object())) if existing else DictionaryObject()
+    xobjects = resources.get("/XObject")
+    xobjects = DictionaryObject(dict.items(xobjects.get_object())) if xobjects else DictionaryObject()
+    xobjects[name] = form
+    resources[NameObject("/XObject")] = xobjects
+    page[NameObject("/Resources")] = resources
+
+    wrap_contents(page, b"q\n", b"\nQ\nq " + name.encode("ascii") + b" Do Q\n")
 
 
 def _title_page(width: float, height: float, label: str, index: int) -> object:
@@ -272,6 +496,34 @@ def _title_page(width: float, height: float, label: str, index: int) -> object:
 
 
 # --------------------------------------------------------------------- merge
+
+
+# Resolution of a page that has to be included as a picture of itself.
+FALLBACK_DPI = 200
+
+
+def _page_as_image(path: Path, index: int):
+    """A one-page PDF holding a rendering of one page, for a page that cannot be
+    copied. Rendered by pdfium, the preview's engine, so it looks as the preview
+    did; the text is no longer selectable, which the report says."""
+    import img2pdf
+    import pypdfium2 as pdfium
+
+    from .pdfium_guard import PDFIUM_LOCK
+
+    with PDFIUM_LOCK:
+        document = pdfium.PdfDocument(str(path))
+        try:
+            page = document[index]
+            image = page.render(scale=FALLBACK_DPI / 72.0).to_pil().convert("RGB")
+            page.close()
+        finally:
+            document.close()
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    data = img2pdf.convert(buffer.getvalue(),
+                           layout_fun=img2pdf.get_fixed_dpi_layout_fun((FALLBACK_DPI, FALLBACK_DPI)))
+    return PdfReader(io.BytesIO(data))
 
 
 def open_pdf(path: Path):
@@ -399,6 +651,9 @@ def merge(
 
     page_number = options.numbering.start
     first = True
+    decorating = _wants_decoration(options)
+    # Readers of pages included as images; their pages are written at the end.
+    keep_alive: list = []
 
     for entry_index, (entry, specs) in enumerate(planned):
         path = Path(entry.path)
@@ -432,33 +687,47 @@ def merge(
         start_index = len(writer.pages)
 
         for position, spec in enumerate(specs, start=1):
-            writer.add_page(reader.pages[spec.index])
-            report.page_map.append((path, spec.index, label))
-            page = writer.pages[-1]
+            def finish(page, extra_rotation: int) -> None:
+                # The rotation is folded into the geometry whenever anything
+                # else is done to the page: left as /Rotate, a fit was computed
+                # in the unrotated frame (a landscape page turned to portrait
+                # lost its sides) and page numbers came out sideways. A page
+                # nothing is done to keeps its content as is, rotated by /Rotate.
+                if options.page_size:
+                    normalise(page, extra_rotation, options.page_size, options.margin)
+                elif decorating:
+                    normalise(page, extra_rotation)
+                else:
+                    rotate_page(page, extra_rotation)
+                _decorate(page, options, number=page_number, total=total_pages,
+                          document=label, page_in_doc=position,
+                          pages_in_doc=len(specs))
 
-            # Order matters: bake /Rotate first, then rotate, then scale, then
-            # decorate - each step assumes the previous one has settled.
-            bake_rotation(page)
-            rotate_page(page, spec.rotation)
-            if options.page_size:
-                # The user's rotation is folded into the content as well before
-                # fitting. Left as /Rotate, the fit was computed in the page's
-                # unrotated frame: a landscape page turned to portrait was scaled
-                # to its rotated size but placed unrotated, so its sides fell off
-                # the sheet - and the sheet itself came out landscape.
-                bake_rotation(page)
-                fit_to_page(page, options.page_size, options.margin)
-
-            width = float(page.mediabox.width)
-            height = float(page.mediabox.height)
-            _decorate(
-                page, options,
-                number=page_number,
-                total=total_pages,
-                document=label,
-                page_in_doc=position,
-                pages_in_doc=len(specs),
-            )
+            before = len(writer.pages)
+            try:
+                writer.add_page(reader.pages[spec.index])
+                finish(writer.pages[-1], spec.rotation)
+                report.page_map.append((path, spec.index, label))
+            except Exception as exc:
+                # One page that cannot be copied must not cost the whole export.
+                # It is included as a picture of itself instead, and named.
+                while len(writer.pages) > before:
+                    writer.remove_page(len(writer.pages) - 1)
+                reason = "%s: %s" % (type(exc).__name__, exc)
+                try:
+                    picture = _page_as_image(path, spec.index)
+                    keep_alive.append(picture)
+                    writer.add_page(picture.pages[0])
+                    finish(writer.pages[-1], spec.rotation)
+                    report.page_map.append(None)
+                    report.as_images.append((len(writer.pages), label, spec.index + 1, reason))
+                except Exception as fallback:
+                    while len(writer.pages) > before:
+                        writer.remove_page(len(writer.pages) - 1)
+                    report.skipped.append((
+                        label, "page %d could not be included (%s; as an image: %s: %s)"
+                        % (spec.index + 1, reason, type(fallback).__name__, fallback)))
+                    continue
             page_number += 1
             first = False
 

@@ -1675,3 +1675,19 @@ def test_an_export_beside_an_existing_file_says_where_it_went(window, monkeypatc
     message = window.status.currentMessage()
     assert "report (1).pdf" in message
     assert "report.pdf already exists, so it was left alone" in message
+
+
+def test_pages_included_as_images_are_named(window, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    shown = {}
+    monkeypatch.setattr(QMessageBox, "exec",
+                        lambda box: shown.setdefault("details", box.detailedText()) and 0)
+    report = _merged_report()
+    report.as_images = [(412, "scan - page", 3, "LimitReachedError: too long")]
+
+    window._on_merged(report)
+
+    assert "included as images (page 412)" in window.status.currentMessage()
+    assert not window.banner.isHidden()
+    assert "page 412 (scan - page, page 3): LimitReachedError" in shown["details"]

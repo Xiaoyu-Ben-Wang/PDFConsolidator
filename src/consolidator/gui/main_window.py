@@ -1634,6 +1634,10 @@ class MainWindow(QMainWindow):
         skipped = list(getattr(report, "skipped", []) or [])
         check = getattr(report, "verification", None)
         problems = list(check.problems) if check is not None else []
+        pictures = list(getattr(report, "as_images", []) or [])
+        if pictures:
+            message += ". %d page(s) could not be copied as they are and were "                        "included as images (page %s)" % (
+                           len(pictures), ", ".join(str(p[0]) for p in pictures[:8]))
         if problems:
             # The file was written, but a page in it lacks something its source
             # page has. That is exactly the failure that otherwise goes unseen.
@@ -1666,16 +1670,17 @@ class MainWindow(QMainWindow):
             self.btn_banner_retry.setVisible(True)
             self.banner.setVisible(False)
 
-        if problems and not skipped:
+        if (problems or pictures) and not skipped:
             self._merge_skips = []
             self.lbl_banner.setText(
-                "%d page(s) of the output may be missing content their source has "
-                "- see the details in the Done dialog." % len(problems))
+                "%d page(s) of the output need a look - see the details in the "
+                "Done dialog." % (len(problems) + len(pictures)))
             self.btn_banner_retry.setVisible(False)
             self.banner.setVisible(True)
 
         box = QMessageBox(self)
-        box.setIcon(QMessageBox.Warning if (skipped or problems) else QMessageBox.Information)
+        box.setIcon(QMessageBox.Warning if (skipped or problems or pictures)
+                    else QMessageBox.Information)
         box.setWindowTitle("Done")
         box.setText("%s.\n\n%s" % (message, written))
         details = []
@@ -1683,6 +1688,12 @@ class MainWindow(QMainWindow):
             details.append(
                 "These were left out of the merged PDF:\n\n"
                 + "\n".join("%s\n    %s" % (label, why) for label, why in skipped))
+        if pictures:
+            details.append(
+                "These pages could not be copied as they are, so each was included "
+                "as an image of itself. They look the same, but their text cannot be "
+                "selected or searched:\n\n"
+                + "\n".join("page %d (%s, page %d): %s" % picture for picture in pictures))
         if problems:
             details.append(
                 "These pages of the output lack content that their source page has. "

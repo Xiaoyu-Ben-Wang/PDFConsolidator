@@ -132,6 +132,9 @@ def _cmd_build(args: argparse.Namespace) -> int:
               % (merged.entries, merged.pages, merged.outline_items))
         for label, why in merged.skipped:
             print("  MERGE-SKIP %s - %s" % (label, why))
+        for output_page, label, source_page, why in getattr(merged, "as_images", []):
+            print("  AS-IMAGE page %d (%s, page %d) - could not be copied as is: %s"
+                  % (output_page, label, source_page, why))
         check = merged.verification
         if check is not None:
             if check.error:

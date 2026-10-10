@@ -122,3 +122,154 @@ def test_the_check_can_be_switched_off(tmp_path):
     source = _pdf(tmp_path / "src.pdf")
     _dest, report = _merge(tmp_path, source, verify=False)
     assert report.verification is None
+
+
+# ------------------------------------------- pages are never parsed or lost
+
+
+def _raw_page_pdf(path: Path, content: bytes, mediabox=(0, 0, 612, 792), rotate=0,
+                  link=None) -> Path:
+    """A PDF whose page content is exactly ``content``, written by hand."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject,
+                               FloatObject, NameObject, NumberObject, RectangleObject,
+                               TextStringObject)
+
+    writer = PdfWriter()
+    writer.add_blank_page(612, 792)
+    page = writer.pages[0]
+    font = DictionaryObject({NameObject("/Type"): NameObject("/Font"),
+                             NameObject("/Subtype"): NameObject("/Type1"),
+                             NameObject("/BaseFont"): NameObject("/Helvetica")})
+    page[NameObject("/Resources")] = DictionaryObject({NameObject("/Font"): DictionaryObject(
+        {NameObject("/F1"): writer._add_object(font)})})
+    stream = DecodedStreamObject()
+    stream.set_data(content)
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    page[NameObject("/MediaBox")] = RectangleObject(mediabox)
+    page[NameObject("/Rotate")] = NumberObject(rotate)
+    if link:
+        annotation = DictionaryObject({
+            NameObject("/Type"): NameObject("/Annot"), NameObject("/Subtype"): NameObject("/Link"),
+            NameObject("/Rect"): ArrayObject([FloatObject(v) for v in link]),
+            NameObject("/A"): DictionaryObject({NameObject("/S"): NameObject("/URI"),
+                                               NameObject("/URI"): TextStringObject("https://example.com")})})
+        page[NameObject("/Annots")] = ArrayObject([writer._add_object(annotation)])
+    writer.write(str(path))
+    return path
+
+
+LONG_NUMBER = b"0." + b"0" * 108 + b"1"          # 112 characters, as reported
+
+
+def _text(content: bytes, x=72, y=700) -> bytes:
+    return b"BT /F1 12 Tf %d %d Td (%s) Tj ET\n" % (x, y, content)
+
+
+@pytest.mark.parametrize("options", [
+    dict(page_size=pages.resolve("a4"), margin=36),
+    dict(page_size=pages.resolve("a4"), margin=36,
+         numbering=assemble.PageNumbering(mode="continuous")),
+    dict(numbering=assemble.PageNumbering(mode="continuous")),
+    dict(),
+])
+def test_a_page_pypdf_cannot_parse_is_still_exported(tmp_path, options):
+    """A 112-character number aborted a 2000-page export with LimitReachedError."""
+    content = _text(b"Paragraph before") + LONG_NUMBER + b" w\n" + \
+        _text(b"Paragraph after", y=650)
+    source = _raw_page_pdf(tmp_path / "long.pdf", content)
+
+    _dest, report = _merge(tmp_path, source, 90, **options)
+
+    assert report.pages == 1 and not report.skipped and not report.as_images
+    assert report.verification.ok, [p.describe() for p in report.verification.problems]
+
+
+def test_page_content_is_kept_byte_for_byte(tmp_path):
+    from pypdf import PdfReader
+
+    content = _text(b"Exactly these bytes") + LONG_NUMBER + b" w\n"
+    source = _raw_page_pdf(tmp_path / "src.pdf", content)
+
+    dest, _report = _merge(tmp_path, source, 0, page_size=pages.resolve("a4"), margin=36)
+
+    page = PdfReader(str(dest)).pages[0]
+    streams = [s.get_object().get_data() for s in page["/Contents"]]
+    assert content in streams, "the original stream travels unchanged, wrapped"
+
+
+def test_a_page_whose_box_does_not_start_at_zero_is_fitted_whole(tmp_path):
+    """Its offset used to be ignored, shifting it and pushing part off the sheet."""
+    content = b"".join(_text(word, x, y) for word, x, y in (
+        (b"left", 2010, 1400), (b"right", 2550, 1400),
+        (b"bottom", 2300, 1010), (b"top", 2300, 1780)))
+    source = _raw_page_pdf(tmp_path / "offset.pdf", content,
+                           mediabox=(2000, 1000, 2612, 1792))
+
+    _dest, report = _merge(tmp_path, source, 0, page_size=pages.resolve("a4"), margin=36)
+
+    assert report.verification.ok, [p.describe() for p in report.verification.problems]
+
+
+def test_a_link_moves_with_its_page_and_its_twin_does_not(tmp_path):
+    from pypdf import PdfReader
+
+    source = _raw_page_pdf(tmp_path / "link.pdf", _text(b"click"),
+                           link=(72, 690, 200, 715))
+    entries = [assemble.MergeEntry(source, "a", [assemble.PageSpec(0, 0)]),
+               assemble.MergeEntry(source, "b", [assemble.PageSpec(0, 90)])]
+    dest = tmp_path / "out.pdf"
+
+    assemble.merge(entries, dest, options=assemble.MergeOptions(
+        page_size=pages.resolve("letter"), margin=0))
+
+    first, second = PdfReader(str(dest)).pages
+    rect_a = [round(float(v)) for v in first["/Annots"][0].get_object()["/Rect"]]
+    rect_b = [round(float(v)) for v in second["/Annots"][0].get_object()["/Rect"]]
+    assert rect_a == [72, 690, 200, 715], "unrotated, letter onto letter: unchanged"
+    assert rect_b != rect_a, "the rotated copy's link moved with its content"
+
+
+def test_an_untouched_page_keeps_its_content_and_only_gains_a_rotation(tmp_path):
+    from pypdf import PdfReader
+
+    content = _text(b"as it was")
+    source = _raw_page_pdf(tmp_path / "src.pdf", content, rotate=90)
+
+    dest, _report = _merge(tmp_path, source, 90)
+
+    page = PdfReader(str(dest)).pages[0]
+    assert int(page["/Rotate"]) == 180
+    assert page["/Contents"].get_object().get_data() == content
+
+
+def test_a_page_that_cannot_be_copied_is_included_as_an_image(tmp_path, monkeypatch):
+    import pypdfium2 as pdfium
+
+    good = _pdf(tmp_path / "good.pdf", words=("kept",))
+    bad = _pdf(tmp_path / "bad.pdf", words=("pictured",))
+    real = assemble.normalise
+    calls = []
+
+    def flaky(page, *args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise ValueError("cannot copy this page")
+        return real(page, *args, **kwargs)
+
+    monkeypatch.setattr(assemble, "normalise", flaky)
+    entries = [assemble.MergeEntry(good, "good"), assemble.MergeEntry(bad, "bad"),
+               assemble.MergeEntry(good, "good again")]
+    dest = tmp_path / "out.pdf"
+
+    report = assemble.merge(entries, dest, options=assemble.MergeOptions(
+        page_size=pages.resolve("letter"), margin=36))
+
+    assert report.pages == 3, "one bad page does not cost the export"
+    assert [(p[0], p[1], p[2]) for p in report.as_images] == [(2, "bad", 1)]
+    assert "cannot copy this page" in report.as_images[0][3]
+    assert report.page_map[1] is None, "an image page is not compared word for word"
+    document = pdfium.PdfDocument(str(dest))
+    images = list(document[1].get_objects())
+    assert images and document[1].get_size() == document[0].get_size()
+    document.close()
