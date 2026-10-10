@@ -57,6 +57,10 @@ def install_safety_nets(window_getter) -> None:
     """
     handle = _open_log()
     if handle is not None:
+        # LibreOffice runs that produce nothing are described in the same log.
+        from .. import libreoffice
+
+        libreoffice.failure_log = Path(handle.name)
         try:
             import faulthandler
 

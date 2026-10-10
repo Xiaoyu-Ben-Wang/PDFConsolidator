@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 from . import libreoffice, pages
@@ -58,6 +59,10 @@ KNOWN_UNSUPPORTED = {
 }
 
 
+# Pause before retrying a conversion that produced nothing.
+RETRY_PAUSE_SECONDS = 2.0
+
+
 class ConversionError(RuntimeError):
     """A single source file could not be converted."""
 
@@ -77,8 +82,21 @@ def convert_with_libreoffice(src: Path, dest: Path, workdir: Path) -> None:
             pass    # convert the page as it is, without its pictures
     try:
         libreoffice.convert_one(src, dest, workdir=workdir)
+        return
     except libreoffice.LibreOfficeError as exc:
-        raise ConversionError(str(exc)) from exc
+        first = exc
+    if libreoffice.stopping():
+        raise ConversionError(str(first)) from first
+    # One more attempt with no other soffice running. Single conversions - an
+    # Office attachment inside an email - run several at a time across emails,
+    # and LibreOffice is known to fail when its processes overlap; the batched
+    # path already retries alone, this one simply gave up.
+    time.sleep(RETRY_PAUSE_SECONDS)
+    try:
+        with libreoffice.alone():
+            libreoffice.convert_one(src, dest, workdir=Path(workdir) / "retry")
+    except libreoffice.LibreOfficeError as exc:
+        raise ConversionError(str(first)) from exc
 
 
 # Beyond this a picture is left as a link: the page is held in memory whole.

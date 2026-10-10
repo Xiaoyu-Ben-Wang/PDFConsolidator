@@ -96,7 +96,103 @@ def resume() -> None:
     _stopping.clear()
 
 
+class _Gate:
+    """Lets conversions run side by side, or one run entirely alone.
+
+    LibreOffice is known to fall over when several of its processes work at once
+    on one machine. Ordinary conversions share the gate; a retry of something
+    that failed takes it exclusively - it waits for the running ones to finish,
+    and no new one starts until it is done - so the retry has no concurrency to
+    lose to. The thread holding it exclusively may still convert (that is the
+    point), so the gate is re-entrant for that thread.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._shared = 0
+        self._owner: int | None = None
+        self._depth = 0
+
+    def _mine(self) -> bool:
+        return self._owner == threading.get_ident()
+
+    def acquire_shared(self) -> bool:
+        with self._condition:
+            if self._mine():
+                return False                    # inside our own exclusive section
+            while self._owner is not None:
+                self._condition.wait()
+            self._shared += 1
+            return True
+
+    def release_shared(self) -> None:
+        with self._condition:
+            self._shared -= 1
+            self._condition.notify_all()
+
+    def acquire_exclusive(self) -> None:
+        with self._condition:
+            if self._mine():
+                self._depth += 1
+                return
+            while self._owner is not None:
+                self._condition.wait()
+            self._owner = threading.get_ident()
+            self._depth = 1
+            while self._shared:
+                self._condition.wait()
+
+    def release_exclusive(self) -> None:
+        with self._condition:
+            self._depth -= 1
+            if self._depth == 0:
+                self._owner = None
+                self._condition.notify_all()
+
+
+_gate = _Gate()
+
+
+class alone:
+    """``with libreoffice.alone():`` - convert with no other soffice running."""
+
+    def __enter__(self):
+        _gate.acquire_exclusive()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        _gate.release_exclusive()
+
+
+# Where failed invocations are described, if the application has set it. A
+# failure on a user's machine is otherwise impossible to diagnose without their
+# documents; this records what LibreOffice said, which names no content.
+failure_log: Path | None = None
+
+
+def _log_failure(cmd: list[str], detail: str) -> None:
+    if failure_log is None:
+        return
+    try:
+        with open(failure_log, "a", encoding="utf-8") as handle:
+            handle.write("\n==== %s  LibreOffice produced no output\n%s\n%s\n"
+                         % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                            " ".join(cmd[-3:]), detail.strip()))
+    except OSError:
+        pass
+
+
 def _run(cmd: list[str], timeout: int, env: dict[str, str]) -> tuple[str, str, bool]:
+    """Run ``soffice`` to completion, through the gate. See :func:`_run_now`."""
+    shared = _gate.acquire_shared()
+    try:
+        return _run_now(cmd, timeout, env)
+    finally:
+        if shared:
+            _gate.release_shared()
+
+
+def _run_now(cmd: list[str], timeout: int, env: dict[str, str]) -> tuple[str, str, bool]:
     """Run ``soffice`` to completion. Returns stdout, stderr and whether it timed out."""
     if _stopping.is_set():
         return "", "the application is closing", False
@@ -381,6 +477,10 @@ def convert_batch(
             reason = fallback
         for src in missing:
             result.failed[str(src)] = reason
+        _log_failure(cmd, "%s (crash dump: %s, %d of %d produced)\nstderr: %s\nstdout: %s"
+                     % (reason, "yes" if crashed else "no", len(result.produced),
+                        len(sources), (stderr or "").strip()[-2000:],
+                        (stdout or "").strip()[-1000:]))
 
     for src in sources:
         _remove_lock(outdir, src.stem + ".pdf")

@@ -28,11 +28,13 @@ from __future__ import annotations
 import base64
 
 import html as html_module
+from html.parser import HTMLParser
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import convert
+from . import pages as pages_module
 
 MSG_EXTS = convert.MSG_EXTS
 EML_EXTS = convert.EML_EXTS
@@ -992,20 +994,148 @@ def _write_attachment(att: Attachment, directory: Path, index: int) -> Path:
 
 
 def write_body_html(item: EmailItem, dest: Path,
-                    policy: ExtractionPolicy | None = None) -> Path:
+                    policy: ExtractionPolicy | None = None,
+                    inline_images: bool = True) -> Path:
     """Write the message body as a standalone HTML file.
 
     Inline pictures the body refers to are embedded in the document itself, so what
     the message actually contained ends up on the page instead of a gap.
+    ``inline_images=False`` leaves them out, for a retry when a body with them
+    could not be rendered.
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(body_html(item, policy, body_image_references(item)),
-                    encoding="utf-8")
+    references = body_image_references(item) if inline_images else {}
+    dest.write_text(body_html(item, policy, references), encoding="utf-8")
     return dest
 
 
-def render_body_pdf(item: EmailItem, workdir: Path, dest: Path, timeout: int = 300) -> Path:
+class _TextOfHtml(HTMLParser):
+    """The readable text of an HTML body, with its paragraph and line breaks."""
+
+    BREAKS = {"br", "p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+              "table", "blockquote", "pre", "hr"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs) -> None:
+        if tag in ("style", "script", "head", "title"):
+            self._skip += 1
+        elif tag in self.BREAKS:
+            self.parts.append("\n")
+        elif tag in ("td", "th"):
+            self.parts.append("\t")
+
+    def handle_endtag(self, tag) -> None:
+        if tag in ("style", "script", "head", "title"):
+            self._skip = max(0, self._skip - 1)
+        elif tag in self.BREAKS:
+            self.parts.append("\n")
+
+    def handle_data(self, data) -> None:
+        if not self._skip:
+            self.parts.append(" ".join(data.split()) if data.strip() else
+                              (" " if data else ""))
+
+
+def html_to_text(html: str) -> str:
+    parser = _TextOfHtml()
+    try:
+        parser.feed(html or "")
+        parser.close()
+    except Exception:
+        pass
+    text = "".join(parser.parts)
+    return re.sub(r"\n[ \t]*\n([ \t]*\n)+", "\n\n", text).strip()
+
+
+def body_text_page(item: EmailItem) -> str:
+    """The message as plain text: headers, body, attachment list.
+
+    The last resort for a body LibreOffice cannot render - formatting is lost,
+    the words are not.
+    """
+    lines = []
+    if item.kind:
+        lines.append(item.kind.upper())
+    if item.subject:
+        lines += [item.subject, ""]
+    for label, value in [("From", item.sender), ("To", item.to), ("CC", item.cc),
+                         ("Date", item.date)] + list(item.details):
+        if value:
+            lines.append("%-10s %s" % (label + ":", value))
+    lines.append("")
+    body = item.body_text if item.body_text.strip() else html_to_text(item.body_html)
+    lines.append(body or "(This message has no readable body.)")
+    if item.attachments:
+        lines += ["", "Attachments:"]
+        for att in item.attachments:
+            lines.append("  %s  (%s, %s)" % (att.filename, att.category, _human_size(att.size)))
+    return "\n".join(lines)
+
+
+# Pause before retrying a body that produced nothing: the usual cause is a
+# machine still settling after other soffice processes exited.
+BODY_RETRY_PAUSE = 2.0
+
+
+def render_body_reliably(item: EmailItem, workdir: Path, dest: Path,
+                         first_error: str | None = None) -> str:
+    """Render a body, falling back step by step until it exists. Returns a note.
+
+    1. LibreOffice, as usual (skipped when ``first_error`` says a batch already
+       tried and failed);
+    2. LibreOffice again, *alone* - no other soffice running - after a pause;
+    3. LibreOffice alone without the inline pictures, in case one of them is
+       what it cannot cope with;
+    4. plain text, laid out without LibreOffice at all.
+
+    The note is empty if the first attempt worked, and otherwise says what the
+    page is - so a body rendered as plain text says so instead of looking like
+    the original.
+    """
+    import time
+
+    from . import libreoffice, text_render
+
+    errors = [first_error] if first_error else []
+    if first_error is None:
+        try:
+            render_body_pdf(item, workdir, dest)
+            return ""
+        except Exception as exc:
+            errors.append(str(exc))
+    if libreoffice.stopping():
+        raise RuntimeError(errors[-1] if errors else "the application is closing")
+
+    time.sleep(BODY_RETRY_PAUSE)
+    for attempt, images in (("retry", True), ("retry without pictures", False)):
+        try:
+            with libreoffice.alone():
+                render_body_pdf(item, Path(workdir) / attempt.replace(" ", "_"),
+                                dest, inline_images=images)
+            if images:
+                return "rendered on a second attempt"
+            return ("rendered without its inline pictures; LibreOffice could not "
+                    "render it with them (%s)" % errors[0])
+        except Exception as exc:
+            errors.append(str(exc))
+            if libreoffice.stopping():
+                raise RuntimeError(errors[-1])
+
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    text_render.render(body_text_page(item), dest, pages_module.LETTER,
+                       title=item.subject or "message")
+    return ("shown as plain text: LibreOffice could not render this body (%s)"
+            % errors[0])
+
+
+def render_body_pdf(item: EmailItem, workdir: Path, dest: Path, timeout: int = 300,
+                    inline_images: bool = True) -> Path:
     """Render one message body to a PDF by way of HTML.
 
     Used for single conversions and for nested messages. Callers converting many
@@ -1018,7 +1148,8 @@ def render_body_pdf(item: EmailItem, workdir: Path, dest: Path, timeout: int = 3
     workdir.mkdir(parents=True, exist_ok=True)
     stem = _safe_name((item.source or Path("message")).stem, "message")
 
-    html_path = write_body_html(item, workdir / ("%s_body.html" % stem))
+    html_path = write_body_html(item, workdir / ("%s_body.html" % stem),
+                                inline_images=inline_images)
 
     out_dir = workdir / ("%s_body_out" % stem)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1099,15 +1230,18 @@ def expand_to_segments(
     # ---- body ----
     if policy.body:
         label = "%s - body" % label_prefix
-        if body_error is not None:
-            add(label, BODY, None, False, body_error)
-        elif body_pdf is not None and Path(body_pdf).exists():
+        if body_pdf is not None and body_error is None and Path(body_pdf).exists():
             add(label, BODY, Path(body_pdf), True)
         else:
+            # Rendered here, alone if need be, and as plain text as a last
+            # resort: one LibreOffice failure must not cost the message its body.
             dest = workdir / ("%s_body.pdf" % stem)
             try:
-                render_body_pdf(item, workdir, dest)
-                add(label, BODY, dest, True)
+                note = render_body_reliably(item, workdir / "body", dest,
+                                            first_error=body_error)
+                add(label, BODY, dest, True, note)
+                if note:
+                    emit("  note %s - %s" % (label, note))
             except Exception as exc:
                 add(label, BODY, None, False, "%s: %s" % (type(exc).__name__, exc))
 

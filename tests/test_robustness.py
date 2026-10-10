@@ -190,3 +190,169 @@ def test_an_unexpected_exception_is_logged_and_shown_not_lost(qapp, tmp_path, mo
     assert "ValueError: a slot went wrong" in log
     assert "ZeroDivisionError" in log and "probe" in log
     assert "still running" in window.status.currentMessage()
+
+
+# ------------------------------------------- a body LibreOffice will not do ---
+
+
+def test_an_exclusive_conversion_waits_for_running_ones_and_blocks_new_ones():
+    gate = libreoffice._Gate()
+    order = []
+    assert gate.acquire_shared()
+
+    def exclusive():
+        gate.acquire_exclusive()
+        order.append("exclusive")
+        assert gate.acquire_shared() is False, "re-entrant for its owner"
+        gate.acquire_exclusive()            # nested
+        gate.release_exclusive()
+        time.sleep(0.2)
+        order.append("exclusive done")
+        gate.release_exclusive()
+
+    def late_shared():
+        time.sleep(0.1)
+        gate.acquire_shared()
+        order.append("late shared")
+        gate.release_shared()
+
+    threads = [threading.Thread(target=exclusive), threading.Thread(target=late_shared)]
+    for thread in threads:
+        thread.start()
+    time.sleep(0.3)
+    order.append("first shared done")
+    gate.release_shared()
+    for thread in threads:
+        thread.join(5)
+
+    assert order == ["first shared done", "exclusive", "exclusive done", "late shared"]
+
+
+def _failing_renderer(monkeypatch, failures: int):
+    """render_body_pdf that fails the first ``failures`` calls, then works."""
+    from consolidator import email_items
+
+    calls = []
+    real = email_items.render_body_pdf
+
+    def fake(item, workdir, dest, timeout=300, inline_images=True):
+        calls.append(inline_images)
+        if len(calls) <= failures:
+            raise RuntimeError("LibreOffice crashed while converting this file")
+        return real(item, workdir, dest, timeout, inline_images)
+
+    monkeypatch.setattr(email_items, "render_body_pdf", fake)
+    monkeypatch.setattr(email_items, "BODY_RETRY_PAUSE", 0)
+    return calls
+
+
+def _item():
+    from consolidator import email_items
+
+    return email_items.EmailItem(
+        subject="Quarterly", sender="a@example.com",
+        body_html="<html><body><p>Revenue rose</p><p>Costs fell</p></body></html>",
+        source=Path("q.msg"))
+
+
+@requires_lo
+@pytest.mark.parametrize("failures, note, calls", [
+    (0, "", [True]),
+    (1, "second attempt", [True, True]),
+    (2, "without its inline pictures", [True, True, False]),
+])
+def test_a_body_is_retried_alone_then_without_pictures(tmp_path, monkeypatch,
+                                                         failures, note, calls):
+    from consolidator import email_items
+
+    seen = _failing_renderer(monkeypatch, failures)
+    dest = tmp_path / "body.pdf"
+
+    result = email_items.render_body_reliably(_item(), tmp_path / "w", dest)
+
+    assert seen == calls
+    assert (note in result) if note else result == ""
+    assert dest.exists()
+
+
+def test_a_body_libreoffice_cannot_render_still_arrives_as_text(tmp_path, monkeypatch):
+    import pypdfium2 as pdfium
+
+    from consolidator import email_items
+
+    _failing_renderer(monkeypatch, failures=99)
+    dest = tmp_path / "body.pdf"
+
+    note = email_items.render_body_reliably(_item(), tmp_path / "w", dest)
+
+    assert note.startswith("shown as plain text")
+    assert "crashed" in note
+    document = pdfium.PdfDocument(str(dest))
+    text = document[0].get_textpage().get_text_range()
+    document.close()
+    for words in ("Quarterly", "Revenue rose", "Costs fell", "a@example.com"):
+        assert words in text
+
+
+def test_a_nested_body_that_fails_keeps_its_segment(tmp_path, monkeypatch):
+    from consolidator import email_items
+
+    _failing_renderer(monkeypatch, failures=99)
+    item = _item()
+    policy = email_items.ExtractionPolicy()
+
+    segments = email_items.expand_to_segments(item, tmp_path / "work", policy)
+
+    body = segments[0]
+    assert body.ok and body.pdf.exists()
+    assert body.detail.startswith("shown as plain text")
+
+
+def test_html_to_text_keeps_paragraphs_and_cells():
+    from consolidator import email_items
+
+    text = email_items.html_to_text(
+        "<style>p{}</style><p>One  two</p><table><tr><td>a</td><td>b</td></tr></table>"
+        "Caf&eacute;<br>end")
+
+    assert text.splitlines()[0] == "One two"
+    assert "a\tb" in text and "Café" in text and "end" in text
+    assert "p{}" not in text
+
+
+def test_a_failed_invocation_is_described_in_the_log(tmp_path, monkeypatch):
+    log = tmp_path / "errors.log"
+    monkeypatch.setattr(libreoffice, "failure_log", log)
+    monkeypatch.setattr(libreoffice, "_run",
+                        lambda cmd, timeout, env: ("", "Error: source file could not be loaded", False))
+    monkeypatch.setattr(libreoffice, "require_soffice", lambda: Path("soffice.exe"))
+    source = tmp_path / "x.html"
+    source.write_text("<p>x</p>")
+
+    result = libreoffice.convert_batch([source], tmp_path / "out")
+
+    assert result.failed
+    text = log.read_text(encoding="utf-8")
+    assert "produced no output" in text and "source file could not be loaded" in text
+
+
+def test_a_single_office_conversion_is_retried_alone(tmp_path, monkeypatch):
+    from consolidator import convert
+
+    calls = []
+
+    def flaky(src, dest, timeout=600, workdir=None):
+        calls.append(libreoffice._gate._owner is not None)
+        if len(calls) == 1:
+            raise libreoffice.LibreOfficeError("LibreOffice crashed while converting this file")
+        Path(dest).write_bytes(b"%PDF-1.4")
+        return dest
+
+    monkeypatch.setattr(libreoffice, "convert_one", flaky)
+    monkeypatch.setattr(convert, "RETRY_PAUSE_SECONDS", 0)
+    src = tmp_path / "memo.docx"
+    src.write_bytes(b"x")
+
+    convert.convert_with_libreoffice(src, tmp_path / "memo.pdf", tmp_path)
+
+    assert calls == [False, True], "the retry ran with the gate held exclusively"
