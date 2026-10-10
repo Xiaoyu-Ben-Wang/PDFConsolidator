@@ -1601,3 +1601,61 @@ def test_a_part_that_still_fails_replaces_its_old_failure(window, tmp_path):
     assert [n.label for n in nodes].count("mail - middle.docx") == 1
     assert [n.detail for n in nodes if not n.ok] == ["still broken"]
     assert len(window.model.pages) == 5
+
+
+# ------------------------------------------------- output check reporting
+
+
+def _merged_report(problems=(), error="", checked=5):
+    from types import SimpleNamespace
+
+    from consolidator.verify import Verification
+
+    check = Verification(checked=checked, problems=list(problems), error=error)
+    return SimpleNamespace(pages=checked, separators=0, skipped=[], verification=check)
+
+
+def test_pages_missing_content_are_named_after_a_merge(window, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    from consolidator.verify import PageProblem
+
+    shown = {}
+
+    def capture(box):
+        shown["details"] = box.detailedText()
+        shown["icon"] = box.icon()
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", capture)
+    problem = PageProblem(output_page=4, source="mail - invoice.pdf", source_page=2,
+                          missing_words=12, words_in_source=300, sample=["Total"])
+
+    window._on_merged(_merged_report([problem]))
+
+    assert "1 page(s) may be missing content (page 4)" in window.status.currentMessage()
+    assert not window.banner.isHidden()
+    assert "page 4 (mail - invoice.pdf, page 2)" in shown["details"]
+    assert "'Total'" in shown["details"]
+    assert shown["icon"] == QMessageBox.Warning
+
+
+def test_a_clean_check_says_every_page_was_checked(window, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: 0)
+
+    window._on_merged(_merged_report())
+
+    assert "every page checked against its source" in window.status.currentMessage()
+    assert window.banner.isHidden()
+
+
+def test_a_check_that_could_not_run_is_not_reported_as_clean(window, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: 0)
+
+    window._on_merged(_merged_report(error="OSError: locked", checked=0))
+
+    assert "could not be checked" in window.status.currentMessage()

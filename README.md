@@ -203,6 +203,27 @@ forwarded message never blends into its carrier and separate forwards stay
 distinguishable. Both levels of that structure come from the same tags on the
 segment, which is why the navigator and the page column always agree.
 
+### Every output is checked against its sources
+
+Assembly rewrites pages: it fits them to a size, rotates them and draws page
+numbers on them. Any of those steps can lose content without an error. So once
+the PDF is written, every page is compared with the page it came from, read by
+pdfium (the engine the preview uses):
+
+- every **word** on the source page must be on the output page (extra words, such
+  as page numbers and headers, are fine)
+- the output page must have at least as many **pictures**
+- text the source showed must not have been **pushed off** the output page
+
+A page that fails is named in the status bar, the banner and the *Done* dialog,
+and on the command line (`MISSING page 4 (mail - invoice.pdf, page 2): 12 of 300
+word(s) missing...`). It costs about 2 ms a page. It is a check, not a proof: text
+drawn as outlines has no words to compare.
+
+Its first run found a real bug. A page that was both **rotated and fitted** to a
+page size was fitted in its unrotated frame, so a landscape page turned to
+portrait lost about 50 pt from each side, and the sheet came out landscape.
+
 ## Command line
 
 ```sh

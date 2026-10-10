@@ -132,6 +132,17 @@ def _cmd_build(args: argparse.Namespace) -> int:
               % (merged.entries, merged.pages, merged.outline_items))
         for label, why in merged.skipped:
             print("  MERGE-SKIP %s - %s" % (label, why))
+        check = merged.verification
+        if check is not None:
+            if check.error:
+                print("Checked   : could not compare with the sources (%s)" % check.error)
+            elif check.problems:
+                print("Checked   : %d of %d page(s) are MISSING CONTENT their source has"
+                      % (len(check.problems), check.checked))
+                for problem in check.problems:
+                    print("  MISSING %s" % problem.describe())
+            else:
+                print("Checked   : all %d page(s) match their sources" % check.checked)
         size_kb = report.output.stat().st_size / 1024
         print("Written   : %s (%.1f KB)" % (report.output, size_kb))
     else:

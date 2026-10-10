@@ -74,6 +74,8 @@ class MergeOptions:
     title: str = ""
     author: str = ""
     subject: str = ""
+    # Compare the written file with its sources, page by page (see verify.py).
+    verify: bool = True
 
 
 @dataclass
@@ -83,6 +85,11 @@ class MergeReport:
     outline_items: int = 0
     skipped: list[tuple[str, str]] = field(default_factory=list)
     separators: int = 0
+    # Where each output page came from: (source pdf, page index, label), or None
+    # for a generated page such as a separator.
+    page_map: list = field(default_factory=list)
+    # The page-by-page comparison of the output with its sources, if it ran.
+    verification: object = None
 
 
 def visual_size(page) -> tuple[float, float]:
@@ -374,6 +381,7 @@ def merge(
             else:
                 separator_page = _make_overlay(width, height, lambda c: None)
             writer.add_page(separator_page)
+            report.page_map.append(None)
             # A separator is a page in the output, so it is numbered like one.
             _decorate(writer.pages[-1], options, number=page_number, total=total_pages,
                       document=label, page_in_doc=0, pages_in_doc=0)
@@ -390,6 +398,7 @@ def merge(
 
         for position, spec in enumerate(specs, start=1):
             writer.add_page(reader.pages[spec.index])
+            report.page_map.append((path, spec.index, label))
             page = writer.pages[-1]
 
             # Order matters: bake /Rotate first, then rotate, then scale, then
@@ -397,6 +406,12 @@ def merge(
             bake_rotation(page)
             rotate_page(page, spec.rotation)
             if options.page_size:
+                # The user's rotation is folded into the content as well before
+                # fitting. Left as /Rotate, the fit was computed in the page's
+                # unrotated frame: a landscape page turned to portrait was scaled
+                # to its rotated size but placed unrotated, so its sides fell off
+                # the sheet - and the sheet itself came out landscape.
+                bake_rotation(page)
                 fit_to_page(page, options.page_size, options.margin)
 
             width = float(page.mediabox.width)
@@ -443,5 +458,10 @@ def merge(
         raise OSError(
             "could not write %s: %s" % (dest, getattr(exc, "strerror", exc) or exc)
         ) from exc
+
+    if options.verify:
+        from . import verify
+
+        report.verification = verify.check(dest, report.page_map)
 
     return report

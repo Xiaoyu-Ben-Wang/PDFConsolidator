@@ -1624,6 +1624,22 @@ class MainWindow(QMainWindow):
         self.status.showMessage(message + ".")
 
         skipped = list(getattr(report, "skipped", []) or [])
+        check = getattr(report, "verification", None)
+        problems = list(check.problems) if check is not None else []
+        if problems:
+            # The file was written, but a page in it lacks something its source
+            # page has. That is exactly the failure that otherwise goes unseen.
+            pages_named = ", ".join(str(p.output_page) for p in problems[:8])
+            if len(problems) > 8:
+                pages_named += ", \u2026"
+            message += ". %d page(s) may be missing content (page %s)" % (
+                len(problems), pages_named)
+        elif check is not None and check.error:
+            message += ". The output could not be checked against its sources"
+        elif check is not None and check.checked:
+            message += ", every page checked against its source"
+        self.status.showMessage(message + ".")
+
         if skipped:
             # Anything the merge left out has to be said out loud: a document that
             # is quietly short is worse than one that fails.
@@ -1642,15 +1658,32 @@ class MainWindow(QMainWindow):
             self.btn_banner_retry.setVisible(True)
             self.banner.setVisible(False)
 
+        if problems and not skipped:
+            self._merge_skips = []
+            self.lbl_banner.setText(
+                "%d page(s) of the output may be missing content their source has "
+                "- see the details in the Done dialog." % len(problems))
+            self.btn_banner_retry.setVisible(False)
+            self.banner.setVisible(True)
+
         box = QMessageBox(self)
-        box.setIcon(QMessageBox.Warning if skipped else QMessageBox.Information)
+        box.setIcon(QMessageBox.Warning if (skipped or problems) else QMessageBox.Information)
         box.setWindowTitle("Done")
         box.setText("%s.\n\n%s" % (message, self.output_path))
+        details = []
         if skipped:
-            box.setDetailedText(
+            details.append(
                 "These were left out of the merged PDF:\n\n"
-                + "\n".join("%s\n    %s" % (label, why) for label, why in skipped)
-            )
+                + "\n".join("%s\n    %s" % (label, why) for label, why in skipped))
+        if problems:
+            details.append(
+                "These pages of the output lack content that their source page has. "
+                "Compare them with the source before relying on the file:\n\n"
+                + "\n".join(problem.describe() for problem in problems))
+        if check is not None and check.error:
+            details.append("The output could not be checked: %s" % check.error)
+        if details:
+            box.setDetailedText("\n\n".join(details))
         box.exec()
 
     def _on_merge_crash(self, detail: str) -> None:

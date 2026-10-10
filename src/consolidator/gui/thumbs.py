@@ -20,12 +20,13 @@ what "a section of the document fails to render" looked like on a large folder.
 from __future__ import annotations
 
 import io
-import threading
 from collections import OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import QSize
 from PySide6.QtGui import QImage
+
+from ..pdfium_guard import PDFIUM_LOCK
 
 # Thumbnails are rendered at this pixel height and cached.
 THUMB_HEIGHT = 150
@@ -69,9 +70,11 @@ class ThumbnailCache:
         self._documents: OrderedDict[str, object] = OrderedDict()
         self._images: OrderedDict[tuple[str, int], QImage] = OrderedDict()
         # Held for the whole of every render, so a document cannot be closed by
-        # another thread midway through using it. Re-entrant because the public
+        # another thread midway through using it. It is the process-wide pdfium
+        # lock, because pdfium is not safe to enter from two threads at all - and
+        # the output verifier uses it from a third. Re-entrant because the public
         # methods call the private helpers that also take it.
-        self._lock = threading.RLock()
+        self._lock = PDFIUM_LOCK
         # Renders that raised. A missing thumbnail is otherwise silent, and a
         # silent gap is impossible to tell from a page that was never there.
         self.failed = 0

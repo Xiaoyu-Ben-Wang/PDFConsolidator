@@ -63,8 +63,20 @@ def test_rotation_is_applied(tmp_path, two_pdfs):
     assemble.merge([entry], dest, page_size=pages.LETTER)
 
     page = PdfReader(str(dest)).pages[0]
-    # bake_rotation folds any pre-existing /Rotate in; our own 90 degrees is
-    # applied afterwards and remains visible as /Rotate.
+    # Fitting folds the rotation into the content, so the sheet keeps the size
+    # asked for. Leaving it as /Rotate fitted the page in its unrotated frame,
+    # which clipped the sides of a rotated landscape page (see test_verify).
+    assert int(page.get("/Rotate", 0) or 0) % 360 == 0
+    assert (round(float(page.mediabox.width)), round(float(page.mediabox.height))) ==         (round(pages.LETTER[0]), round(pages.LETTER[1]))
+
+
+def test_rotation_without_fitting_stays_a_rotate_entry(tmp_path, two_pdfs):
+    """Without a page size nothing is rewritten: the rotation is just /Rotate."""
+    entry = assemble.MergeEntry(two_pdfs[0], "alpha", pages=[assemble.PageSpec(0, 90)])
+    dest = tmp_path / "rot.pdf"
+    assemble.merge([entry], dest)
+
+    page = PdfReader(str(dest)).pages[0]
     assert int(page.get("/Rotate", 0) or 0) % 360 == 90
 
 
