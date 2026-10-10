@@ -58,6 +58,13 @@ class Attachment:
     content_id: str = ""
     inline: bool = False
     category: str = "other"
+    # An attached Outlook item, already parsed. Reading it straight from the
+    # carrier is what makes it reliable: exporting it to bytes and parsing those
+    # again fails on plenty of real items, and the failure used to lose it.
+    item: "EmailItem | None" = None
+    # Why this attachment could not be read at all. It is still listed, and still
+    # becomes a row that says so - an attachment that vanishes is the worst case.
+    error: str = ""
 
     @property
     def size(self) -> int:
@@ -76,6 +83,11 @@ class EmailItem:
     attachments: list[Attachment] = field(default_factory=list)
     source: Path | None = None
     body_is_rtf_only: bool = False
+    # What kind of Outlook item this is ("Appointment", "Contact", "Task"...), and
+    # the fields that make it that kind - a meeting's time and place, a contact's
+    # numbers. Empty for ordinary mail, whose headers say everything.
+    kind: str = ""
+    details: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -169,6 +181,14 @@ def _safe(fn, default=""):
     return value
 
 
+def _raw(fn):
+    """A property as it comes, or None if reading it fails."""
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
 def _attachment_bytes(att) -> bytes:
     """An attachment's bytes, whatever shape ``extract-msg`` hands back.
 
@@ -190,58 +210,268 @@ def _attachment_bytes(att) -> bytes:
         return b""
 
 
-def _read_msg(path: Path) -> EmailItem:
+def _open_msg(path: Path):
+    """Open a ``.msg`` of any Outlook item class, tolerating what can be tolerated.
+
+    ``extract_msg.Message`` with its defaults is strict, and strictness costs far
+    more than it protects: an attached Outlook item of a class it does not handle
+    (a document dragged into a mail folder is ``IPM.Document.*``, a recalled mail
+    is ``IPM.Outlook.Recall``), an attachment with a missing stream, or one it
+    simply does not implement made it raise while *opening the carrier* - so the
+    whole message, its body and every other attachment, was lost. Opened
+    leniently, the broken part becomes one attachment that says it is broken.
+    """
     import extract_msg
+    from extract_msg.enums import ErrorBehavior
 
-    msg = extract_msg.Message(str(path))
+    lenient = (ErrorBehavior.ATTACH_SUPPRESS_ALL | ErrorBehavior.RTFDE
+               | ErrorBehavior.STANDARDS_VIOLATION | ErrorBehavior.NAMED_NAME_STREAM)
     try:
-        body_html = _safe(lambda: msg.htmlBody)
-        body_text = _safe(lambda: msg.body)
+        return extract_msg.openMsg(str(path), strict=False, errorBehavior=lenient)
+    except Exception:
+        # The last resort silences OLE defects too, which extract-msg warns can
+        # misread a damaged file - still better than not reading it at all.
+        return extract_msg.openMsg(str(path), strict=False,
+                                   errorBehavior=ErrorBehavior.SUPPRESS_ALL)
 
-        item = EmailItem(
-            subject=str(_safe(lambda: msg.subject)).strip(),
-            sender=str(_safe(lambda: msg.sender)).strip(),
-            to=str(_safe(lambda: msg.to)).strip(),
-            cc=str(_safe(lambda: msg.cc)).strip(),
-            date=str(_safe(lambda: msg.date, "")),
-            body_html=body_html,
-            body_text=body_text,
-            source=path,
-            body_is_rtf_only=bool(not body_html and not body_text),
-        )
 
-        live = referenced_cids(body_html)
+# Outlook item classes, by prefix, and what to call them. Mail needs no name: it
+# is what everyone expects an email file to be.
+_ITEM_KINDS = (
+    ("ipm.note", ""),
+    ("report", ""),
+    ("ipm.schedule.meeting.request", "Meeting request"),
+    ("ipm.schedule.meeting.canceled", "Meeting cancellation"),
+    ("ipm.schedule.meeting.resp", "Meeting response"),
+    ("ipm.schedule.meeting.notification.forward", "Meeting forward notification"),
+    ("ipm.appointment", "Appointment"),
+    ("ipm.contact", "Contact"),
+    ("ipm.distlist", "Contact group"),
+    ("ipm.taskrequest", "Task request"),
+    ("ipm.task", "Task"),
+    ("ipm.stickynote", "Note"),
+    ("ipm.activity", "Journal entry"),
+    ("ipm.post", "Post"),
+    ("ipm.document", "Document"),
+    ("ipm.outlook.recall", "Recall"),
+)
 
-        for att in _safe(lambda: msg.attachments, []) or []:
-            data = _attachment_bytes(att)
-            if not data:
-                continue
-            name = (
-                str(_safe(lambda: att.longFilename, "")).strip()
-                or str(_safe(lambda: att.shortFilename, "")).strip()
-                or "attachment"
-            )
-            cid = _cid_plain(_safe(lambda: att.cid, ""))
-            mimetype = str(_safe(lambda: att.mimetype, "")).strip()
-            embedded = _is_embedded_message(att, mimetype)
-            if embedded and not _has_email_extension(name):
-                # An attached Outlook item is named after its subject, which may
-                # carry no extension at all - and extract-msg reports no MIME type
-                # for one, so the name is the only thing that can identify it.
-                name = _with_email_extension(name, ".msg" if _looks_like_msg_bytes(data)
-                                             else ".eml")
-            category = "embedded" if embedded else categorise(name, mimetype)
-            item.attachments.append(
-                Attachment(
-                    filename=name,
-                    data=data,
-                    mimetype=mimetype,
-                    content_id=cid,
-                    inline=bool(cid and cid in live),
-                    category=category,
-                )
-            )
+
+def _item_kind(message_class: str) -> str:
+    lowered = (message_class or "").lower()
+    if not lowered or lowered == "ipm":
+        return ""
+    for prefix, kind in _ITEM_KINDS:
+        if lowered.startswith(prefix):
+            return kind
+    return message_class
+
+
+def _flatten_header(value, out: list[tuple[str, str]]) -> None:
+    """Flatten extract-msg's ``headerFormatProperties`` into label/value pairs."""
+    if not isinstance(value, dict):
+        return
+    for label, entry in value.items():
+        if isinstance(entry, dict):
+            _flatten_header(entry, out)
+            continue
+        if isinstance(entry, tuple):
+            entry = entry[0] if entry else None
+        if entry is None:
+            continue
+        text = _clean(str(entry)).strip()
+        if text:
+            out.append((_clean(str(label)), text))
+
+
+_META_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?([A-Za-z0-9_.:-]+)""",
+                           re.IGNORECASE)
+
+
+def _decode_html(data) -> str:
+    """HTML body bytes as text, in the charset they were written in.
+
+    Outlook stores the HTML body as bytes in whatever charset the sender used,
+    often windows-1252. Decoding everything as UTF-8 turned every accented letter
+    and curly quote of such a body into a replacement character.
+    """
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return _clean(data)
+    data = bytes(data)
+    try:
+        return _clean(data.decode("utf-8"))
+    except UnicodeDecodeError:
+        pass
+    match = _META_CHARSET.search(data[:4096])
+    if match:
+        try:
+            return _clean(data.decode(match.group(1).decode("ascii"), "replace"))
+        except LookupError:
+            pass
+    return _clean(data.decode("cp1252", "replace"))
+
+
+# Nesting that runs deeper than this is not mail any more; the expansion has its
+# own, lower, limit that the user controls.
+_MAX_PARSE_DEPTH = 16
+
+
+def _item_from_msg(msg, source: Path | None, depth: int = 0) -> EmailItem:
+    """Everything the consolidator needs from one open Outlook item.
+
+    Works on every item class - a message, an appointment, a contact, a task, or
+    a class extract-msg has no model for - by falling back to the raw property
+    streams, which every class shares.
+    """
+    message_class = str(_safe(lambda: msg.classType, "")).strip()
+    kind = _item_kind(message_class)
+
+    def stream(name: str) -> str:
+        return str(_safe(lambda: msg.getStringStream(name), "")).strip()
+
+    # Read raw: _safe would decode the bytes as UTF-8 before the charset is known.
+    body_html = _decode_html(_raw(lambda: getattr(msg, "htmlBody"))
+                             or _raw(lambda: msg.getStream("__substg1.0_10130102")))
+    body_text = str(_safe(lambda: getattr(msg, "body"), "")
+                    or stream("__substg1.0_1000"))
+
+    subject = (str(_safe(lambda: getattr(msg, "subject"), "")).strip()
+               or stream("__substg1.0_0037")
+               or str(_safe(lambda: getattr(msg, "displayName"), "")).strip()
+               or stream("__substg1.0_3001"))
+
+    details: list[tuple[str, str]] = []
+    if kind:
+        # The fields that make an appointment an appointment - when, where, who -
+        # are what a printout of it has to show. extract-msg already knows them
+        # for every class it models; the ones mail headers cover are left out.
+        _flatten_header(_safe(lambda: msg.headerFormatProperties, None), details)
+        shown = {"from", "to", "cc", "subject", "sent", "date"}
+        details = [(label, value) for label, value in details
+                   if label.lower() not in shown]
+
+    item = EmailItem(
+        subject=subject,
+        sender=str(_safe(lambda: getattr(msg, "sender"), "")).strip(),
+        to=str(_safe(lambda: getattr(msg, "to"), "")).strip(),
+        cc=str(_safe(lambda: getattr(msg, "cc"), "")).strip(),
+        date=str(_safe(lambda: getattr(msg, "date"), "") or ""),
+        body_html=body_html,
+        body_text=body_text,
+        source=source,
+        body_is_rtf_only=bool(not body_html and not body_text),
+        kind=kind,
+        details=details,
+    )
+
+    try:
+        attachments = list(msg.attachments or [])
+    except Exception as exc:
+        # Lenient opening makes this rare, but if the list itself cannot be read
+        # the message must still say that it had attachments nobody can see.
+        item.attachments.append(Attachment(
+            "attachments", b"", category="other",
+            error="the attachments of this item could not be read (%s: %s)"
+                  % (type(exc).__name__, exc)))
         return item
+
+    live = referenced_cids(body_html)
+    for att in attachments:
+        item.attachments.append(_msg_attachment(att, live, depth))
+    return item
+
+
+def _msg_attachment(att, live: set[str], depth: int) -> Attachment:
+    """One extract-msg attachment, whatever kind it is, as an :class:`Attachment`.
+
+    Never returns nothing: an attachment that cannot be read is still returned,
+    with :attr:`Attachment.error` saying why, so it becomes a visible row.
+    """
+    kind = type(att).__name__
+    name = (
+        str(_safe(lambda: att.longFilename, "")).strip()
+        or str(_safe(lambda: att.shortFilename, "")).strip()
+        or str(_safe(lambda: att.displayName, "")).strip()
+    )
+    cid = _cid_plain(_safe(lambda: att.cid, ""))
+    mimetype = str(_safe(lambda: att.mimetype, "")).strip()
+
+    if kind == "EmbeddedMsgAttachment":
+        # An attached Outlook item: a forwarded mail, a meeting, a contact, a
+        # task. It is parsed straight from the carrier - re-exporting it to bytes
+        # and reading those back is how such items went missing.
+        nested_msg = _safe(lambda: att.data, None)
+        if nested_msg is None:
+            return Attachment(_with_email_extension(name or "attached item", ".msg"),
+                              b"", category="embedded",
+                              error="the attached Outlook item could not be opened")
+        if depth + 1 > _MAX_PARSE_DEPTH:
+            return Attachment(_with_email_extension(name or "attached item", ".msg"),
+                              b"", category="embedded",
+                              error="Outlook items nested more than %d deep"
+                                    % _MAX_PARSE_DEPTH)
+        try:
+            nested = _item_from_msg(nested_msg, None, depth + 1)
+        except Exception as exc:
+            return Attachment(_with_email_extension(name or "attached item", ".msg"),
+                              b"", category="embedded",
+                              error="the attached Outlook item could not be read "
+                                    "(%s: %s)" % (type(exc).__name__, exc))
+        if not name:
+            name = nested.subject or nested.kind or "attached item"
+        # An attached Outlook item is named after its subject, which may carry no
+        # extension at all - and extract-msg reports no MIME type for one.
+        if not _has_email_extension(name):
+            name = _with_email_extension(name, ".msg")
+        # The serialised copy is a convenience for anything that wants the file;
+        # the parsed item is what is used, so a failure here costs nothing.
+        data = _raw(lambda: nested_msg.exportBytes(allowBadEmbed=True))
+        if not isinstance(data, (bytes, bytearray)):
+            data = b""
+        return Attachment(name, bytes(data), mimetype, cid, inline=False,
+                          category="embedded", item=nested)
+
+    if kind == "WebAttachment":
+        url = str(_safe(lambda: att.url, "")).strip()
+        return Attachment(name or url or "linked file", b"", mimetype, cid,
+                          category=categorise(name, mimetype),
+                          error="a link to a file stored online%s, not the file "
+                                "itself" % ((" (%s)" % url) if url else ""))
+
+    if kind in ("BrokenAttachment", "UnsupportedAttachment"):
+        return Attachment(name or "attachment", b"", mimetype, cid,
+                          category=categorise(name, mimetype),
+                          error="this attachment is damaged or of a kind that "
+                                "cannot be read")
+
+    data = _attachment_bytes(att)
+    name = name or "attachment"
+    if not data:
+        return Attachment(name, b"", mimetype, cid,
+                          category=categorise(name, mimetype),
+                          error="the attachment is empty")
+
+    embedded = _is_embedded_message(att, mimetype)
+    if embedded and not _has_email_extension(name):
+        name = _with_email_extension(name, ".msg" if _looks_like_msg_bytes(data)
+                                     else ".eml")
+    category = "embedded" if embedded else categorise(name, mimetype)
+    return Attachment(
+        filename=name,
+        data=data,
+        mimetype=mimetype,
+        content_id=cid,
+        inline=bool(cid and cid in live),
+        category=category,
+    )
+
+
+def _read_msg(path: Path) -> EmailItem:
+    msg = _open_msg(path)
+    try:
+        return _item_from_msg(msg, path)
     finally:
         try:
             msg.close()
@@ -504,6 +734,7 @@ table.headers { border-collapse: collapse; width: 100%; margin-bottom: 14px; }
 table.headers td { padding: 3px 8px; border-bottom: 1px solid #dcdcdc; vertical-align: top; }
 table.headers td.label { color: #666; width: 72px; white-space: nowrap; }
 h1.subject { font-size: 14pt; margin: 0 0 10px 0; }
+p.kind { color: #666; font-size: 9pt; text-transform: uppercase; letter-spacing: 1px; margin: 0 0 4px 0; }
 table.attachments { border-collapse: collapse; width: 100%; margin-top: 16px; }
 table.attachments td { padding: 3px 8px; border-bottom: 1px solid #eee; font-size: 9.5pt; color: #444; }
 .note { color: #777; font-size: 9pt; margin-top: 10px; }
@@ -572,6 +803,8 @@ def body_html(item: EmailItem, policy: ExtractionPolicy | None = None,
     parts: list[str] = []
     parts.append("<html><head><meta charset='utf-8'><style>%s</style></head><body>" % _CSS)
 
+    if item.kind:
+        parts.append("<p class='kind'>%s</p>" % html_module.escape(item.kind))
     if item.subject:
         parts.append("<h1 class='subject'>%s</h1>" % html_module.escape(item.subject))
 
@@ -581,7 +814,7 @@ def body_html(item: EmailItem, policy: ExtractionPolicy | None = None,
         ("CC", item.cc),
         ("Date", item.date),
         ("Subject", item.subject),
-    ]
+    ] + list(item.details)
     visible = [(label, value) for label, value in rows if value]
     if visible:
         parts.append("<table class='headers'>")
@@ -603,6 +836,8 @@ def body_html(item: EmailItem, policy: ExtractionPolicy | None = None,
         parts.append("<table class='attachments'>")
         for att in item.attachments:
             marker = " (inline)" if att.inline else ""
+            if att.error:
+                marker += " - " + att.error
             parts.append(
                 "<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
                 % (
@@ -783,6 +1018,12 @@ def expand_to_segments(
             # Inline images belong to the body; never separate pages.
             continue
 
+        if att.error:
+            # Unreadable, but present: a row that says so, never a gap.
+            add(label, ATTACHMENT, None, False, att.error)
+            emit("  FAIL %s - %s" % (att.filename, att.error))
+            continue
+
         if not policy.wants(category):
             add(label, ATTACHMENT, None, False,
                 "excluded by the extraction policy (%s)" % category)
@@ -809,7 +1050,12 @@ def expand_to_segments(
                     add(label, ATTACHMENT, None, False,
                         "nested message deeper than %d levels" % policy.max_depth)
                     continue
-                nested = read_message(staged)
+                if att.item is not None:
+                    # Parsed from the carrier already; the staged copy (which may
+                    # be empty, if the item would not serialise) only names it.
+                    nested = replace(att.item)
+                else:
+                    nested = read_message(staged)
                 nested.source = staged
                 # An embedded message's body *is* its content, so render it even
                 # when the top-level body is switched off. Otherwise enabling

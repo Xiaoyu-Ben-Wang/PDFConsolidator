@@ -166,6 +166,27 @@ would list B's attachments as A's, duplicating them and flattening the nest), an
 otherwise arrive as a zero-byte file. An A → B → C → PDF chain arrives as three
 attachments at three depths; there are tests for both.
 
+### Outlook items
+
+Dragging something from Outlook onto a message attaches it as an *Outlook item*
+rather than a file: another mail, but just as often a meeting, a contact, a task,
+or a document stored in a mail folder. Each is read as what it is. Its body becomes
+a page headed with its kind ("Appointment", "Contact"…) and the fields that make it
+that kind, such as when and where, or phone numbers. Its own attachments are
+extracted inside it, exactly as for a forwarded mail.
+
+Two things made these go missing, and both are fixed. `extract-msg`, opened
+strictly, **raises while opening the carrier** when one attached item is a class it
+refuses (`IPM.Document.*`, `IPM.Outlook.Recall`) or does not recognise, or when an
+attachment has no data stream. That lost the whole message: its body and every
+other attachment. The message is now opened leniently, and the broken part
+becomes a single row that says it is broken. Second, an attached item was
+exported to bytes and parsed again, and any failure there skipped it without a
+word. It is now parsed straight from the carrier. **No attachment is skipped
+silently any more:** an empty one, a damaged one, or a cloud attachment (a link,
+not a file) each becomes a row with the reason, and appears in the body page's
+attachment list.
+
 In the navigator a forwarded message becomes a node inside the message that carried
 it, so you can see what came from where and leave out a whole forwarded
 conversation by unticking one row. In the page column every message has its own
