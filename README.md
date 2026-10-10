@@ -72,6 +72,10 @@ Generate some sample input and try it:
   overrides.
 - **Output** is a single *Save as…* button that opens the standard Windows save
   dialog.
+  An existing file is never replaced: if `report.pdf` is already there, the
+  export is written as `report (1).pdf`, then `report (2).pdf`, and the status
+  bar and *Done* dialog say which name was used. The command line behaves the
+  same way.
 - **Closing** the window asks first (No is the default), and says what would be
   lost: a running conversion, an unfinished PDF, or the page arrangement.
 - **About** (bottom right, and under *Help*) names the version and the terms, and

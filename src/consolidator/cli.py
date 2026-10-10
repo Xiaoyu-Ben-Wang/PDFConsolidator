@@ -145,6 +145,9 @@ def _cmd_build(args: argparse.Namespace) -> int:
                 print("Checked   : all %d page(s) match their sources" % check.checked)
         size_kb = report.output.stat().st_size / 1024
         print("Written   : %s (%.1f KB)" % (report.output, size_kb))
+        requested = getattr(merged, "requested", None)
+        if requested is not None and Path(requested) != Path(report.output):
+            print("            %s already exists, so it was left alone" % Path(requested).name)
     else:
         print("No output produced.")
 

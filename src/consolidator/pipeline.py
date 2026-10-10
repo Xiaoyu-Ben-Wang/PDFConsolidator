@@ -763,7 +763,8 @@ def build(
 
     emit("Assembling %d segment(s)..." % len(entries))
     report.merged = assemble.merge(entries, dest, options=options)
-    report.output = dest
+    # Not necessarily dest: an existing file is never replaced.
+    report.output = report.merged.output or dest
     report.seconds = time.monotonic() - started
 
     if owned_scratch and not keep_scratch:

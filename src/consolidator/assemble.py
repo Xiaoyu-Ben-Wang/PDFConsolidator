@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -76,6 +77,9 @@ class MergeOptions:
     subject: str = ""
     # Compare the written file with its sources, page by page (see verify.py).
     verify: bool = True
+    # An existing file is never replaced: the output goes to "name (1).pdf",
+    # "name (2).pdf"... instead. Only a caller that means to replace sets this.
+    overwrite: bool = False
 
 
 @dataclass
@@ -90,6 +94,9 @@ class MergeReport:
     page_map: list = field(default_factory=list)
     # The page-by-page comparison of the output with its sources, if it ran.
     verification: object = None
+    # The file actually written - not the one asked for, if that already existed.
+    output: Path | None = None
+    requested: Path | None = None
 
 
 def visual_size(page) -> tuple[float, float]:
@@ -289,6 +296,34 @@ def open_pdf(path: Path):
     return reader, ""
 
 
+_NUMBERED = re.compile(r"^(?P<base>.*) \((?P<n>\d+)\)$")
+
+
+def reserve_output(dest: Path) -> Path:
+    """Claim a name for the output that no existing file has.
+
+    ``dest`` itself if it is free, otherwise ``name (1).pdf``, ``name (2).pdf``
+    and so on - the way Explorer names copies. A name that already ends in
+    ``(N)`` continues from N rather than growing ``(1) (1)``. The name is claimed
+    by creating it exclusively, so two exports at the same moment cannot both
+    pick it; the caller replaces the empty placeholder with the real file.
+    """
+    dest = Path(dest)
+    stem, suffix = dest.stem, dest.suffix
+    base, number = stem, 0
+    match = _NUMBERED.match(stem)
+    if match:
+        base, number = match.group("base"), int(match.group("n"))
+    candidate = dest
+    while True:
+        try:
+            with open(candidate, "xb"):
+                return candidate
+        except FileExistsError:
+            number += 1
+            candidate = dest.with_name("%s (%d)%s" % (base, number, suffix))
+
+
 def merge(
     entries: list[MergeEntry],
     dest: Path,
@@ -443,21 +478,30 @@ def merge(
     report.pages = len(writer.pages)
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    report.requested = dest
+    target = dest if options.overwrite else reserve_output(dest)
+    tmp = target.with_suffix(target.suffix + ".tmp")
     try:
         with open(tmp, "wb") as handle:
             writer.write(handle)
-        os.replace(tmp, dest)
+        os.replace(tmp, target)
     except OSError as exc:
-        # Never leave a half-written file where a complete one is expected.
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
+        # Never leave a half-written file where a complete one is expected -
+        # nor the empty placeholder that reserved a numbered name.
+        leftovers = [tmp]
+        if not options.overwrite:
+            leftovers.append(target)        # the empty placeholder we created
+        for leftover in leftovers:
+            try:
+                if leftover.exists() and (leftover == tmp or leftover.stat().st_size == 0):
+                    leftover.unlink()
+            except OSError:
+                pass
         raise OSError(
-            "could not write %s: %s" % (dest, getattr(exc, "strerror", exc) or exc)
+            "could not write %s: %s" % (target, getattr(exc, "strerror", exc) or exc)
         ) from exc
+    dest = target
+    report.output = target
 
     if options.verify:
         from . import verify

@@ -1659,3 +1659,19 @@ def test_a_check_that_could_not_run_is_not_reported_as_clean(window, monkeypatch
     window._on_merged(_merged_report(error="OSError: locked", checked=0))
 
     assert "could not be checked" in window.status.currentMessage()
+
+
+def test_an_export_beside_an_existing_file_says_where_it_went(window, monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: 0)
+    window.output_path = tmp_path / "report.pdf"
+
+    window._on_merged(SimpleNamespace(pages=3, separators=0, skipped=[],
+                                      output=tmp_path / "report (1).pdf"))
+
+    message = window.status.currentMessage()
+    assert "report (1).pdf" in message
+    assert "report.pdf already exists, so it was left alone" in message

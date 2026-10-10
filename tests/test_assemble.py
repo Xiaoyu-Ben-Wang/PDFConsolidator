@@ -204,3 +204,61 @@ def test_merge_is_atomic(tmp_path, two_pdfs):
     assemble.merge([assemble.MergeEntry(two_pdfs[0], "alpha")], dest)
     assert dest.exists()
     assert not dest.with_suffix(".pdf.tmp").exists()
+
+
+# ------------------------------------------------ never overwrite an export
+
+
+def test_an_existing_output_is_left_alone_and_numbered(tmp_path, two_pdfs):
+    dest = tmp_path / "report.pdf"
+    dest.write_bytes(b"the user's own file")
+    entry = assemble.MergeEntry(two_pdfs[0], "alpha")
+
+    first = assemble.merge([entry], dest)
+    second = assemble.merge([entry], dest)
+
+    assert dest.read_bytes() == b"the user's own file", "never replaced"
+    assert first.output == tmp_path / "report (1).pdf"
+    assert second.output == tmp_path / "report (2).pdf"
+    assert first.requested == dest
+    assert len(PdfReader(str(second.output)).pages) == 2
+    assert second.verification.ok, "the check reads the file actually written"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_a_free_name_is_used_as_given(tmp_path, two_pdfs):
+    dest = tmp_path / "fresh.pdf"
+    report = assemble.merge([assemble.MergeEntry(two_pdfs[0], "alpha")], dest)
+    assert report.output == dest
+
+
+def test_a_numbered_name_continues_its_numbering(tmp_path):
+    (tmp_path / "report (3).pdf").write_bytes(b"x")
+    assert assemble.reserve_output(tmp_path / "report (3).pdf") == \
+        tmp_path / "report (4).pdf"
+
+
+def test_overwrite_can_still_be_asked_for(tmp_path, two_pdfs):
+    dest = tmp_path / "report.pdf"
+    dest.write_bytes(b"old")
+    options = assemble.MergeOptions(overwrite=True)
+
+    report = assemble.merge([assemble.MergeEntry(two_pdfs[0], "alpha")], dest,
+                            options=options)
+
+    assert report.output == dest and dest.read_bytes().startswith(b"%PDF")
+
+
+def test_a_failed_write_leaves_no_placeholder(tmp_path, two_pdfs, monkeypatch):
+    dest = tmp_path / "report.pdf"
+    dest.write_bytes(b"x")
+
+    def refuse(self, stream):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(assemble.PdfWriter, "write", refuse)
+    with pytest.raises(OSError):
+        assemble.merge([assemble.MergeEntry(two_pdfs[0], "alpha")], dest)
+
+    assert sorted(p.name for p in tmp_path.iterdir() if p.suffix != ".pdf" or
+                  p.name.startswith("report")) == ["report.pdf"]

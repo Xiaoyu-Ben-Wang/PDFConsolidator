@@ -1561,8 +1561,11 @@ class MainWindow(QMainWindow):
     def choose_output(self) -> None:
         """Pick the destination with the native Windows save dialog."""
         start = str(self.output_path) if self.output_path else "consolidated.pdf"
+        # No "replace it?" question: an existing file is never replaced - the
+        # export goes beside it as "name (1).pdf" - so asking would mislead.
         name, _ = QFileDialog.getSaveFileName(
-            self, "Save merged PDF as", start, "PDF (*.pdf)"
+            self, "Save merged PDF as", start, "PDF (*.pdf)",
+            options=QFileDialog.Option.DontConfirmOverwrite,
         )
         if not name:
             return
@@ -1618,7 +1621,12 @@ class MainWindow(QMainWindow):
     def _on_merged(self, report) -> None:
         self._end_progress()
         self.btn_create.setEnabled(True)
+        written = getattr(report, "output", None) or self.output_path
         message = "Wrote %d page(s)" % report.pages
+        if written is not None and self.output_path is not None \
+                and Path(written) != Path(self.output_path):
+            message += " to %s (%s already exists, so it was left alone)" % (
+                Path(written).name, Path(self.output_path).name)
         if report.separators:
             message += " including %d separator(s)" % report.separators
         self.status.showMessage(message + ".")
@@ -1669,7 +1677,7 @@ class MainWindow(QMainWindow):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning if (skipped or problems) else QMessageBox.Information)
         box.setWindowTitle("Done")
-        box.setText("%s.\n\n%s" % (message, self.output_path))
+        box.setText("%s.\n\n%s" % (message, written))
         details = []
         if skipped:
             details.append(
