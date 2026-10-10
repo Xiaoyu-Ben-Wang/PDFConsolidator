@@ -18,7 +18,7 @@ translation XSLTs. Everything needed to render a document is kept.
 
 Usage::
 
-    python tools/build.py [--out dist] [--skip-libreoffice] [--no-trim]
+    python tools/build.py [--out dist] [--skip-libreoffice] [--no-trim] [--zip]
 """
 
 from __future__ import annotations
@@ -248,6 +248,33 @@ def sign_executable(exe: Path, publisher: str, trust: bool) -> bool:
     return True
 
 
+def make_zip(bundle: Path, dest: Path) -> int:
+    """Zip the bundle's *contents*, flat: PDFConsolidator.exe at the archive root.
+
+    No inner folder, so "Extract here" puts the executable where the user
+    extracted to. Written to a temporary name and renamed, so an interrupted
+    build never leaves a truncated archive under the real name. Returns the
+    number of files.
+    """
+    import zipfile
+
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    count = 0
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        for path in sorted(bundle.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(bundle).as_posix())
+                count += 1
+    with zipfile.ZipFile(tmp) as archive:
+        bad = archive.testzip()
+        if bad is not None:
+            raise SystemExit("zip verification failed at %s" % bad)
+        if "PDFConsolidator.exe" not in archive.namelist():
+            raise SystemExit("zip has no PDFConsolidator.exe at its root")
+    os.replace(tmp, dest)
+    return count
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default=str(ROOT / "dist"), help="output directory")
@@ -261,6 +288,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="skip signing the executable")
     parser.add_argument("--trust", action="store_true",
                         help="also trust the certificate locally (needs administrator)")
+    parser.add_argument("--zip", action="store_true",
+                        help="also write <out>/PDFConsolidator.zip, flat (no inner folder)")
     args = parser.parse_args(argv)
 
     out_dir = Path(args.out)
@@ -286,12 +315,20 @@ def main(argv: list[str] | None = None) -> int:
     check_licences(exe)
 
     total = directory_size(bundle)
+    archive = None
+    if args.zip:
+        archive = out_dir / "PDFConsolidator.zip"
+        print("zipping ...", flush=True)
+        files = make_zip(bundle, archive)
+        print("zip: %d file(s), %s" % (files, human(archive.stat().st_size)))
     print()
     print("=" * 68)
     print("Bundle    : %s" % bundle)
     print("Size      : %s" % human(total))
     print("Exe       : %s" % exe)
     print("Publisher : %s" % (args.publisher if not args.no_sign else "(not signed)"))
+    if archive is not None:
+        print("Zip       : %s (%s, flat)" % (archive, human(archive.stat().st_size)))
     print("Time      : %.1fs" % (time.monotonic() - started))
     print("=" * 68)
     print()
