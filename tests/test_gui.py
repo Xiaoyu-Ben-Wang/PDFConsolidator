@@ -1502,3 +1502,102 @@ def test_the_prompt_says_what_would_be_lost(window, tmp_path, monkeypatch):
     assert seen["text"] == "Are you sure you want to close the application?"
     assert "page arrangement" in seen["info"]
     assert seen["default"], "No is the default, so Enter does not discard work"
+
+
+# -------------------------------------------------- retry puts things back
+
+
+def _email_with_a_failed_middle(window, tmp_path):
+    from consolidator.model import Segment
+
+    source = Path("mail.msg")
+    window.selected_sources = [source]
+    group = str(source)
+    add = window.model.add_segment
+    add(source, "mail - body", make_pdf(tmp_path / "b.pdf", 1), True, kind="body",
+        page_count=1, group=group, group_label="mail.msg")
+    add(source, "mail - first.pdf", make_pdf(tmp_path / "f.pdf", 2), True,
+        kind="attachment", page_count=2, group=group, group_label="mail.msg")
+    add(source, "mail - middle.docx", None, False, kind="attachment",
+        detail="LibreOffice crashed", group=group, group_label="mail.msg")
+    add(source, "mail - last.pdf", make_pdf(tmp_path / "l.pdf", 1), True,
+        kind="attachment", page_count=1, group=group, group_label="mail.msg")
+    other = Path("other.pdf")
+    add(other, "other", make_pdf(tmp_path / "o.pdf", 1), True, page_count=1)
+    window.refresh_tree()
+    window.refresh_pages()
+
+    # What the retry brings back: the whole email again, now fully converted.
+    retried = [
+        Segment(source, "mail - body", "body", make_pdf(tmp_path / "rb.pdf", 1), True,
+                page_count=1, group=group, group_label="mail.msg"),
+        Segment(source, "mail - first.pdf", "attachment",
+                make_pdf(tmp_path / "rf.pdf", 2), True, page_count=2,
+                group=group, group_label="mail.msg"),
+        Segment(source, "mail - middle.docx", "attachment",
+                make_pdf(tmp_path / "rm.pdf", 3), True, page_count=3,
+                group=group, group_label="mail.msg"),
+        Segment(source, "mail - last.pdf", "attachment",
+                make_pdf(tmp_path / "rl.pdf", 1), True, page_count=1,
+                group=group, group_label="mail.msg"),
+    ]
+    return source, retried
+
+
+def _page_labels(window):
+    return [window.model.segment(p.segment_id).label for p in window.model.pages]
+
+
+def test_a_retried_attachment_goes_back_where_it_was(window, tmp_path):
+    from consolidator.model import SourceResult
+    from consolidator.pipeline import BuildReport
+
+    source, retried = _email_with_a_failed_middle(window, tmp_path)
+    window.model.rotate([1], 90)                     # an edit to keep
+
+    window._on_retried(BuildReport(sources=[SourceResult(source, retried)]))
+
+    assert _page_labels(window) == [
+        "mail - body", "mail - first.pdf", "mail - first.pdf",
+        "mail - middle.docx", "mail - middle.docx", "mail - middle.docx",
+        "mail - last.pdf", "other",
+    ]
+    assert window.model.pages[1].rotation == 90, "edits to parts that worked survive"
+    labels = [s.label for s in window.model.segments_of(source)]
+    assert labels == ["mail - body", "mail - first.pdf", "mail - middle.docx",
+                      "mail - last.pdf"], "nothing duplicated, email order kept"
+    rows = _labels(window.tree.topLevelItem(0))
+    assert rows[1:] == ["  body", "  first.pdf", "  middle.docx", "  last.pdf"]
+
+
+def test_a_retry_after_reordering_follows_the_part_before_it(window, tmp_path):
+    from consolidator.model import SourceResult
+    from consolidator.pipeline import BuildReport
+
+    source, retried = _email_with_a_failed_middle(window, tmp_path)
+    # The user moved "other" to the front.
+    window.model.pages.insert(0, window.model.pages.pop())
+
+    window._on_retried(BuildReport(sources=[SourceResult(source, retried)]))
+
+    assert _page_labels(window) == [
+        "other", "mail - body", "mail - first.pdf", "mail - first.pdf",
+        "mail - middle.docx", "mail - middle.docx", "mail - middle.docx",
+        "mail - last.pdf",
+    ]
+
+
+def test_a_part_that_still_fails_replaces_its_old_failure(window, tmp_path):
+    from consolidator.model import Segment, SourceResult
+    from consolidator.pipeline import BuildReport
+
+    source, retried = _email_with_a_failed_middle(window, tmp_path)
+    retried[2] = Segment(source, "mail - middle.docx", "attachment", None, False,
+                         "still broken", group=str(source), group_label="mail.msg")
+
+    window._on_retried(BuildReport(sources=[SourceResult(source, retried)]))
+
+    nodes = window.model.segments_of(source)
+    assert [n.label for n in nodes].count("mail - middle.docx") == 1
+    assert [n.detail for n in nodes if not n.ok] == ["still broken"]
+    assert len(window.model.pages) == 5

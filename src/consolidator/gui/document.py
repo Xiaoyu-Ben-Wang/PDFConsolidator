@@ -385,6 +385,86 @@ class DocumentModel:
         self._changed()
         return before - len(self.segments)
 
+    def replace_source(self, source: Path, segments: list, count_pages=None) -> int:
+        """Merge a re-conversion of one source back in, in place. Returns recoveries.
+
+        A retry converts the whole source again, so it comes back with *every*
+        segment, not only the ones that failed. Appending them all duplicated the
+        parts that had worked and put everything - recovered attachments too - at
+        the end of the document. Instead the new segments are matched to the old
+        ones by what they are (label, kind, depth, in order):
+
+        * a part that had already worked keeps its node, so its pages and any
+          edits made to them stay exactly where they are;
+        * a part that failed before and works now takes the failed one's place in
+          the email, and its pages go where that place is in the page list;
+        * a part that still fails replaces its old failure.
+
+        ``segments`` are pipeline segments; ``count_pages`` counts a PDF's pages
+        when a segment does not say.
+        """
+        source = Path(source)
+        old = self.segments_of(source)
+        old_ids = {node.id for node in old}
+        unclaimed: dict[tuple, list[SegmentNode]] = {}
+        for node in old:
+            unclaimed.setdefault((node.label, node.kind, node.depth), []).append(node)
+
+        # A nested message's group is named after the retry's scratch path, which
+        # differs from the first run's; map it back so siblings stay together.
+        groups: dict[str, str] = {}
+        merged: list[SegmentNode] = []
+        recovered = 0
+        for segment in segments:
+            key = (segment.label, segment.kind, segment.depth)
+            previous = unclaimed.get(key)
+            match = previous.pop(0) if previous else None
+            if match is not None and segment.group and match.group:
+                groups.setdefault(segment.group, match.group)
+            if match is not None and match.ok:
+                merged.append(match)            # worked before: leave it be
+                continue
+            pages = segment.page_count
+            if not pages and segment.ok and segment.pdf and count_pages:
+                pages = count_pages(segment.pdf)
+            node = SegmentNode(
+                id=self._next_id, source=source, label=segment.label,
+                kind=segment.kind, pdf=Path(segment.pdf) if segment.pdf else None,
+                ok=bool(segment.ok), detail=segment.detail or "",
+                page_count=pages, group=segment.group, parent=segment.parent,
+                group_label=segment.group_label, depth=segment.depth,
+            )
+            self._next_id += 1
+            if match is not None:
+                node.enabled = match.enabled
+            if node.ok:
+                recovered += 1
+            merged.append(node)
+
+        for node in merged:
+            if node.id not in old_ids:
+                node.group = groups.get(node.group, node.group)
+                node.parent = groups.get(node.parent, node.parent)
+
+        # The source's block of segments is replaced where it stood, so segment
+        # order - which decides where returning pages go - is the email's order.
+        kept = {node.id for node in merged}
+        first = next((i for i, node in enumerate(self.segments) if node.id in old_ids),
+                     len(self.segments))
+        before = [n for n in self.segments[:first] if n.id not in old_ids]
+        after = [n for n in self.segments[first:] if n.id not in old_ids]
+        self.segments = before + merged + after
+        self.pages = [p for p in self.pages
+                      if p.segment_id in kept or p.segment_id not in old_ids]
+        self._changed()
+
+        for node in merged:
+            if node.id not in old_ids and node.ok and node.pdf and node.enabled:
+                insert_at = self._home_of(node.id)
+                for index in range(node.page_count):
+                    self.pages.insert(insert_at + index, PageRef(node.id, index))
+        return recovered
+
     def group_by_source(self) -> None:
         """Cluster pages so every page from one source file is contiguous.
 

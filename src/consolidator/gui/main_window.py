@@ -1521,27 +1521,10 @@ class MainWindow(QMainWindow):
 
         recovered = 0
         for result in report.sources:
-            self.model.remove_failed_for(result.source)
-            for segment in result.segments:
-                if segment.ok:
-                    recovered += 1
-                self.model.add_segment(
-                    result.source,
-                    segment.label,
-                    segment.pdf,
-                    segment.ok,
-                    kind=segment.kind,
-                    detail=segment.detail,
-                    # The pipeline verified this when it produced the segment;
-                    # count it here only if it came from somewhere that did not.
-                    page_count=segment.page_count or (
-                        pipeline.count_pages(segment.pdf)
-                        if segment.ok and segment.pdf else 0),
-                    group=segment.group,
-                    parent=segment.parent,
-                    group_label=segment.group_label,
-                    depth=segment.depth,
-                )
+            # In place: parts that worked stay put, recovered parts go back where
+            # they were in the email instead of to the end of the document.
+            recovered += self.model.replace_source(
+                result.source, result.segments, count_pages=pipeline.count_pages)
 
         self.refresh_tree()
         self.refresh_pages()
