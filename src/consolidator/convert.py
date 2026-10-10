@@ -14,6 +14,7 @@ interpreted - is escaped and laid out with ReportLab.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -67,10 +68,64 @@ def _is_office(ext: str) -> bool:
 
 def convert_with_libreoffice(src: Path, dest: Path, workdir: Path) -> None:
     """Lay a document out with LibreOffice: Office formats and web pages alike."""
+    if Path(src).suffix.lower() in WEB_EXTS:
+        staged = Path(workdir) / ("%s_page%s" % (Path(dest).stem, Path(src).suffix))
+        try:
+            stage_web_page(src, staged)
+            src = staged
+        except OSError:
+            pass    # convert the page as it is, without its pictures
     try:
         libreoffice.convert_one(src, dest, workdir=workdir)
     except libreoffice.LibreOfficeError as exc:
         raise ConversionError(str(exc)) from exc
+
+
+# Beyond this a picture is left as a link: the page is held in memory whole.
+MAX_INLINE_IMAGE_BYTES = 32 * 1024 * 1024
+
+_IMG_SRC = re.compile(
+    rb"""(<img\b[^>]*?\bsrc\s*=\s*)(["']?)([^"'\s>]+)\2""", re.IGNORECASE)
+
+
+def inline_local_images(html: bytes, base_dir: Path) -> bytes:
+    """Embed the pictures a saved web page links to, as ``data:`` URIs.
+
+    LibreOffice, run headless, does not load linked pictures at all - not by a
+    relative path, not by a ``file:`` URL - so every image of a page saved with
+    "Save page as..." (``page_files/...``) was missing from its PDF. A ``data:``
+    URI is the one form it renders. Remote pictures are left alone.
+    """
+    import base64
+    import mimetypes
+    from urllib.parse import unquote, urlparse
+
+    def swap(match: "re.Match[bytes]") -> bytes:
+        reference = match.group(3).decode("latin-1")
+        parsed = urlparse(reference)
+        if parsed.scheme in ("", "file") or len(parsed.scheme) == 1:
+            if parsed.scheme == "file":
+                target = Path(unquote(parsed.path.lstrip("/")))
+            elif len(parsed.scheme) == 1:          # C:\... read as a scheme
+                target = Path(reference)
+            else:
+                target = base_dir / unquote(parsed.path)
+            try:
+                if target.is_file() and target.stat().st_size <= MAX_INLINE_IMAGE_BYTES:
+                    mimetype = mimetypes.guess_type(target.name)[0] or "image/png"
+                    data = base64.b64encode(target.read_bytes())
+                    return (match.group(1) + b'"data:' + mimetype.encode("ascii")
+                            + b";base64," + data + b'"')
+            except OSError:
+                pass
+        return match.group(0)
+
+    return _IMG_SRC.sub(swap, html)
+
+
+def stage_web_page(src: Path, staged: Path) -> None:
+    """Copy a web page for conversion, bringing its local pictures with it."""
+    staged.write_bytes(inline_local_images(Path(src).read_bytes(), Path(src).parent))
 
 
 def convert_pdf(src: Path, dest: Path, workdir: Path) -> None:
@@ -160,38 +215,18 @@ def convert_text(src: Path, dest: Path, workdir: Path, page_size: tuple | None) 
     """Render a text file as literal, monospaced, whitespace-preserving text.
 
     Markdown is intentionally *not* interpreted: ``# Title`` stays ``# Title``.
+    The encoding is detected, every script is drawn and long lines are wrapped
+    rather than cut off; see :mod:`consolidator.text_render`.
     """
-    from reportlab.lib.utils import simpleSplit
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfgen import canvas as rl_canvas
-
-    width, height = page_size or pages.LETTER
-    margin = 54.0          # 0.75 inch
-    font, size, leading = "Courier", 9.5, 12.0
+    from . import text_render
 
     try:
-        text = src.read_text(encoding="utf-8", errors="replace")
+        text = text_render.decode_text(src.read_bytes())
     except OSError as exc:
         raise ConversionError("could not read text file: %s" % exc) from exc
 
     try:
-        c = rl_canvas.Canvas(str(dest), pagesize=(width, height))
-        c.setTitle(src.stem)
-        usable = width - 2 * margin
-        y = height - margin
-
-        for raw_line in text.splitlines() or [""]:
-            # Expand tabs so column alignment survives, then wrap to the page.
-            line = raw_line.expandtabs(4)
-            for chunk in (simpleSplit(line, font, size, usable) or [""]):
-                if y < margin:
-                    c.showPage()
-                    y = height - margin
-                c.setFont(font, size)
-                c.drawString(margin, y, chunk)
-                y -= leading
-
-        c.save()
+        text_render.render(text, dest, page_size or pages.LETTER, title=src.stem)
     except Exception as exc:
         raise ConversionError("text layout failed: %s" % exc) from exc
 

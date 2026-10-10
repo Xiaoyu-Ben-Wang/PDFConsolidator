@@ -343,7 +343,10 @@ def convert_sources(
         elif ext in convert.LIBREOFFICE_EXTS:
             staged = staging / ("%04d_%s%s" % (index, src.stem, ext))
             try:
-                shutil.copyfile(src, staged)
+                if ext in convert.WEB_EXTS:
+                    convert.stage_web_page(src, staged)
+                else:
+                    shutil.copyfile(src, staged)
                 document_batch.append((index, src, staged))
             except OSError as exc:
                 results[index] = SourceResult(
