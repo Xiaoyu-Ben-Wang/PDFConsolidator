@@ -1438,3 +1438,67 @@ def test_closing_is_prompt(window):
     elapsed = _time.monotonic() - started
     assert elapsed < 1.5, "closing took %.2fs" % elapsed
 
+
+
+# ------------------------------------------------------------ close prompt
+
+
+def _close_event(spontaneous: bool):
+    from PySide6.QtGui import QCloseEvent
+
+    class Event(QCloseEvent):
+        def spontaneous(self):          # noqa: D401 - Qt naming
+            return spontaneous
+
+    return Event()
+
+
+def test_closing_from_the_window_asks_first(window, monkeypatch):
+    asked = []
+    monkeypatch.setattr(window, "confirm_close", lambda: asked.append(1) or False)
+
+    event = _close_event(spontaneous=True)
+    window.closeEvent(event)
+
+    assert asked == [1]
+    assert not event.isAccepted(), "answering No keeps the window open"
+
+
+def test_answering_yes_closes(window, monkeypatch):
+    monkeypatch.setattr(window, "confirm_close", lambda: True)
+
+    event = _close_event(spontaneous=True)
+    window.closeEvent(event)
+
+    assert event.isAccepted()
+
+
+def test_a_close_issued_by_code_does_not_ask(window, monkeypatch):
+    monkeypatch.setattr(window, "confirm_close",
+                        lambda: pytest.fail("a programmatic close must not prompt"))
+
+    event = _close_event(spontaneous=False)
+    window.closeEvent(event)
+
+    assert event.isAccepted()
+
+
+def test_the_prompt_says_what_would_be_lost(window, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    seen = {}
+
+    def fake_exec(box):
+        seen["text"] = box.text()
+        seen["info"] = box.informativeText()
+        seen["default"] = box.defaultButton() is box.button(QMessageBox.No)
+        return QMessageBox.No
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+    window.model.add_segment(Path("a.pdf"), "a", make_pdf(tmp_path / "a.pdf", 1),
+                             True, page_count=1)
+
+    assert window.confirm_close() is False
+    assert seen["text"] == "Are you sure you want to close the application?"
+    assert "page arrangement" in seen["info"]
+    assert seen["default"], "No is the default, so Enter does not discard work"

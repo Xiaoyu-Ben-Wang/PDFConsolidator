@@ -1704,6 +1704,26 @@ class MainWindow(QMainWindow):
                 continue
         return False
 
+    def confirm_close(self) -> bool:
+        """Ask before closing. Says what would be lost, when anything would be."""
+        if self._conversion is not None and self._conversion.isRunning():
+            detail = "A conversion is still running and will be stopped."
+        elif self._merge is not None and self._merge.isRunning():
+            detail = "The PDF is still being written and will not be finished."
+        elif self.model.pages:
+            detail = "The page arrangement is not kept once the application closes."
+        else:
+            detail = ""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Close PDF Consolidator")
+        box.setText("Are you sure you want to close the application?")
+        if detail:
+            box.setInformativeText(detail)
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        return box.exec() == QMessageBox.Yes
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         """Shut down promptly.
 
@@ -1715,6 +1735,13 @@ class MainWindow(QMainWindow):
         import threading
 
         from .. import libreoffice
+
+        # Only a close the user asked for from the window itself - the title
+        # bar's close button, Alt+F4 - is confirmed. A close issued by code is
+        # deliberate, and a dialog there would block whatever issued it.
+        if event.spontaneous() and not self.confirm_close():
+            event.ignore()
+            return
 
         self._autoconvert.stop()
 

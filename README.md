@@ -72,6 +72,8 @@ Generate some sample input and try it:
   overrides.
 - **Output** is a single *Save as…* button that opens the standard Windows save
   dialog.
+- **Closing** the window asks first (No is the default), and says what would be
+  lost: a running conversion, an unfinished PDF, or the page arrangement.
 - **About** (bottom right, and under *Help*) names the version and the terms, and
   opens the full licence inventory.
 
