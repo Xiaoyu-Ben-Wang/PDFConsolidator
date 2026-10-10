@@ -816,3 +816,95 @@ def test_email_end_to_end_produces_pages(emails, tmp_path):
     labels = [s.label for s in report.segments]
     assert any("invoice.pdf" in label for label in labels)
     assert any("terms.docx" in label for label in labels)
+
+
+# ------------------------------------------------------- body completeness ---
+
+
+def _eml(tmp_path, message) -> Path:
+    path = tmp_path / "message.eml"
+    path.write_bytes(message.as_bytes())
+    return path
+
+
+def test_a_body_split_around_a_picture_keeps_every_piece(tmp_path):
+    """Apple Mail and phones send text, picture, text; the second text is body too."""
+    from email.message import EmailMessage
+
+    message = EmailMessage()
+    message["Subject"] = "split"
+    message.make_mixed()
+    for html in ("<p>first paragraph</p>", None, "<p>after the picture</p>"):
+        part = EmailMessage()
+        if html is None:
+            part.set_content(b"\x89PNG fake", maintype="image", subtype="png",
+                             disposition="inline", filename="photo.png")
+        else:
+            part.set_content(html, subtype="html")
+        message.attach(part)
+
+    item = email_items.read_message(_eml(tmp_path, message))
+
+    assert "first paragraph" in item.body_html
+    assert "after the picture" in item.body_html
+    assert [a.filename for a in item.attachments] == ["photo.png"]
+
+
+def test_plain_pieces_between_html_ones_keep_their_place(tmp_path):
+    from email.message import EmailMessage
+
+    message = EmailMessage()
+    message["Subject"] = "mixed pieces"
+    message.make_mixed()
+    for subtype, content in (("html", "<p>one</p>"), ("plain", "two"),
+                             ("html", "<p>three</p>")):
+        part = EmailMessage()
+        part.set_content(content, subtype=subtype)
+        message.attach(part)
+
+    item = email_items.read_message(_eml(tmp_path, message))
+
+    body = item.body_html
+    assert body.index("one") < body.index("two") < body.index("three")
+
+
+def test_an_alternative_body_is_not_repeated(tmp_path):
+    from email.message import EmailMessage
+
+    message = EmailMessage()
+    message["Subject"] = "alt"
+    message.set_content("plain version")
+    message.add_alternative("<p>html version</p>", subtype="html")
+
+    item = email_items.read_message(_eml(tmp_path, message))
+
+    assert "html version" in item.body_html
+    assert "plain version" not in item.body_html
+    assert item.body_text.strip() == "plain version"
+    assert item.attachments == []
+
+
+def test_an_unnamed_pdf_part_is_still_an_attachment(tmp_path):
+    from email.message import EmailMessage
+
+    message = EmailMessage()
+    message["Subject"] = "unnamed"
+    message.set_content("see attached")
+    message.add_attachment(b"%PDF-1.4 fake", maintype="application", subtype="pdf")
+    del message.get_payload()[1]["Content-Disposition"]
+
+    item = email_items.read_message(_eml(tmp_path, message))
+
+    assert [(a.filename, a.category) for a in item.attachments] == [("part1.pdf", "pdf")]
+
+
+def test_a_body_in_a_legacy_charset_is_decoded_in_it(tmp_path):
+    from email.message import EmailMessage
+
+    message = EmailMessage()
+    message["Subject"] = "latin"
+    message.set_content("Café crème", charset="iso-8859-1", cte="8bit")
+
+    item = email_items.read_message(_eml(tmp_path, message))
+
+    assert "Café crème" in item.body_text

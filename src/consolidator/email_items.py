@@ -554,6 +554,110 @@ def _walk_parts(part):
     yield part
 
 
+def _part_text(part) -> str:
+    """A text part decoded in its declared charset."""
+    data = _decode_part(part)
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return data.decode(charset, "replace")
+    except LookupError:
+        return data.decode("utf-8", "replace")
+
+
+def _is_body_text(part) -> bool:
+    """An unnamed text part that is not marked as an attachment reads as body."""
+    if part.get_content_type() not in ("text/plain", "text/html"):
+        return False
+    if part.get_filename():
+        return False
+    return (part.get_content_disposition() or "inline").lower() != "attachment"
+
+
+def _alternative_choice(part):
+    """The richest rendering of a ``multipart/alternative``: HTML, else the last."""
+    children = [c for c in part.get_payload() if hasattr(c, "get_content_type")]
+    for child in children:
+        if child.get_content_type() == "text/html":
+            return child
+    for child in children:
+        if child.get_content_maintype() == "multipart":
+            inner = list(_walk_parts(child))
+            if any(p.get_content_type() == "text/html" for p in inner):
+                return child
+    return children[-1] if children else None
+
+
+_BODY_BREAK = "<br>"
+
+
+def _collect_body(message):
+    """The whole body of a message, and every part that is not body.
+
+    Taking only the *first* text part as the body lost the rest: Apple Mail and
+    many phones split a body around an inline picture into text, image, text, and
+    everything after the picture was dropped without a trace. Body text parts are
+    therefore joined, in order. In a ``multipart/alternative`` only the richest
+    rendering is body - the others say the same thing again.
+    """
+    html_pieces: list[str] = []
+    text_pieces: list[str] = []
+    any_html = False
+    candidates: list = []
+    ordered: list[tuple[str, str]] = []      # ("html" | "text", content)
+    alternative_text: list[str] = []
+
+    def visit(part) -> None:
+        nonlocal any_html
+        if part.get_content_maintype() == "multipart":
+            subtype = part.get_content_subtype()
+            if subtype == "alternative":
+                chosen = _alternative_choice(part)
+                for child in part.get_payload():
+                    if child is chosen:
+                        visit(child)
+                    elif _is_body_text(child) and child.get_content_type() == "text/plain":
+                        # Not rendered, but kept as the plain-text form of the body.
+                        alternative_text.append(_part_text(child))
+                    elif child.get_filename():
+                        # A named part inside an alternative is a real file.
+                        candidates.append(child)
+                return
+            for child in part.get_payload():
+                visit(child)
+            return
+        if _is_body_text(part):
+            kind = "html" if part.get_content_type() == "text/html" else "text"
+            any_html = any_html or kind == "html"
+            ordered.append((kind, _part_text(part)))
+            return
+        candidates.append(part)
+
+    visit(message)
+
+    for kind, content in ordered:
+        if kind == "html":
+            html_pieces.append(content)
+        else:
+            text_pieces.append(content)
+            if any_html:
+                # Plain pieces between HTML ones keep their place in the body.
+                html_pieces.append("<pre class='body'>%s</pre>"
+                                   % html_module.escape(content))
+    body_html = _BODY_BREAK.join(html_pieces) if any_html else ""
+    body_text = "\n".join(text_pieces or alternative_text)
+    return body_html, body_text, candidates
+
+
+def _name_for_unnamed(mimetype: str, index: int) -> str:
+    import mimetypes
+
+    extension = {
+        "application/pdf": ".pdf", "text/plain": ".txt", "text/html": ".html",
+        "image/jpeg": ".jpg", "image/png": ".png", "image/tiff": ".tif",
+    }.get(mimetype) or mimetypes.guess_extension(mimetype or "") or ".bin"
+    return "part%d%s" % (index + 1, extension)
+
+
 def _read_eml(path: Path) -> EmailItem:
     import email
     from email import policy as email_policy
@@ -567,22 +671,7 @@ def _read_eml(path: Path) -> EmailItem:
 
     # First pass: find the body, so we know which content IDs it references
     # before deciding what counts as an attachment.
-    body_html = ""
-    body_text = ""
-    candidates = []
-    for part in _walk_parts(message):
-        if part.get_content_maintype() == "multipart":
-            continue
-        mimetype = part.get_content_type() or ""
-        filename = part.get_filename()
-        if not filename:
-            if mimetype == "text/html" and not body_html:
-                body_html = _decode_part(part).decode("utf-8", "replace")
-                continue
-            if mimetype == "text/plain" and not body_text:
-                body_text = _decode_part(part).decode("utf-8", "replace")
-                continue
-        candidates.append(part)
+    body_html, body_text, candidates = _collect_body(message)
 
     live = referenced_cids(body_html)
     attachments: list[Attachment] = []
@@ -622,14 +711,17 @@ def _read_eml(path: Path) -> EmailItem:
             )
             continue
 
-        # No filename and not referenced: nothing we can present as an attachment.
+        # No filename. A picture with a content id is a body resource; anything
+        # else is still content, so it is named from its type rather than
+        # dropped - a PDF part nobody named is still a PDF.
         if not filename:
             if content_id and mimetype.startswith("image/"):
                 attachments.append(
                     Attachment(content_id, _decode_part(part), mimetype,
                                content_id, inline=True, category="images")
                 )
-            continue
+                continue
+            filename = _name_for_unnamed(mimetype, len(attachments))
 
         # Note: a *named* part with an inline disposition is still an attachment.
         # Real mail is inconsistent about this, and dropping it would lose data.
