@@ -41,7 +41,7 @@ NOTICES_PATH = ROOT / "THIRD-PARTY-NOTICES.md"
 # network server, but the offer has to say where. Set this before you hand the
 # bundle to anybody; leaving it empty makes the notices fall back to wording
 # that assumes the source travelled with the build.
-SOURCE_URL = ""
+SOURCE_URL = "https://github.com/Xiaoyu-Ben-Wang/PDFConsolidator"
 
 # What actually ends up in the bundle, and what it does for us. Verified against
 # a real build by ``--verify``; a module in the bundle that is missing from this
