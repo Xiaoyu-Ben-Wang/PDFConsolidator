@@ -67,3 +67,10 @@ consolidator-errors.log
 .idea/
 Thumbs.db
 desktop.ini
+
+# ---- Working notes and experiments (kept locally, not published) ----
+PLAN.md
+RESEARCH-*.md
+CLAUDE.md
+.claude/
+_probe/

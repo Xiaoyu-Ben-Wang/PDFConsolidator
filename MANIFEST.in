@@ -7,7 +7,6 @@
 include LICENSE
 include THIRD-PARTY-NOTICES.md
 include README.md
-include PLAN.md
 include conftest.py
 
 graft LICENSES
