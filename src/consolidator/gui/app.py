@@ -9,9 +9,10 @@ import time
 import traceback
 from pathlib import Path
 
-# Threads the pipeline starts (its conversion pools) get the same generous stack
-# as the Qt workers: deep recursion on a malformed file must be an exception, not
-# a stack overflow that ends the process. Reserved address space, not memory.
+# Stack size for threads the pipeline starts (its conversion pools), matching
+# the Qt workers. Deep recursion on a malformed file then raises an exception
+# instead of overflowing the stack and ending the process. This reserves address
+# space, not memory.
 THREAD_STACK_BYTES = 16 * 1024 * 1024
 
 LOG_NAME = "consolidator-errors.log"
@@ -20,7 +21,7 @@ _log_handle = None
 
 
 def _open_log():
-    """The error log, beside the application if it is writable, else in scratch."""
+    """Open the error log beside the application, or in the working directory."""
     global _log_handle
     if _log_handle is not None:
         return _log_handle
@@ -47,17 +48,16 @@ def log_error(title: str, detail: str) -> None:
 
 
 def install_safety_nets(window_getter) -> None:
-    """Make an unexpected error a logged, visible message instead of a vanishing one.
+    """Log unhandled exceptions and show them in the status bar.
 
-    An exception escaping a Qt slot is printed to a console a windowed build does
-    not have, and the action the user took silently does nothing. It is logged
-    here and named in the status bar, and the application keeps running.
-    ``faulthandler`` writes the Python stack of a *native* crash to the same log,
-    which is the only trace such a crash would otherwise leave.
+    An exception raised in a Qt slot is otherwise printed to a console that a
+    windowed build does not have. Exceptions are logged, reported in the status
+    bar, and the application keeps running. ``faulthandler`` writes the Python
+    stack of native crashes to the same log.
     """
     handle = _open_log()
     if handle is not None:
-        # LibreOffice runs that produce nothing are described in the same log.
+        # LibreOffice runs that produce no output are logged to the same file.
         from .. import libreoffice
 
         libreoffice.failure_log = Path(handle.name)
@@ -113,13 +113,12 @@ def run(argv: list[str] | None = None, initial: list[str] | None = None) -> int:
     window = MainWindow()
     install_safety_nets(lambda: window)
 
-    # Scratch left by a run that ended abruptly is removed in the background.
+    # Remove scratch directories left by earlier runs, in the background.
     from .. import pipeline
 
     threading.Thread(target=pipeline.sweep_stale_scratch, daemon=True).start()
 
-    # Paths given on the command line are pre-loaded, so the app can be used as
-    # a shell extension target or launched with a selection.
+    # Load paths given on the command line, e.g. from a shell extension.
     if initial:
         from .. import pipeline
 
@@ -137,15 +136,14 @@ def run(argv: list[str] | None = None, initial: list[str] | None = None) -> int:
     code = app.exec()
 
     if window.workers_running():
-        # A worker that would not stop in time. Letting Python tear down its
-        # QThread while it runs makes Qt abort the process - a crash report for
-        # closing a window - so leave without the teardown. Nothing is lost:
-        # outputs are written atomically, and scratch the cleanup under way does
-        # not finish is swept on the next start (pipeline.sweep_stale_scratch).
+        # A worker did not stop in time. Destroying a running QThread makes Qt
+        # abort the process, so exit without teardown. Outputs are written
+        # atomically, and leftover scratch is removed on the next start
+        # (pipeline.sweep_stale_scratch).
         log_error("exit", "left with a background task still running")
         from .. import libreoffice
 
-        libreoffice.stop_all()      # nothing the worker started may outlive us
+        libreoffice.stop_all()      # end soffice processes the worker started
         try:
             sys.stdout.flush()
             sys.stderr.flush()

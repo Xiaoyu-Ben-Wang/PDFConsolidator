@@ -1,26 +1,20 @@
 """Outlook items (``.msg``) and email (``.eml``) as inputs.
 
-Two responsibilities:
+* **Parse** a message into an :class:`EmailItem` (headers, body, attachments).
+  ``.msg`` is read with ``extract-msg``, which parses the OLE2 compound file
+  directly without Outlook. ``.eml`` uses the standard library.
+* **Expand** an item into an ordered list of PDF *segments*: the body first,
+  then one segment per attachment that the policy selects.
 
-* **Parse** a message into an :class:`EmailItem` - headers, body and attachments.
-  ``.msg`` goes through ``extract-msg``, which reads the OLE2 compound file
-  directly, so Outlook is never involved. ``.eml`` uses the standard library.
-* **Expand** an item into an ordered list of PDF *segments*: the message body
-  first, then one segment per attachment that the policy says to extract.
+PDF attachments are copied byte-for-byte rather than re-rendered, so their pages
+and quality are unchanged.
 
-Attachments are the point of the feature: these are frequently emails carrying
-PDFs, and those PDFs belong in the assembled document. A PDF attachment is
-embedded **byte-for-byte** rather than re-rendered, so its page count and quality
-survive exactly.
+Inline images referenced by ``cid:`` from the body are part of the body and do
+not become separate pages (this keeps signature logos out of the output).
 
-Inline images referenced by ``cid:`` from the body are treated as part of the
-body and never become separate pages - otherwise every signature logo would.
-
-A message attached to a message is drilled into rather than listed: the nested
-item is parsed and expanded in place, giving its body and its own attachments
-their own pages, nested as deep as the policy allows. Those segments remember
-which message they came from, so the interface can nest them under the message
-that carried them and give each message its own colour.
+An attached message is parsed and expanded in place, up to the policy's depth
+limit. Its segments record which message they came from, so the interface can
+nest them under the carrying message.
 """
 
 from __future__ import annotations
@@ -44,8 +38,8 @@ IMAGE_EXTS = convert.IMAGE_EXTS
 OFFICE_EXTS = convert.OFFICE_EXTS
 WEB_EXTS = convert.WEB_EXTS
 TEXT_EXTS = convert.TEXT_EXTS
-# Every attachment that is a document the local engines can lay out, whatever the
-# engine: Word, Excel, PowerPoint, HTML, plain text, CSV.
+# Document types the local converters handle: Word, Excel, PowerPoint, HTML,
+# plain text, CSV.
 DOCUMENT_EXTS = convert.DOCUMENT_EXTS
 
 # Attachment categories the user can choose to extract.
@@ -60,12 +54,11 @@ class Attachment:
     content_id: str = ""
     inline: bool = False
     category: str = "other"
-    # An attached Outlook item, already parsed. Reading it straight from the
-    # carrier is what makes it reliable: exporting it to bytes and parsing those
-    # again fails on plenty of real items, and the failure used to lose it.
+    # An attached Outlook item, parsed directly from the carrier. Exporting it to
+    # bytes and parsing those again fails on many real items.
     item: "EmailItem | None" = None
-    # Why this attachment could not be read at all. It is still listed, and still
-    # becomes a row that says so - an attachment that vanishes is the worst case.
+    # Why this attachment could not be read. Unreadable attachments are still
+    # listed and shown as failed rows.
     error: str = ""
 
     @property
@@ -85,33 +78,30 @@ class EmailItem:
     attachments: list[Attachment] = field(default_factory=list)
     source: Path | None = None
     body_is_rtf_only: bool = False
-    # What kind of Outlook item this is ("Appointment", "Contact", "Task"...), and
-    # the fields that make it that kind - a meeting's time and place, a contact's
-    # numbers. Empty for ordinary mail, whose headers say everything.
+    # Outlook item kind ("Appointment", "Contact", "Task", ...) and its
+    # kind-specific fields, such as a meeting's time and place. Empty for
+    # ordinary mail.
     kind: str = ""
     details: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
 class ExtractionPolicy:
-    """Which attachment categories are pulled out, and the safety limits."""
+    """Which attachment categories to extract, and size and depth limits."""
 
     body: bool = True
     pdf: bool = True
     images: bool = True
-    # Office documents, web pages and plain text: anything that becomes pages as a
-    # document rather than as an image or a PDF.
+    # Office documents, web pages and plain text.
     documents: bool = True
-    # Attached messages are expanded by default: a forwarded email is ordinary
-    # mail, and the point of the feature is that its contents become pages. The
-    # depth and size limits below are what keep that from running away.
+    # Attached messages are expanded by default; the depth and size limits
+    # below bound the expansion.
     embedded: bool = True
     other: bool = False
 
     max_attachment_bytes: int = 64 * 1024 * 1024
     max_total_bytes: int = 256 * 1024 * 1024
-    # Forwards of forwards are common enough to matter: A carries B carries C
-    # carries D. Four levels covers that chain with room to spare.
+    # Maximum nesting depth for attached messages (forwards of forwards).
     max_depth: int = 4
 
     def wants(self, category: str) -> bool:
@@ -127,9 +117,8 @@ def categorise(filename: str, mimetype: str = "") -> str:
         return "pdf"
     if ext in IMAGE_EXTS or mimetype.startswith("image/"):
         return "images"
-    # Word, Excel, PowerPoint, HTML, plain text, CSV: all become pages as
-    # documents. Leaving text and web attachments out of this meant a mail
-    # carrying notes.txt or a saved page silently contributed nothing.
+    # Word, Excel, PowerPoint, HTML, plain text and CSV are all converted as
+    # documents.
     if ext in DOCUMENT_EXTS:
         return "documents"
     if ext in EMAIL_EXTS or mimetype.startswith("message/"):
@@ -152,23 +141,22 @@ def referenced_cids(html: str) -> set[str]:
 
 
 def _clean(value: str) -> str:
-    """Drop the NUL terminators that some ``.msg`` producers leave in strings.
+    """Remove NUL terminators that some ``.msg`` producers leave in strings.
 
-    Seen in a real Outlook export: every string property came back as
-    ``'image.png\\x00'``, ``'message/rfc822\\x00'``, ``'test\\x00'``. A NUL is not
-    cosmetic here - it makes the staged filename unopenable ("embedded null
-    character"), and it hides the extension, so ``email 1.msg\\x00`` was not
-    recognised as an email and the attached message was never opened.
+    Some exports return every string property NUL-terminated, for example
+    ``'image.png\\x00'``. A NUL makes a filename unopenable ("embedded null
+    character") and hides the extension, so ``email 1.msg\\x00`` would not be
+    recognised as an email.
     """
     return value.replace("\x00", "")
 
 
 def _safe(fn, default=""):
-    """Read a property that a malformed message may fail to provide.
+    """Read a property, returning ``default`` if it is missing or unreadable.
 
-    Real ``.msg`` files contain junk: undecodable headers, missing streams,
-    truncated properties, NUL-terminated strings. ``extract-msg`` raises on some
-    of them, and one bad field must not cost the user the whole message.
+    ``.msg`` files can contain undecodable headers, missing streams, truncated
+    properties and NUL-terminated strings. ``extract-msg`` raises on some of
+    these; one bad field should not prevent reading the rest of the message.
     """
     try:
         value = fn()
@@ -184,7 +172,7 @@ def _safe(fn, default=""):
 
 
 def _raw(fn):
-    """A property as it comes, or None if reading it fails."""
+    """Return a property unchanged, or None if reading it fails."""
     try:
         return fn()
     except Exception:
@@ -192,11 +180,11 @@ def _raw(fn):
 
 
 def _attachment_bytes(att) -> bytes:
-    """An attachment's bytes, whatever shape ``extract-msg`` hands back.
+    """Return an attachment's data as bytes.
 
-    An ordinary attachment gives ``bytes``. An attached *message* is handed back
-    as a ``Message`` object, which serialises through ``bytes()`` - and which has
-    to be serialised, because the file it produces is what gets parsed next.
+    ``extract-msg`` returns ``bytes`` for an ordinary attachment and a
+    ``Message`` object for an attached message, which is serialised with
+    ``bytes()``.
     """
     try:
         data = att.data
@@ -213,15 +201,13 @@ def _attachment_bytes(att) -> bytes:
 
 
 def _open_msg(path: Path):
-    """Open a ``.msg`` of any Outlook item class, tolerating what can be tolerated.
+    """Open a ``.msg`` of any Outlook item class in lenient mode.
 
-    ``extract_msg.Message`` with its defaults is strict, and strictness costs far
-    more than it protects: an attached Outlook item of a class it does not handle
-    (a document dragged into a mail folder is ``IPM.Document.*``, a recalled mail
-    is ``IPM.Outlook.Recall``), an attachment with a missing stream, or one it
-    simply does not implement made it raise while *opening the carrier* - so the
-    whole message, its body and every other attachment, was lost. Opened
-    leniently, the broken part becomes one attachment that says it is broken.
+    With default settings, ``extract-msg`` raises while opening the carrier if
+    an attachment is an unhandled item class (such as ``IPM.Document.*`` or
+    ``IPM.Outlook.Recall``), has a missing stream, or is unsupported. That loses
+    the whole message. In lenient mode the bad attachment is reported as broken
+    and the rest of the message is still read.
     """
     import extract_msg
     from extract_msg.enums import ErrorBehavior
@@ -231,14 +217,14 @@ def _open_msg(path: Path):
     try:
         return extract_msg.openMsg(str(path), strict=False, errorBehavior=lenient)
     except Exception:
-        # The last resort silences OLE defects too, which extract-msg warns can
-        # misread a damaged file - still better than not reading it at all.
+        # Last resort: also suppress OLE errors. extract-msg warns this can
+        # misread a damaged file.
         return extract_msg.openMsg(str(path), strict=False,
                                    errorBehavior=ErrorBehavior.SUPPRESS_ALL)
 
 
-# Outlook item classes, by prefix, and what to call them. Mail needs no name: it
-# is what everyone expects an email file to be.
+# Display names for Outlook item classes, matched by prefix. Mail classes map
+# to an empty name.
 _ITEM_KINDS = (
     ("ipm.note", ""),
     ("report", ""),
@@ -291,11 +277,10 @@ _META_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?([A-Za-z0-9_.:-]+)"
 
 
 def _decode_html(data) -> str:
-    """HTML body bytes as text, in the charset they were written in.
+    """Decode HTML body bytes using their actual charset.
 
-    Outlook stores the HTML body as bytes in whatever charset the sender used,
-    often windows-1252. Decoding everything as UTF-8 turned every accented letter
-    and curly quote of such a body into a replacement character.
+    Outlook stores the HTML body in the sender's charset, often windows-1252.
+    Tries UTF-8, then the ``<meta charset>`` declaration, then cp1252.
     """
     if data is None:
         return ""
@@ -315,17 +300,16 @@ def _decode_html(data) -> str:
     return _clean(data.decode("cp1252", "replace"))
 
 
-# Nesting that runs deeper than this is not mail any more; the expansion has its
-# own, lower, limit that the user controls.
+# Hard limit on parse nesting depth. Expansion has its own lower, user-set
+# limit (ExtractionPolicy.max_depth).
 _MAX_PARSE_DEPTH = 16
 
 
 def _item_from_msg(msg, source: Path | None, depth: int = 0) -> EmailItem:
-    """Everything the consolidator needs from one open Outlook item.
+    """Build an :class:`EmailItem` from an open Outlook item.
 
-    Works on every item class - a message, an appointment, a contact, a task, or
-    a class extract-msg has no model for - by falling back to the raw property
-    streams, which every class shares.
+    Works for any item class, including ones extract-msg has no model for, by
+    falling back to the raw property streams that all classes share.
     """
     message_class = str(_safe(lambda: msg.classType, "")).strip()
     kind = _item_kind(message_class)
@@ -333,7 +317,7 @@ def _item_from_msg(msg, source: Path | None, depth: int = 0) -> EmailItem:
     def stream(name: str) -> str:
         return str(_safe(lambda: msg.getStringStream(name), "")).strip()
 
-    # Read raw: _safe would decode the bytes as UTF-8 before the charset is known.
+    # Read raw: _safe would decode as UTF-8 before the charset is known.
     body_html = _decode_html(_raw(lambda: getattr(msg, "htmlBody"))
                              or _raw(lambda: msg.getStream("__substg1.0_10130102")))
     body_text = str(_safe(lambda: getattr(msg, "body"), "")
@@ -346,9 +330,8 @@ def _item_from_msg(msg, source: Path | None, depth: int = 0) -> EmailItem:
 
     details: list[tuple[str, str]] = []
     if kind:
-        # The fields that make an appointment an appointment - when, where, who -
-        # are what a printout of it has to show. extract-msg already knows them
-        # for every class it models; the ones mail headers cover are left out.
+        # Include kind-specific fields (time, location, attendees, ...) from
+        # extract-msg, minus those already shown as mail headers.
         _flatten_header(_safe(lambda: msg.headerFormatProperties, None), details)
         shown = {"from", "to", "cc", "subject", "sent", "date"}
         details = [(label, value) for label, value in details
@@ -371,8 +354,8 @@ def _item_from_msg(msg, source: Path | None, depth: int = 0) -> EmailItem:
     try:
         attachments = list(msg.attachments or [])
     except Exception as exc:
-        # Lenient opening makes this rare, but if the list itself cannot be read
-        # the message must still say that it had attachments nobody can see.
+        # If the attachment list cannot be read, record a placeholder so the
+        # failure is visible.
         item.attachments.append(Attachment(
             "attachments", b"", category="other",
             error="the attachments of this item could not be read (%s: %s)"
@@ -386,10 +369,10 @@ def _item_from_msg(msg, source: Path | None, depth: int = 0) -> EmailItem:
 
 
 def _msg_attachment(att, live: set[str], depth: int) -> Attachment:
-    """One extract-msg attachment, whatever kind it is, as an :class:`Attachment`.
+    """Convert an extract-msg attachment of any kind to an :class:`Attachment`.
 
-    Never returns nothing: an attachment that cannot be read is still returned,
-    with :attr:`Attachment.error` saying why, so it becomes a visible row.
+    Always returns an attachment. If it cannot be read, :attr:`Attachment.error`
+    holds the reason.
     """
     kind = type(att).__name__
     name = (
@@ -401,9 +384,9 @@ def _msg_attachment(att, live: set[str], depth: int) -> Attachment:
     mimetype = str(_safe(lambda: att.mimetype, "")).strip()
 
     if kind == "EmbeddedMsgAttachment":
-        # An attached Outlook item: a forwarded mail, a meeting, a contact, a
-        # task. It is parsed straight from the carrier - re-exporting it to bytes
-        # and reading those back is how such items went missing.
+        # An attached Outlook item (mail, meeting, contact, task). Parse it
+        # directly from the carrier; re-exporting to bytes and re-parsing is
+        # unreliable.
         nested_msg = _safe(lambda: att.data, None)
         if nested_msg is None:
             return Attachment(_with_email_extension(name or "attached item", ".msg"),
@@ -423,12 +406,12 @@ def _msg_attachment(att, live: set[str], depth: int) -> Attachment:
                                     "(%s: %s)" % (type(exc).__name__, exc))
         if not name:
             name = nested.subject or nested.kind or "attached item"
-        # An attached Outlook item is named after its subject, which may carry no
-        # extension at all - and extract-msg reports no MIME type for one.
+        # The name may be a subject with no extension, and extract-msg reports
+        # no MIME type for an attached item, so add ``.msg``.
         if not _has_email_extension(name):
             name = _with_email_extension(name, ".msg")
-        # The serialised copy is a convenience for anything that wants the file;
-        # the parsed item is what is used, so a failure here costs nothing.
+        # The serialised bytes are optional; the parsed item is what is used,
+        # so a failure here is ignored.
         data = _raw(lambda: nested_msg.exportBytes(allowBadEmbed=True))
         if not isinstance(data, (bytes, bytearray)):
             data = b""
@@ -451,8 +434,8 @@ def _msg_attachment(att, live: set[str], depth: int) -> Attachment:
     data = _attachment_bytes(att)
     name = name or "attachment"
     if data:
-        # image001, scan, ATT00001, file.dat: the name may say nothing, so the
-        # bytes decide what the attachment is.
+        # Names like image001, ATT00001 or file.dat are uninformative, so the
+        # type is determined from the content.
         name = convert.typed_name(name, data, mimetype)
     if not data:
         return Attachment(name, b"", mimetype, cid,
@@ -486,12 +469,11 @@ def _read_msg(path: Path) -> EmailItem:
 
 
 def _decode_part(part) -> bytes:
-    """The bytes of one part, including a whole attached message.
+    """Return the decoded bytes of a MIME part, including attached messages.
 
-    ``get_payload(decode=True)`` returns ``None`` for a ``message/rfc822`` part,
-    because its payload is a list rather than a string. An attached message has
-    to be re-serialised instead - otherwise a forwarded email arrives empty and
-    there is nothing to drill into.
+    ``get_payload(decode=True)`` returns ``None`` for a ``message/rfc822`` part
+    because its payload is a list, so an attached message is re-serialised
+    instead.
     """
     if part.get_content_maintype() == "message":
         payload = part.get_payload()
@@ -518,23 +500,21 @@ def _has_email_extension(name: str) -> bool:
 
 
 def _with_email_extension(name: str, fallback: str = ".eml") -> str:
-    """Give an attached message a name that says it is mail.
+    """Replace an attached message's extension with an email extension.
 
-    The extension is what chooses the parser for the staged copy, so a forwarded
-    message called ``forwarded`` or ``email.dat`` has to end up as something the
-    reader recognises - otherwise it is rejected later as "not an email file".
+    The extension selects the parser for the staged copy. Without it, a message
+    named ``forwarded`` or ``email.dat`` is rejected as "not an email file".
     """
     stem = Path(name or "").stem.strip() or "attached message"
     return "%s%s" % (stem, fallback)
 
 
 def _attached_message_name(part) -> str:
-    """A name for an attached message that arrived without one.
+    """Return a filename for an attached message that has none.
 
     Gmail and Outlook export a forwarded message as a ``message/rfc822`` part
-    with **no filename**, so there is nothing to call it. Giving it the inner
-    message's subject - with the .eml extension that marks it as an email - is
-    what lets it be recognised, staged and shown like any other attachment.
+    with no filename. The name is built from the inner message's subject plus
+    ``.eml``.
     """
     subject = ""
     payload = part.get_payload()
@@ -545,13 +525,11 @@ def _attached_message_name(part) -> str:
 
 
 def _walk_parts(part):
-    """The parts of *this* message, with an attached message kept whole.
+    """Yield the leaf parts of this message, keeping attached messages whole.
 
-    ``Message.walk()`` descends into an attached ``message/rfc822``, which
-    reports the attachments *of* a forwarded email as attachments of the email
-    that forwarded it. That duplicates them, and it destroys the nesting the
-    expansion then has to reconstruct - a forwarded email's own attachment would
-    show up as a sibling of the forwarded email instead of inside it.
+    ``Message.walk()`` descends into attached ``message/rfc822`` parts, which
+    would list a forwarded email's attachments as attachments of the outer
+    message, duplicating them and losing the nesting.
     """
     if part.get_content_maintype() == "multipart":
         for child in part.get_payload():
@@ -561,7 +539,7 @@ def _walk_parts(part):
 
 
 def _part_text(part) -> str:
-    """A text part decoded in its declared charset."""
+    """Decode a text part using its declared charset."""
     data = _decode_part(part)
     charset = part.get_content_charset() or "utf-8"
     try:
@@ -571,7 +549,7 @@ def _part_text(part) -> str:
 
 
 def _is_body_text(part) -> bool:
-    """An unnamed text part that is not marked as an attachment reads as body."""
+    """Return whether a part is body text: unnamed text, not an attachment."""
     if part.get_content_type() not in ("text/plain", "text/html"):
         return False
     if part.get_filename():
@@ -580,7 +558,7 @@ def _is_body_text(part) -> bool:
 
 
 def _alternative_choice(part):
-    """The richest rendering of a ``multipart/alternative``: HTML, else the last."""
+    """Pick the ``multipart/alternative`` part to render: HTML, else the last."""
     children = [c for c in part.get_payload() if hasattr(c, "get_content_type")]
     for child in children:
         if child.get_content_type() == "text/html":
@@ -597,13 +575,11 @@ _BODY_BREAK = "<br>"
 
 
 def _collect_body(message):
-    """The whole body of a message, and every part that is not body.
+    """Return ``(body_html, body_text, other_parts)`` for a message.
 
-    Taking only the *first* text part as the body lost the rest: Apple Mail and
-    many phones split a body around an inline picture into text, image, text, and
-    everything after the picture was dropped without a trace. Body text parts are
-    therefore joined, in order. In a ``multipart/alternative`` only the richest
-    rendering is body - the others say the same thing again.
+    All body text parts are joined in order, because Apple Mail and many phone
+    clients split the body around inline images (text, image, text). In a
+    ``multipart/alternative`` only the preferred rendering is used.
     """
     html_pieces: list[str] = []
     text_pieces: list[str] = []
@@ -622,7 +598,7 @@ def _collect_body(message):
                     if child is chosen:
                         visit(child)
                     elif _is_body_text(child) and child.get_content_type() == "text/plain":
-                        # Not rendered, but kept as the plain-text form of the body.
+                        # Not rendered; kept as the plain-text form of the body.
                         alternative_text.append(_part_text(child))
                     elif child.get_filename():
                         # A named part inside an alternative is a real file.
@@ -662,7 +638,7 @@ def _name_for_unnamed(mimetype: str, index: int) -> str:
         "image/jpeg": ".jpg", "image/png": ".png", "image/tiff": ".tif",
     }.get(mimetype) or mimetypes.guess_extension(mimetype or "") or ""
     if extension == ".bin":
-        extension = ""          # says nothing; the content will decide
+        extension = ""          # uninformative; the content decides the type
     return "part%d%s" % (index + 1, extension)
 
 
@@ -677,8 +653,8 @@ def _read_eml(path: Path) -> EmailItem:
         value = message.get(name, "")
         return str(value).strip()
 
-    # First pass: find the body, so we know which content IDs it references
-    # before deciding what counts as an attachment.
+    # Find the body first, to know which content IDs it references before
+    # classifying attachments.
     body_html, body_text, candidates = _collect_body(message)
 
     live = referenced_cids(body_html)
@@ -690,22 +666,17 @@ def _read_eml(path: Path) -> EmailItem:
         content_id = _cid_plain(part.get("Content-ID", "") or "")
         disposition = (part.get_content_disposition() or "").lower()
 
-        # An attached message is an email whatever it is called. Mail exported by
-        # Gmail and Outlook routinely carries the forwarded message as a
-        # ``message/rfc822`` part with no filename at all; treating "no filename"
-        # as "nothing to present" dropped the entire forward, silently.
+        # Gmail and Outlook often export a forwarded message as a
+        # ``message/rfc822`` part with no filename; give it one.
         if not filename and mimetype.startswith("message/"):
             filename = _attached_message_name(part)
 
-        # ...and a message part is often *named* something that says nothing about
-        # being mail ("forwarded", "attached", "email.dat"). The extension decides
-        # which parser opens the staged copy, so a message without an email
-        # extension is given one here rather than being refused later as
-        # "not an email file".
+        # A message part may be named without an email extension ("forwarded",
+        # "email.dat"). The extension selects the parser, so add one.
         if mimetype.startswith("message/") and not _has_email_extension(filename):
             filename = _with_email_extension(filename)
 
-        # An image the body embeds by cid is part of the body, never its own page.
+        # An image the body references by cid is part of the body, not a page.
         if content_id and content_id in live and mimetype.startswith("image/"):
             attachments.append(
                 Attachment(
@@ -719,9 +690,8 @@ def _read_eml(path: Path) -> EmailItem:
             )
             continue
 
-        # No filename. A picture with a content id is a body resource; anything
-        # else is still content, so it is named from its type rather than
-        # dropped - a PDF part nobody named is still a PDF.
+        # No filename: an image with a content ID is a body resource; any other
+        # part is named from its MIME type and kept.
         if not filename:
             if content_id and mimetype.startswith("image/"):
                 attachments.append(
@@ -735,8 +705,8 @@ def _read_eml(path: Path) -> EmailItem:
         if not mimetype.startswith("message/"):
             filename = convert.typed_name(filename, data, mimetype)
 
-        # Note: a *named* part with an inline disposition is still an attachment.
-        # Real mail is inconsistent about this, and dropping it would lose data.
+        # A named part with an inline disposition is still treated as an
+        # attachment, since mail clients set disposition inconsistently.
         attachments.append(
             Attachment(
                 filename=filename,
@@ -766,7 +736,7 @@ _OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
 def _looks_like_msg_bytes(data: bytes) -> bool:
-    """A ``.msg`` is an OLE2 compound file, which starts with a fixed signature."""
+    """Return whether data starts with the OLE2 signature used by ``.msg``."""
     return data[:8] == _OLE_MAGIC
 
 
@@ -782,11 +752,10 @@ _HEADER_LINE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*:")
 
 
 def _looks_like_eml(path: Path) -> bool:
-    """An RFC 822 message: header lines, then a blank line, then the body.
+    """Return whether a file looks like RFC 822: headers, a blank line, a body.
 
-    Deliberately loose. The only question being answered is whether a file whose
-    name says nothing is mail at all, and a false yes costs nothing - the parser
-    is about to look at it anyway.
+    The check is loose on purpose; a false positive is harmless because the
+    parser reads the file next anyway.
     """
     try:
         head = path.read_bytes()[:8192]
@@ -799,10 +768,10 @@ def _looks_like_eml(path: Path) -> bool:
 
 
 def _is_embedded_message(att, mimetype: str) -> bool:
-    """Whether an extract-msg attachment is a message rather than a file.
+    """Return whether an extract-msg attachment is a message rather than a file.
 
-    An attached Outlook item comes back as ``EmbeddedMsgAttachment``, and reports
-    **no MIME type at all** - so its class is the only signal that it is mail.
+    An attached Outlook item is an ``EmbeddedMsgAttachment`` with no MIME type,
+    so its class is the only indicator.
     """
     if mimetype.startswith("message/"):
         return True
@@ -812,10 +781,9 @@ def _is_embedded_message(att, mimetype: str) -> bool:
 def read_message(path: Path) -> EmailItem:
     """Parse a ``.msg`` or ``.eml`` file.
 
-    The extension is the first guess, not the only one: an attached message is
-    routinely named by whatever the sending client felt like, so a file that is
-    plainly an OLE container or plainly RFC 822 is read as one rather than being
-    refused with "not an email file" - which is what a user saw.
+    The extension is checked first. Otherwise the content is checked, because
+    attached messages often have arbitrary names: an OLE2 file is read as
+    ``.msg`` and an RFC 822 file as ``.eml``.
     """
     path = Path(path)
     ext = path.suffix.lower()
@@ -847,24 +815,23 @@ pre.body { font-family: Consolas, monospace; font-size: 10pt; white-space: pre-w
 
 
 def body_images(item: EmailItem) -> list[Attachment]:
-    """Inline images the body actually refers to, in a stable order."""
+    """Return the inline images the body references, in attachment order."""
     live = referenced_cids(item.body_html)
     return [att for att in item.attachments
             if att.inline and att.data and _cid_plain(att.content_id) in live]
 
 
-# Beyond this, a picture is left as a reference rather than inlined: the HTML is
-# held in memory whole, and base64 costs a third again in size.
+# Images larger than this are not inlined: the HTML is held in memory, and
+# base64 adds about 33% to the size.
 MAX_INLINE_BYTES = 32 * 1024 * 1024
 
 
 def body_image_references(item: EmailItem) -> dict[str, str]:
-    """Map each content id to a ``data:`` URI holding the image itself.
+    """Map each content ID to a ``data:`` URI containing the image.
 
-    Measured against the bundled LibreOffice: a relative filename and an absolute
-    ``file:///`` URL both produced a page with **no** image at all, while a data URI
-    produced it. Since the image is already in memory, embedding it is also the
-    form that needs no temporary files and no cleanup.
+    The bundled LibreOffice does not render images referenced by relative
+    filename or ``file:///`` URL, but does render ``data:`` URIs. This also
+    avoids temporary files.
     """
     references: dict[str, str] = {}
     for attachment in body_images(item):
@@ -878,13 +845,12 @@ def body_image_references(item: EmailItem) -> dict[str, str]:
 
 
 def resolve_cids(html: str, references: dict[str, str]) -> str:
-    """Point ``cid:`` references at something a renderer can actually open.
+    """Replace ``cid:`` image references with something a renderer can open.
 
-    The body arrives with ``<img src="cid:74bc873b-...">``. Nothing can resolve
-    that outside a mail client, so the picture vanished from the body page - and
-    because inline images are deliberately not extracted as pages of their own, it
-    appeared nowhere at all in the output. Rewriting each reference to the image's
-    own bytes is what puts it back.
+    ``cid:`` URLs point at MIME parts and cannot be resolved outside a mail
+    client. Inline images are not extracted as separate pages, so each
+    reference is replaced with the URI from ``references`` to keep the image
+    in the body.
     """
     if not references:
         return html
@@ -899,10 +865,9 @@ def body_html(item: EmailItem, policy: ExtractionPolicy | None = None,
               references: dict[str, str] | None = None) -> str:
     """Build a self-contained HTML document for the message body.
 
-    Headers are composed here rather than trusted to any renderer, and the list
-    of attachments is included so nothing is silently invisible. ``references``
-    maps a content id to a URL - a filename beside the HTML - so that inline
-    pictures survive rendering; without it the body is passed through untouched.
+    Includes a header table and a list of all attachments. ``references`` maps
+    content IDs to URLs used to replace ``cid:`` image references; without it
+    the body HTML is used unchanged.
     """
     parts: list[str] = []
     parts.append("<html><head><meta charset='utf-8'><style>%s</style></head><body>" % _CSS)
@@ -968,15 +933,15 @@ def _human_size(size: int) -> str:
 
 
 def _safe_name(name: str, fallback: str) -> str:
-    """A filename safe to write into the scratch directory."""
+    """Return a filename safe to write into the scratch directory."""
     stem = Path(name or "").name
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
     return stem or fallback
 
 
 def _write_attachment(att: Attachment, directory: Path, index: int) -> Path:
-    # The extension comes from the sanitised name rather than the raw one: a NUL
-    # or any other stray character in the suffix would make the path unopenable.
+    # Take the extension from the sanitised name; a NUL or other invalid
+    # character in the raw suffix would make the path unopenable.
     safe = _safe_name(att.filename, "file")
     suffix = Path(safe).suffix
     if not suffix:
@@ -998,10 +963,9 @@ def write_body_html(item: EmailItem, dest: Path,
                     inline_images: bool = True) -> Path:
     """Write the message body as a standalone HTML file.
 
-    Inline pictures the body refers to are embedded in the document itself, so what
-    the message actually contained ends up on the page instead of a gap.
-    ``inline_images=False`` leaves them out, for a retry when a body with them
-    could not be rendered.
+    Inline images referenced by the body are embedded as ``data:`` URIs.
+    ``inline_images=False`` omits them, for retrying a body that failed to
+    render with them.
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1011,7 +975,7 @@ def write_body_html(item: EmailItem, dest: Path,
 
 
 class _TextOfHtml(HTMLParser):
-    """The readable text of an HTML body, with its paragraph and line breaks."""
+    """Extract the text of an HTML body, keeping paragraph and line breaks."""
 
     BREAKS = {"br", "p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6",
               "table", "blockquote", "pre", "hr"}
@@ -1053,10 +1017,9 @@ def html_to_text(html: str) -> str:
 
 
 def body_text_page(item: EmailItem) -> str:
-    """The message as plain text: headers, body, attachment list.
+    """Return the message as plain text: headers, body, attachment list.
 
-    The last resort for a body LibreOffice cannot render - formatting is lost,
-    the words are not.
+    Used as the fallback when LibreOffice cannot render the body.
     """
     lines = []
     if item.kind:
@@ -1077,25 +1040,23 @@ def body_text_page(item: EmailItem) -> str:
     return "\n".join(lines)
 
 
-# Pause before retrying a body that produced nothing: the usual cause is a
-# machine still settling after other soffice processes exited.
+# Pause in seconds before retrying a body that produced nothing, to let other
+# soffice processes finish exiting.
 BODY_RETRY_PAUSE = 2.0
 
 
 def render_body_reliably(item: EmailItem, workdir: Path, dest: Path,
                          first_error: str | None = None) -> str:
-    """Render a body, falling back step by step until it exists. Returns a note.
+    """Render a body to PDF, trying fallbacks in order. Returns a note.
 
-    1. LibreOffice, as usual (skipped when ``first_error`` says a batch already
-       tried and failed);
-    2. LibreOffice again, *alone* - no other soffice running - after a pause;
-    3. LibreOffice alone without the inline pictures, in case one of them is
-       what it cannot cope with;
-    4. plain text, laid out without LibreOffice at all.
+    1. LibreOffice (skipped when ``first_error`` is set, meaning a batch
+       already failed);
+    2. LibreOffice again, with no other soffice running, after a pause;
+    3. LibreOffice alone, without inline images;
+    4. plain text, rendered without LibreOffice.
 
-    The note is empty if the first attempt worked, and otherwise says what the
-    page is - so a body rendered as plain text says so instead of looking like
-    the original.
+    The note is empty if the first attempt succeeded; otherwise it describes
+    which fallback produced the page.
     """
     import time
 
@@ -1138,9 +1099,9 @@ def render_body_pdf(item: EmailItem, workdir: Path, dest: Path, timeout: int = 3
                     inline_images: bool = True) -> Path:
     """Render one message body to a PDF by way of HTML.
 
-    Used for single conversions and for nested messages. Callers converting many
-    messages should write the HTML with :func:`write_body_html` and convert them
-    all in one batch instead - LibreOffice start-up dominates otherwise.
+    Used for single conversions and nested messages. To convert many messages,
+    write the HTML with :func:`write_body_html` and convert in one batch to
+    avoid repeated LibreOffice start-up.
     """
     from . import libreoffice
 
@@ -1184,18 +1145,15 @@ def expand_to_segments(
     """Expand a parsed message into an ordered list of segments.
 
     Body first, then attachments in their original order. PDF attachments are
-    copied byte-for-byte; everything else is routed through the normal converter
-    so an attached spreadsheet becomes pages too.
+    copied byte-for-byte; other attachments go through the normal converter.
 
-    ``body_pdf`` lets the caller supply an already-rendered body, which is how a
-    batch of messages shares a single LibreOffice invocation.
+    ``body_pdf`` supplies an already-rendered body, so a batch of messages can
+    share one LibreOffice invocation.
 
-    An attached message is *drilled into*: the nested message is parsed and
-    expanded in place, and its segments are tagged with ``group``/``parent``/
-    ``group_label`` so the interface can nest them and colour them separately
-    rather than flattening them into the parent's rows. ``group``, ``parent`` and
-    ``group_label`` are supplied by the caller for a nested message and describe
-    that message; for a top-level one they default to the item itself.
+    An attached message is parsed and expanded recursively. Its segments are
+    tagged with ``group``, ``parent`` and ``group_label`` so the interface can
+    nest them. The caller passes these for a nested message; for a top-level
+    message they default to the item itself.
     """
     from . import convert
     from .model import ATTACHMENT, BODY, DOCUMENT, Segment
@@ -1211,9 +1169,9 @@ def expand_to_segments(
     segments: list = []
     total_bytes = 0
 
-    # The message these pages belong to, the message that carried it, and what to
-    # call it. The label prefix is the group name without its extension, so a row
-    # can drop it and show just the part ("body", "invoice.pdf").
+    # This message's group, its parent group, and its display name. The label
+    # prefix is the group name without its extension, so a row can strip it and
+    # show just the part ("body", "invoice.pdf").
     own_group = group or str(item.source or source)
     own_parent = parent
     own_label = group_label or source.name
@@ -1233,8 +1191,8 @@ def expand_to_segments(
         if body_pdf is not None and body_error is None and Path(body_pdf).exists():
             add(label, BODY, Path(body_pdf), True)
         else:
-            # Rendered here, alone if need be, and as plain text as a last
-            # resort: one LibreOffice failure must not cost the message its body.
+            # Render here with fallbacks (solo LibreOffice run, then plain text)
+            # so a single LibreOffice failure does not lose the body.
             dest = workdir / ("%s_body.pdf" % stem)
             try:
                 note = render_body_reliably(item, workdir / "body", dest,
@@ -1251,11 +1209,11 @@ def expand_to_segments(
         category = att.category
 
         if att.inline:
-            # Inline images belong to the body; never separate pages.
+            # Inline images are part of the body, not separate pages.
             continue
 
         if att.error:
-            # Unreadable, but present: a row that says so, never a gap.
+            # Unreadable attachment: record a failed segment with the reason.
             add(label, ATTACHMENT, None, False, att.error)
             emit("  FAIL %s - %s" % (att.filename, att.error))
             continue
@@ -1287,21 +1245,20 @@ def expand_to_segments(
                         "nested message deeper than %d levels" % policy.max_depth)
                     continue
                 if att.item is not None:
-                    # Parsed from the carrier already; the staged copy (which may
-                    # be empty, if the item would not serialise) only names it.
+                    # Already parsed from the carrier. The staged copy (empty if
+                    # the item did not serialise) only provides its name.
                     nested = replace(att.item)
                 else:
                     nested = read_message(staged)
                 nested.source = staged
-                # An embedded message's body *is* its content, so render it even
-                # when the top-level body is switched off. Otherwise enabling
-                # "embedded messages" would extract nothing at all.
+                # Always render an embedded message's body, even when the
+                # top-level body is disabled; otherwise nothing would be extracted.
                 nested_policy = replace(policy, body=True)
                 inner = expand_to_segments(
                     nested, workdir / ("nested%03d" % index), nested_policy,
                     page_size=page_size, depth=depth + 1, on_event=on_event,
-                    # The nested message is its own group, inside this one, and is
-                    # named after the attachment that carried it.
+                    # The nested message is a child group, named after the
+                    # attachment that carried it.
                     group=str(staged),
                     parent=own_group,
                     group_label=att.filename or staged.name,
@@ -1318,7 +1275,7 @@ def expand_to_segments(
             add(label, ATTACHMENT, None, False, "%s: %s" % (type(exc).__name__, exc))
             emit("  FAIL %s - %s" % (att.filename, exc))
 
-    # Anything the policy kept but that has no converter still deserves a mention.
+    # Record a failed segment if the message produced nothing.
     if not segments:
         add(source.stem, DOCUMENT, None, False, "nothing to extract")
 

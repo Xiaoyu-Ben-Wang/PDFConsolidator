@@ -1,13 +1,12 @@
-"""Install packages without relying on pip's build machinery.
+"""Install packages without pip's build step.
 
-Some dependencies this project needs publish source-only distributions whose
-``setup.py`` cannot be built in this environment - notably
-``red-black-tree-mod``, a hard import-time dependency of ``extract-msg``. pip
-fails outright on them.
+Some dependencies publish only source distributions whose ``setup.py`` does
+not build in this environment, notably ``red-black-tree-mod``, which
+``extract-msg`` imports. pip fails on them.
 
-For a *pure-Python* sdist no build step is actually required: unpacking the
-archive and copying its importable packages into site-packages is sufficient.
-This script does exactly that, and handles wheels the same way.
+A pure-Python sdist needs no build step: unpacking it and copying its
+importable packages into site-packages is enough. This script does that, and
+unpacks wheels directly.
 
 Usage::
 
@@ -24,8 +23,9 @@ import tarfile
 import urllib.request
 import zipfile
 
-# Best-first for a standard (non free-threaded) CPython 3.14 on win_amd64.
-# The cp314-cp314t tag is the FREE-THREADED ABI and must not be selected.
+# Wheel tags in order of preference for standard (not free-threaded) CPython
+# 3.14 on win_amd64. The cp314-cp314t tag is the free-threaded ABI and must not
+# be selected.
 WHEEL_PREFERENCE = (
     "cp314-cp314-win_amd64",
     "cp314-abi3-win_amd64",
@@ -87,7 +87,7 @@ def install_sdist(archive: str, target: str) -> list[str]:
             if os.path.exists(os.path.join(candidate, "__init__.py")):
                 shutil.copytree(candidate, os.path.join(target, name), dirs_exist_ok=True)
                 copied.append(name)
-                dirs.remove(name)  # do not descend into a package we just copied
+                dirs.remove(name)  # skip the contents of a copied package
         for name in files:
             # Single-module distributions ship a bare .py file.
             if name.endswith(".py") and name != "setup.py":

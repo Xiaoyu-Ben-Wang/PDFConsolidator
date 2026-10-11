@@ -1,13 +1,12 @@
 """The About box and the licences window.
 
-The GPL's own advice is that a GUI should offer its notices from an about box,
-and the LGPL wants its text reachable rather than merely present on disk. The
-About box carries the copyright and the terms; the licences window shows
-``THIRD-PARTY-NOTICES.md`` with the full licence texts one click away.
+The GPL recommends that a GUI show its notices in an About box, and the LGPL
+requires its text to be reachable from the program. The About box shows the
+copyright and terms; the licences window shows ``THIRD-PARTY-NOTICES.md`` and the
+full licence texts.
 
-Every document is read from the bundle (or the repository checkout when running
-from source), so there is a single copy of each text and no chance of the
-interface quoting a licence the build did not ship.
+Documents are read from the bundle (or the repository checkout when running from
+source), so the interface only shows licences that the build includes.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ INTRO = (
 
 
 def app_root() -> Path:
-    """Where the licence documents live: beside the executable, or the checkout."""
+    """Return the folder with the licence documents (executable or checkout)."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     # src/consolidator/gui/licences.py -> the repository root.
@@ -45,7 +44,7 @@ def version() -> str:
 
 
 def documents() -> list[tuple[str, Path]]:
-    """(title, path) for every licence document that is actually present."""
+    """Return (title, path) for each licence document that exists."""
     root = app_root()
     candidates = [
         ("Third-party notices", root / "THIRD-PARTY-NOTICES.md"),
@@ -56,10 +55,10 @@ def documents() -> list[tuple[str, Path]]:
 
 
 def about_text() -> str:
-    """The About box, kept short: what it is, who wrote it, and the terms.
+    """Return the About box HTML: description, copyright and licence terms.
 
-    The words that matter legally are the licence name and the warranty
-    disclaimer; everything else belongs in the licences window, one button away.
+    Includes the licence name and warranty disclaimer; full texts are in the
+    licences window.
     """
     return """<h2>PDF Consolidator {version}</h2>
 <p>Turn a mixed folder of documents into one merged PDF.</p>
@@ -76,11 +75,9 @@ warranty. The authors are not liable for any damages.</p>
 
 
 class AboutDialog(QDialog):
-    """The about box: what this is, who wrote it, and under what terms.
+    """About dialog showing the version, copyright and licence terms.
 
-    The licensing is the point of it, so the terms are on the face of the dialog
-    and the full inventory is one button away - which is what the GPL means by
-    offering the notices from an about box.
+    Includes a button that opens the licences window.
     """
 
     def __init__(self, parent=None) -> None:
@@ -113,7 +110,7 @@ class AboutDialog(QDialog):
 
 
 class LicencesDialog(QDialog):
-    """A plain viewer: a document, buttons to switch, and a close button."""
+    """Viewer for the licence documents, with a button per document."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -169,7 +166,7 @@ class LicencesDialog(QDialog):
         else:
             self.view.setPlainText(text)
         self.view.verticalScrollBar().setValue(0)
-        # The buttons already name each document; this confirms which is showing.
+        # Show which document is displayed and its path.
         self.where.setText("%s \u2014 %s" % (title, path))
 
 

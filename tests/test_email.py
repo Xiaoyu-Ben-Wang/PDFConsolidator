@@ -54,7 +54,7 @@ def test_inline_image_is_not_an_attachment_page(emails):
 
 
 def test_named_inline_part_is_still_an_attachment(tmp_path):
-    """Real mail marks genuine attachments 'inline'; dropping them loses data."""
+    """A named part marked 'inline' is still an attachment; real mail does this."""
     from email.message import EmailMessage
 
     message = EmailMessage()
@@ -62,7 +62,7 @@ def test_named_inline_part_is_still_an_attachment(tmp_path):
     message.set_content("see file")
     message.add_attachment(b"%PDF-1.4 fake", maintype="application", subtype="pdf",
                            filename="report.pdf")
-    # Force the dishonest disposition that caused the original bug.
+    # Mark the attachment as inline.
     message.get_payload()[-1].replace_header(
         "Content-Disposition", 'inline; filename="report.pdf"')
 
@@ -115,24 +115,23 @@ class FakeAttachment:
 
 
 def test_nul_terminated_strings_from_a_msg_are_cleaned():
-    """Measured on a real export: 'test\\x00', 'image.png\\x00', 'message/rfc822\\x00'."""
+    """Trailing NULs are stripped, e.g. 'test\\x00', 'image.png\\x00', 'message/rfc822\\x00'."""
     assert email_items._clean("image.png\x00") == "image.png"
     assert email_items._safe(lambda: "email 1.msg\x00") == "email 1.msg"
     assert email_items._safe(lambda: b"test\x00") == "test"
 
 
 def test_a_nul_terminated_name_still_identifies_an_email():
-    """'email 1.msg\\x00' is not a '.msg' by suffix, which is the whole bug.
+    """A name like 'email 1.msg\\x00' is classified as an email once cleaned.
 
-    Left uncleaned, the attached message was classified as a stranger and never
-    opened - the attached email simply did not appear.
+    Uncleaned, its suffix is not '.msg', so the attached message is not opened.
     """
     assert email_items.categorise("email 1.msg", "") == "embedded"
     assert email_items.categorise(email_items._clean("email 1.msg\x00"), "") == "embedded"
 
 
 def test_an_attachment_with_a_stray_terminator_is_still_staged(tmp_path):
-    """A NUL in the suffix made the staged path unopenable."""
+    """A NUL in the suffix is removed so the staged file can be opened."""
     att = email_items.Attachment("image.png\x00", b"PNG" * 4, "image/png\x00")
     path = email_items._write_attachment(att, tmp_path, 0)
 
@@ -159,7 +158,7 @@ def test_an_attached_message_is_serialised_for_staging():
 
 
 def test_msg_samples_keep_every_attachment(messages):
-    """Nothing may be dropped or left with a stray NUL."""
+    """No attachment is dropped or left with a stray NUL."""
     for path in sorted(messages.glob("*.msg")):
         item = email_items.read_message(path)
         assert "\x00" not in item.subject
@@ -176,7 +175,7 @@ def test_msg_samples_keep_every_attachment(messages):
 
 @requires_lo
 def test_pdf_attachment_is_merged_verbatim(emails, tmp_path):
-    """The PDF must be byte-identical, so its page count is exact."""
+    """The PDF is copied byte for byte, so its page count is exact."""
     item = email_items.read_message(emails / "with_pdf.eml")
     policy = email_items.ExtractionPolicy(body=False)
 
@@ -251,11 +250,10 @@ def forwarded_chain(depth: int):
 
 
 def test_attached_message_keeps_its_content(tmp_path):
-    """An attached message must arrive whole, not as an empty part.
+    """An attached message is written out with its full content.
 
-    ``get_payload(decode=True)`` returns None for ``message/rfc822``, so a
-    forwarded email used to be written out as a zero-byte file and then read back
-    as an empty message - nothing to drill into.
+    ``get_payload(decode=True)`` returns None for ``message/rfc822``, so a naive
+    write produces a zero-byte file that reads back as an empty message.
     """
     path = tmp_path / "forwarded.eml"
     path.write_bytes(forwarded_chain(1).as_bytes())
@@ -288,8 +286,7 @@ def test_nested_messages_are_tagged_with_their_place_in_the_chain(tmp_path):
     assert all(s.group_label == "forwarded1.eml" for s in first)
     assert all(s.parent == first[0].group for s in second)
     assert all(s.group_label == "forwarded0.eml" for s in second)
-    # Labels stay local to their own message: the chain is the navigator's job,
-    # and repeating it in every label made rows unreadable.
+    # Labels name only their own message; the navigator shows the nesting chain.
     assert all(" > " not in s.label for s in segments)
 
 
@@ -309,7 +306,7 @@ def test_nesting_beyond_the_depth_limit_is_reported(tmp_path):
 
 @requires_lo
 def test_nested_body_becomes_pages(emails, tmp_path):
-    """The whole point: a forwarded message's own body yields pages."""
+    """A forwarded message's own body yields pages."""
     item = email_items.read_message(emails / "nested.eml")
     segments = email_items.expand_to_segments(
         item, tmp_path, email_items.ExtractionPolicy(body=False, embedded=True)
@@ -350,7 +347,7 @@ def message_with_attachment(subject: str, body: str, payload, filename: str):
 
 
 def test_an_attached_message_keeps_its_own_attachments(tmp_path):
-    """A carries B; B carries a PDF of its own. Both survive, one level apart."""
+    """A carries B and B carries a PDF; both are kept, one level apart."""
     from email.message import EmailMessage
 
     note = _pdf(tmp_path / "note.pdf", 2)
@@ -406,12 +403,10 @@ def test_an_attached_message_keeps_its_own_attachments(tmp_path):
 
 
 def test_an_attached_message_without_a_filename_is_still_an_email(tmp_path):
-    """The shape Gmail and Outlook actually export a forward in.
+    """A ``message/rfc822`` part without a filename is read as an email.
 
-    Measured on a real export: the forwarded message arrives as a
-    ``message/rfc822`` part with **no filename** and an attachment disposition.
-    Treating "no filename" as "nothing to present" dropped the entire forward,
-    silently - the body of the message the user cared about simply was not there.
+    Gmail and Outlook export a forward as a ``message/rfc822`` part with no
+    filename and an attachment disposition. Guards against dropping such a forward.
     """
     from email.message import EmailMessage
 
@@ -423,7 +418,7 @@ def test_an_attached_message_without_a_filename_is_still_an_email(tmp_path):
     outer = EmailMessage()
     outer["Subject"] = "hi there"
     outer.set_content("see below")
-    outer.add_attachment(inner)          # no filename: exactly the real case
+    outer.add_attachment(inner)          # no filename, as in real exports
 
     path = tmp_path / "hi there.eml"
     path.write_bytes(outer.as_bytes())
@@ -495,7 +490,7 @@ def _inline_image_email(tmp_path: Path) -> Path:
 
 
 def test_an_inline_image_is_referenced_not_left_as_a_cid(tmp_path):
-    """A body saying src="cid:..." renders as a broken image everywhere else."""
+    """A cid: image reference in the body is replaced with the image data."""
     source = _inline_image_email(tmp_path)
     item = email_items.read_message(source)
 
@@ -509,15 +504,15 @@ def test_an_inline_image_is_referenced_not_left_as_a_cid(tmp_path):
     written = html_path.read_text(encoding="utf-8")
 
     assert "cid:pic@example" not in written, "the reference must be resolved"
-    # A data URI, not a filename: measured against the bundled LibreOffice, a
-    # relative filename and an absolute file:/// URL both produced no image at all.
+    # A data URI, not a filename: the bundled LibreOffice shows no image for a
+    # relative filename or an absolute file:/// URL.
     assert "data:image/png;base64," in written
     assert "inline_001.png" not in written
 
 
 @requires_lo
 def test_an_inline_image_reaches_the_body_page(tmp_path):
-    """End to end: the picture is on the page, not a placeholder."""
+    """End to end: the inline picture appears on the rendered page."""
     from pypdf import PdfReader
 
     source = _inline_image_email(tmp_path)
@@ -535,11 +530,10 @@ def test_an_inline_image_reaches_the_body_page(tmp_path):
 
 
 def test_a_pdf_cut_short_in_a_message_is_reported_not_ignored(tmp_path):
-    """The reported case: a PDF attachment that was cut off inside a message.
+    """A truncated PDF attachment in a message is reported, not ignored.
 
-    A PDF that was cut short still reads up to the cut, so the pages before it look
-    fine. What must never happen is that it quietly becomes a shorter document:
-    the item is either converted or reported, never silently reduced.
+    A truncated PDF still reads up to the cut, so its first pages look valid. The
+    item is either converted in full or reported, never silently shortened.
     """
     from email.message import EmailMessage
 
@@ -576,7 +570,7 @@ def test_a_pdf_cut_short_in_a_message_is_reported_not_ignored(tmp_path):
 
 
 def test_a_produced_pdf_that_cannot_be_read_is_a_failure(tmp_path, monkeypatch):
-    """Zero pages used to look like success: the item contributed nothing."""
+    """A produced PDF with zero readable pages counts as a failure."""
     from consolidator import pipeline
 
     source = tmp_path / "notes.pdf"
@@ -609,7 +603,7 @@ def test_the_pipeline_reports_how_many_pages_each_segment_has(tmp_path):
 
 
 def test_text_and_web_attachments_are_documents_not_strangers():
-    """A mail carrying notes.txt or a saved page used to contribute nothing."""
+    """Text and HTML attachments are classified as documents."""
     for name, mime in (("notes.txt", "text/plain"),
                        ("readme.md", "text/markdown"),
                        ("data.csv", "text/csv"),
@@ -644,7 +638,7 @@ def test_a_text_attachment_is_extracted_not_merely_listed(tmp_path):
 
 
 def test_the_old_office_category_name_still_works_on_the_command_line():
-    """'--extract office' keeps working; the category is simply called documents."""
+    """'--extract office' still works as an alias for the documents category."""
     from consolidator import email_items
     from consolidator.cli import CATEGORY_ALIASES
 
@@ -655,11 +649,10 @@ def test_the_old_office_category_name_still_works_on_the_command_line():
 
 
 def test_an_attached_message_named_without_an_extension_is_still_read(tmp_path):
-    """A forwarded part called 'forwarded' or 'email.dat' is still mail.
+    """A forwarded part called 'forwarded' or 'email.dat' is still read as mail.
 
-    Reported as "ValueError: not an email file". The staged copy is opened by
-    extension, so a message part whose name carries no email extension was handed
-    to the reader as a stranger and refused - the attached email never appeared.
+    The staged copy is opened by extension, so a message part without an email
+    extension is otherwise refused with "ValueError: not an email file".
     """
     from email.message import EmailMessage
 
@@ -671,7 +664,7 @@ def test_an_attached_message_named_without_an_extension_is_still_read(tmp_path):
     outer["Subject"] = "outer"
     outer.set_content("see below")
     outer.add_attachment(inner, filename="forwarded")     # no extension at all
-    outer.add_attachment(inner, filename="email.dat")     # the wrong one
+    outer.add_attachment(inner, filename="email.dat")     # wrong extension
 
     path = tmp_path / "odd.eml"
     path.write_bytes(outer.as_bytes())
@@ -692,9 +685,8 @@ def test_an_attached_message_named_without_an_extension_is_still_read(tmp_path):
 
 
 def test_a_msg_container_is_recognised_whatever_it_is_called(messages, tmp_path):
-    """The extension is a first guess, not a requirement: sniff the container."""
-    # Pick a sample that actually carries attachments, so the rename is tested
-    # against a file with something to lose.
+    """A .msg container is detected by its content, whatever its extension."""
+    # Use a sample that has attachments, so the renamed file has content to lose.
     sample, expected = None, 0
     for candidate in sorted(messages.glob("*.msg")):
         found = len(email_items.read_message(candidate).attachments)
@@ -715,7 +707,7 @@ def test_a_msg_container_is_recognised_whatever_it_is_called(messages, tmp_path)
 
 
 def test_something_that_is_not_mail_is_still_refused(tmp_path):
-    """Sniffing must not turn every file into an email."""
+    """Content sniffing does not classify non-email files as email."""
     plain = tmp_path / "notes.dat"
     plain.write_bytes(b"just some bytes, no headers and no OLE container\n")
 
@@ -803,7 +795,7 @@ def test_email_end_to_end_produces_pages(emails, tmp_path):
 
     assert dest.exists()
     assert report.merged.pages > 0
-    # Every source should have contributed at least its body.
+    # Every source contributes at least its body.
     assert len(report.succeeded) == len(sources)
     # A PDF attachment and an Office attachment were converted.
     labels = [s.label for s in report.segments]
@@ -821,7 +813,7 @@ def _eml(tmp_path, message) -> Path:
 
 
 def test_a_body_split_around_a_picture_keeps_every_piece(tmp_path):
-    """Apple Mail and phones send text, picture, text; the second text is body too."""
+    """In a text, picture, text message (Apple Mail, phones), both texts are body."""
     from email.message import EmailMessage
 
     message = EmailMessage()

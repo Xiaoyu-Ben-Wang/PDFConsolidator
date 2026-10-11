@@ -1,17 +1,12 @@
-"""Plain text to PDF, without losing a character.
+"""Render plain text files to PDF without dropping characters.
 
-Three things the obvious approach gets wrong, each of which silently drops text:
-
-* **Encoding.** Notepad writes UTF-16 with a byte-order mark, older tools write
-  windows-1252, and reading everything as UTF-8 turned the first into noise and
-  the curly quotes of the second into replacement characters.
-* **Glyphs.** ReportLab's built-in Courier covers Western European text only, so
-  Cyrillic, Greek, Chinese, Japanese and Korean simply did not appear. Text is
-  drawn with a TrueType monospace face, and each character no face covers falls
-  back to one of the system fonts that does.
-* **Wrapping.** Breaking only at spaces leaves a long URL, a hash or a CSV row
-  wider than the page, and whatever ran off the edge was gone. Lines are broken
-  at a space when one is available and mid-word when not.
+* **Encoding.** Files may be UTF-16 with a byte-order mark (Notepad), UTF-8 or
+  windows-1252. The encoding is detected instead of assuming UTF-8.
+* **Glyphs.** ReportLab's built-in Courier covers Western European text only.
+  Text is drawn with a TrueType monospace font, and characters it lacks fall
+  back to a system font that has them (Cyrillic, Greek, CJK and others).
+* **Wrapping.** Lines break at a space when possible and mid-word otherwise, so
+  long URLs, hashes or CSV rows do not run off the page.
 """
 
 from __future__ import annotations
@@ -22,8 +17,8 @@ from pathlib import Path
 
 _FONT_DIR = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
 
-# Monospace first: it keeps columns aligned. The rest are fallbacks for scripts
-# the monospace faces lack, in rough order of how much they cover.
+# Monospace fonts first, to keep columns aligned. The rest are fallbacks for
+# scripts the monospace fonts lack, roughly ordered by coverage.
 _FACES = (
     ("ConsText", "consola.ttf"),
     ("CourText", "cour.ttf"),
@@ -42,7 +37,7 @@ _faces: list[tuple[str, set[int]]] | None = None
 
 
 def _load_faces() -> list[tuple[str, set[int]]]:
-    """Register the fonts this machine has, once, with the characters each covers."""
+    """Register the installed fonts once and return each with the characters it covers."""
     global _faces
     if _faces is not None:
         return _faces
@@ -61,14 +56,14 @@ def _load_faces() -> list[tuple[str, set[int]]]:
             face = pdfmetrics.getFont(name).face
             found.append((name, set(face.charToGlyph)))
         except Exception:
-            # A font that will not load is a font we do without.
+            # Skip fonts that fail to load.
             continue
     _faces = found
     return found
 
 
 def decode_text(data: bytes) -> str:
-    """Bytes of a text file as text, in the encoding they were most likely written in."""
+    """Decode text file bytes using the most likely encoding."""
     for bom, encoding in ((codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"),
                           (codecs.BOM_UTF8, "utf-8-sig"),
                           (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16")):
@@ -88,7 +83,7 @@ def decode_text(data: bytes) -> str:
 
 
 class _Measure:
-    """Which font draws each character, and how wide it is."""
+    """Pick the font for each character and measure its width (cached)."""
 
     def __init__(self, size: float):
         from reportlab.pdfbase.pdfmetrics import stringWidth
@@ -109,8 +104,8 @@ class _Measure:
                 if code in covered:
                     font = name
                     break
-            # Nothing covers it: the primary face draws its "missing" box, which
-            # at least shows that something was there.
+            # No font covers it: the primary font draws its "missing glyph" box,
+            # which shows that a character was there.
             self._font[char] = font
         return font
 
@@ -123,7 +118,7 @@ class _Measure:
 
 
 def wrap(line: str, usable: float, measure: _Measure) -> list[str]:
-    """Break one line to fit ``usable`` points: at a space if possible, else anywhere."""
+    """Split one line to fit ``usable`` points, at a space if possible, else mid-word."""
     if not line:
         return [""]
     pieces: list[str] = []
@@ -153,7 +148,7 @@ def wrap(line: str, usable: float, measure: _Measure) -> list[str]:
 
 
 def _runs(text: str, measure: _Measure):
-    """Split ``text`` into stretches drawn with the same font."""
+    """Split ``text`` into runs that use the same font."""
     run = ""
     font = None
     for char in text:
@@ -168,7 +163,7 @@ def _runs(text: str, measure: _Measure):
 
 
 def render(text: str, dest: Path, page_size: tuple[float, float], title: str = "") -> int:
-    """Lay ``text`` out as literal monospaced lines. Returns the page count."""
+    """Write ``text`` to ``dest`` as monospaced lines and return the page count."""
     from reportlab.pdfgen import canvas as rl_canvas
 
     width, height = page_size
@@ -183,15 +178,15 @@ def render(text: str, dest: Path, page_size: tuple[float, float], title: str = "
     y = height - margin
     pages = 1
 
-    # A form feed is a page break in a text file; splitlines() would drop it.
+    # Treat form feeds as page breaks; splitlines() would drop them.
     for block_index, block in enumerate(text.replace("\r\n", "\n").split("\f")):
         if block_index:
             canvas.showPage()
             pages += 1
             y = height - margin
         for raw_line in block.splitlines() or [""]:
-            # Expand tabs so column alignment survives; other control characters
-            # would only draw as boxes.
+            # Expand tabs to keep columns aligned; drop other control characters,
+            # which would draw as boxes.
             line = "".join(c for c in raw_line.expandtabs(4)
                            if c >= " " or c == "\t")
             for chunk in wrap(line, usable, measure):

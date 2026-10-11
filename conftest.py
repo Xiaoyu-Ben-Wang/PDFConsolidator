@@ -3,11 +3,10 @@
 pytest and :mod:`tempfile` write to ``pytest-tmp/`` beside this file, not to the
 system temp directory, so the suite does not depend on ``%TEMP%``.
 
-Only :mod:`tempfile` is redirected here. The process environment is deliberately
-left alone: overriding ``TMP``/``TEMP``/``TMPDIR`` for the whole process changes
-what every spawned program sees, and LibreOffice crashes rendering HTML when that
-happens. The application sets the environment for its own subprocesses explicitly
-(see ``libreoffice.clean_env``), so it does not need it here.
+Only :mod:`tempfile` is redirected. The process environment is not changed:
+overriding ``TMP``/``TEMP``/``TMPDIR`` for the whole process affects every spawned
+program, and LibreOffice then crashes when rendering HTML. The application sets
+the environment for its own subprocesses (see ``libreoffice.clean_env``).
 """
 
 from __future__ import annotations

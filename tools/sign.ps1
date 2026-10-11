@@ -1,29 +1,29 @@
 <#
 .SYNOPSIS
-    Give the built executable a publisher, so Windows stops calling it unknown.
+    Sign the built executable so Windows shows a publisher name.
 
 .DESCRIPTION
-    "Unknown Publisher" appears because the executable has no Authenticode
-    signature. Windows reads the publisher name from the signing certificate, so
-    there is no setting that simply declares one - the file has to be signed.
+    Windows shows "Unknown Publisher" for an executable without an Authenticode
+    signature. The publisher name comes from the signing certificate, so the
+    file must be signed.
 
-    This creates a self-signed code-signing certificate with the requested
-    subject (in the current user's certificate store, never the machine store)
-    and signs the executable with it.
+    This script creates a self-signed code-signing certificate with the given
+    subject in the current user's certificate store (not the machine store) and
+    signs the executable with it.
 
-    What that achieves:
-      * The file gains a digital signature naming the publisher, which shows on
-        the Properties -> Digital Signatures tab, and in SmartScreen and UAC
-        prompts in place of "Unknown Publisher".
-      * On this machine, adding the certificate to Trusted Root and Trusted
-        Publishers makes those prompts stop warning altogether. That is what
-        -Trust does, and it needs administrator rights.
-      * On other machines the signature is present but untrusted, so the name is
-        shown and the warning remains until the certificate is trusted there.
+    Effects:
+      * The file has a digital signature naming the publisher. The name appears
+        on the Properties -> Digital Signatures tab and in SmartScreen and UAC
+        prompts instead of "Unknown Publisher".
+      * -Trust adds the certificate to Trusted Root and Trusted Publishers on
+        this machine, so those prompts no longer warn. It needs administrator
+        rights.
+      * On other machines the signature is untrusted: the name is shown, but
+        the warning remains until the certificate is trusted there.
 
-    A self-signed certificate can never earn "verified publisher" reputation the
-    way a commercial certificate does; it identifies the publisher, it does not
-    vouch for them. That requires a certificate from a public authority.
+    A self-signed certificate does not build SmartScreen reputation. It
+    identifies the publisher but does not verify them; that needs a certificate
+    from a public certificate authority.
 
 .EXAMPLE
     .\sign.ps1 -Path dist\PDFConsolidator\PDFConsolidator.exe -Trust

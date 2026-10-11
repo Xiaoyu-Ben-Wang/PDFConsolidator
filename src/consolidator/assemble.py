@@ -1,13 +1,12 @@
-"""Phase B - assemble converted PDFs into the final document.
+"""Phase B: assemble the converted PDFs into the final document.
 
-This phase never invokes a converter. It works purely on the intermediate PDFs
-produced by Phase A, which makes re-running it cheap: reordering, rotating or
-re-fitting pages costs nothing but a rewrite.
+This phase does not run any converter. It works only on the intermediate PDFs
+from Phase A, so reordering, rotating or refitting pages only requires
+rewriting the output.
 
-An important detail makes overlays tractable: a page's ``/Rotate`` entry is baked
-into its content stream before anything else happens. Otherwise a page number
-drawn onto a rotated page would itself appear rotated, because the viewer applies
-``/Rotate`` to the whole page including anything merged onto it.
+A page's ``/Rotate`` entry is folded into its geometry before overlays are
+drawn. Otherwise a page number drawn on a rotated page would also be rotated,
+because the viewer applies ``/Rotate`` to the whole page, overlays included.
 """
 
 from __future__ import annotations
@@ -77,8 +76,8 @@ class MergeOptions:
     subject: str = ""
     # Compare the written file with its sources, page by page (see verify.py).
     verify: bool = True
-    # An existing file is never replaced: the output goes to "name (1).pdf",
-    # "name (2).pdf"... instead. Only a caller that means to replace sets this.
+    # If False, an existing file is not replaced; the output goes to
+    # "name (1).pdf", "name (2).pdf" and so on instead.
     overwrite: bool = False
 
 
@@ -89,36 +88,33 @@ class MergeReport:
     outline_items: int = 0
     skipped: list[tuple[str, str]] = field(default_factory=list)
     separators: int = 0
-    # Where each output page came from: (source pdf, page index, label), or None
-    # for a generated page such as a separator.
+    # Source of each output page: (source pdf, page index, label), or None for
+    # a generated page such as a separator.
     page_map: list = field(default_factory=list)
-    # The page-by-page comparison of the output with its sources, if it ran.
+    # Result of verify.check(), if verification ran.
     verification: object = None
-    # Pages that could not be copied and were included as pictures of themselves:
-    # (output page, label, source page, why).
+    # Pages that could not be copied and were included as rendered images:
+    # (output page, label, source page, reason).
     as_images: list = field(default_factory=list)
-    # The file actually written - not the one asked for, if that already existed.
+    # The file written, which differs from ``requested`` if that already existed.
     output: Path | None = None
     requested: Path | None = None
 
 
 # ------------------------------------------------- page geometry, unparsed
 #
-# Fitting, rotating and decorating a page all used to go through pypdf's content
-# stream parser (add_transformation, transfer_rotation_to_content, merge_page),
-# which reads and re-writes every drawing instruction on the page. It is strict
-# where viewers are lenient - a number longer than 64 characters, as some
-# generators write, raised LimitReachedError and aborted an entire 2000-page
-# export - and anything it misreads is silently lost. None of it is needed: a
-# page's own instructions can be left exactly as they are, byte for byte, with a
-# transformation placed *around* them and decorations drawn *after* them as a
-# separate form. That is what everything below does; nothing here parses a page.
+# Page content streams are never parsed. pypdf's content stream parser
+# (add_transformation, transfer_rotation_to_content, merge_page) is stricter
+# than viewers: for example, a number longer than 64 characters raises
+# LimitReachedError, and content it misreads is lost. Instead, each page's
+# instructions are kept byte for byte, a transformation is placed around them,
+# and overlays are drawn after them as a separate form XObject.
 
 Matrix = tuple[float, float, float, float, float, float]
 
 
 def then(first: Matrix, second: Matrix) -> Matrix:
-    """The transformation that applies ``first`` and then ``second``."""
+    """Return the matrix that applies ``first`` and then ``second``."""
     a1, b1, c1, d1, e1, f1 = first
     a2, b2, c2, d2, e2, f2 = second
     return (a1 * a2 + b1 * c2, a1 * b2 + b1 * d2,
@@ -139,11 +135,10 @@ def page_rotation(page) -> int:
 
 
 def visible_box(page) -> tuple[float, float, float, float]:
-    """``(left, bottom, width, height)`` of what a viewer shows: crop box within media box.
+    """Return ``(left, bottom, width, height)`` of the crop box clipped to the media box.
 
-    A box that does not start at the origin is common (scanners, imposition
-    software). Fitting used to measure only width and height and assume (0, 0),
-    which shifted such pages and could push part of them off the sheet.
+    The box often does not start at the origin (e.g. scanners, imposition
+    software), so the offset is returned as well as the size.
     """
     media = page.mediabox
     try:
@@ -161,7 +156,7 @@ def visible_box(page) -> tuple[float, float, float, float]:
 
 
 def visual_size(page) -> tuple[float, float]:
-    """Page size as the reader sees it: the visible box, turned by ``/Rotate``."""
+    """Return the displayed page size: the visible box with ``/Rotate`` applied."""
     _left, _bottom, width, height = visible_box(page)
     if page_rotation(page) in (90, 270):
         width, height = height, width
@@ -169,7 +164,7 @@ def visual_size(page) -> tuple[float, float]:
 
 
 def rotation_matrix(box: tuple[float, float, float, float], degrees: int) -> Matrix:
-    """Turn the content of ``box`` clockwise by ``degrees`` onto a box at the origin."""
+    """Return a matrix that rotates ``box`` clockwise by ``degrees`` onto a box at the origin."""
     left, bottom, width, height = box
     degrees %= 360
     if degrees == 90:
@@ -196,7 +191,7 @@ def _stream(writer, data: bytes, extra: dict | None = None):
 
 
 def _contents(page) -> list:
-    """The page's content streams as references - located, never read."""
+    """Return references to the page's content streams without reading them."""
     from pypdf.generic import ArrayObject, IndirectObject, NameObject
 
     writer = _writer_of(page)
@@ -209,7 +204,7 @@ def _contents(page) -> list:
     references = []
     for item in items:
         if not isinstance(item, IndirectObject):
-            item = writer._add_object(item)      # a direct stream: give it a home
+            item = writer._add_object(item)      # make a direct stream an indirect object
         references.append(item)
     return references
 
@@ -220,7 +215,7 @@ def _number(value: float) -> bytes:
 
 
 def wrap_contents(page, prefix: bytes = b"", suffix: bytes = b"") -> None:
-    """Put drawing instructions before and after the page's own, untouched."""
+    """Add content streams before and after the page's existing, unmodified content."""
     from pypdf.generic import ArrayObject, NameObject
 
     writer = _writer_of(page)
@@ -234,10 +229,10 @@ def wrap_contents(page, prefix: bytes = b"", suffix: bytes = b"") -> None:
 
 
 def _transform_annotations(page, matrix: Matrix) -> None:
-    """Move link and other annotation rectangles along with the content.
+    """Transform annotation rectangles (links etc.) with the page content.
 
-    Each annotation is copied for this page first: a page used twice shares its
-    annotations with its twin, which must not move as well.
+    Each annotation is copied first, because a page used twice shares its
+    annotations with the other copy, which must not move.
     """
     from pypdf.generic import ArrayObject, DictionaryObject, NameObject, RectangleObject
 
@@ -262,7 +257,7 @@ def _transform_annotations(page, matrix: Matrix) -> None:
                     (min(xs), min(ys), max(xs), max(ys)))
             moved.append(writer._add_object(copy))
         except Exception:
-            continue                    # an unreadable annotation is dropped, not fatal
+            continue                    # drop unreadable annotations
     page[NameObject("/Annots")] = moved
 
 
@@ -270,8 +265,8 @@ def place(page, matrix: Matrix, sheet: tuple[float, float],
           clip: tuple[float, float, float, float]) -> None:
     """Draw the page's content through ``matrix`` onto a sheet of size ``sheet``.
 
-    The content is clipped to ``clip`` - its visible box, in its own coordinates -
-    so whatever a viewer hid before (outside the crop box) stays hidden.
+    The content is clipped to ``clip`` (its visible box, in its own
+    coordinates), so content outside the original crop box stays hidden.
     """
     from pypdf.generic import NameObject, NumberObject, RectangleObject
 
@@ -290,12 +285,12 @@ def place(page, matrix: Matrix, sheet: tuple[float, float],
 
 def normalise(page, extra_rotation: int = 0,
               target: tuple[float, float] | None = None, margin: float = 0.0) -> None:
-    """Turn the page upright and, given ``target``, scale and centre it onto it.
+    """Fold rotation into the page geometry and optionally fit it to ``target``.
 
-    Upright means its own /Rotate plus ``extra_rotation`` (clockwise) folded into
-    its geometry. Afterwards the page has no /Rotate, its box starts at the
-    origin, and its content is exactly the original's, transformed - which is
-    what overlays need.
+    The page's /Rotate plus ``extra_rotation`` (clockwise) is applied to its
+    content. Afterwards the page has /Rotate 0, its box starts at the origin,
+    and its original content is drawn through a transformation, so overlays
+    draw upright.
     """
     box = visible_box(page)
     degrees = (page_rotation(page) + extra_rotation) % 360
@@ -315,7 +310,7 @@ def normalise(page, extra_rotation: int = 0,
 
 
 def rotate_page(page, degrees: int) -> None:
-    """Rotate a page clockwise by 90, 180 or 270 degrees, by its /Rotate entry only."""
+    """Rotate a page clockwise by 90, 180 or 270 degrees using only its /Rotate entry."""
     from pypdf.generic import NameObject, NumberObject
 
     degrees %= 360
@@ -326,9 +321,8 @@ def rotate_page(page, degrees: int) -> None:
 def fit_to_page(page, target: tuple[float, float], margin: float = 0.0) -> None:
     """Scale and centre a page onto ``target``, preserving aspect ratio.
 
-    The transformation is placed around the page's own drawing instructions,
-    which are never read: vector text and images scale without re-encoding,
-    and there is nothing for a parser to misread.
+    The transformation wraps the page's content without parsing it, so vector
+    text and images scale without re-encoding.
     """
     normalise(page, 0, target, margin)
 
@@ -342,17 +336,17 @@ def bake_rotation(page) -> None:
 # ------------------------------------------------------------------ overlays
 
 
-EDGE_MARGIN = 40.0      # distance of header/footer text from the page sides
-SLOT_GAP = 12.0         # space kept between neighbouring slots
-MAX_SLOT_LINES = 3      # a slot never grows past this many lines
+EDGE_MARGIN = 40.0      # points between header/footer text and the page sides
+SLOT_GAP = 12.0         # points between neighbouring slots
+MAX_SLOT_LINES = 3      # maximum lines per slot
 
 
 def _slot_widths(texts: dict[str, str], width: float, font: str,
                  size: float) -> dict[str, float]:
-    """How wide each slot on one edge may be before its text wraps.
+    """Return the maximum text width of each slot on one edge before wrapping.
 
-    The centre slot is centred on the page, so it gets whatever the wider of
-    the two sides leaves on both sides of it. A side slot takes the room it
+    The centre slot is centred on the page, so its width is what remains after
+    reserving the wider side slot on both sides. A side slot gets the width it
     needs, up to a third of the line.
     """
     from reportlab.pdfbase.pdfmetrics import stringWidth
@@ -371,9 +365,9 @@ def _slot_widths(texts: dict[str, str], width: float, font: str,
 def _wrap(text: str, limit: float, font: str, size: float) -> list[str]:
     """Break ``text`` into lines no wider than ``limit``.
 
-    Lines break at spaces first. A single word too long for a line (a file name,
-    usually) breaks after ``_``, ``-`` or ``.`` where it can, and anywhere if not.
-    Past MAX_SLOT_LINES the last line ends in an ellipsis.
+    Lines break at spaces. A word too long for a line (usually a file name)
+    breaks after ``_``, ``-`` or ``.`` if possible, otherwise at any character.
+    Beyond MAX_SLOT_LINES, the last line is truncated with an ellipsis.
     """
     from reportlab.pdfbase.pdfmetrics import stringWidth
 
@@ -423,16 +417,16 @@ def _draw_slot(canvas, text: str, slot: str, width: float, y: float,
                font: str, size: float, limit: float, grow: int) -> None:
     """Draw one header/footer slot, wrapped to ``limit`` points.
 
-    ``y`` is the baseline of the line nearest the page edge; further lines go
-    towards the middle of the page (``grow`` is +1 for a footer, -1 for a header).
+    ``y`` is the baseline of the line nearest the page edge; other lines go
+    towards the page centre (``grow`` is +1 for a footer, -1 for a header).
     """
     if not text:
         return
     canvas.setFont(font, size)
     lines = _wrap(text, limit, font, size)
     leading = size * 1.2
-    # Lines are drawn in reading order, so text selection and extraction
-    # read them in that order too. A footer's last line sits on the baseline.
+    # Draw lines in reading order so text selection and extraction follow it.
+    # A footer's last line sits on the baseline.
     for index, line in enumerate(lines):
         steps = len(lines) - 1 - index if grow > 0 else index
         line_y = y + grow * steps * leading
@@ -457,11 +451,10 @@ def _substitute(template: str, *, number: int, total: int, document: str,
 
 
 def _make_overlay(width: float, height: float, draw) -> object:
-    """Build a single transparent page of the given size and return it.
+    """Return a single transparent page of the given size, drawn by ``draw``.
 
-    ``showPage()`` is called explicitly: ReportLab only emits a page when
-    something has been drawn, so a deliberately blank overlay would otherwise
-    produce a zero-page PDF and blow up on the next access.
+    ``showPage()`` is called explicitly because ReportLab emits a page only when
+    something was drawn; a blank overlay would otherwise give a zero-page PDF.
     """
     from reportlab.pdfgen import canvas as rl_canvas
 
@@ -506,7 +499,7 @@ def _decorate(page, options: MergeOptions, number: int, total: int,
         if horizontal not in slots:
             horizontal = "center"
         target = top if edge == "top" else bottom
-        # An explicit header/footer slot wins over the automatic page number.
+        # Explicit header/footer text takes precedence over the page number.
         if not target.get(horizontal):
             target[horizontal] = resolve(numbering.template)
 
@@ -533,12 +526,11 @@ _stamp_counter = itertools.count(1)
 
 
 def stamp(page, overlay) -> None:
-    """Draw ``overlay`` (a page of our own making) on top of ``page``.
+    """Draw ``overlay`` (a generated page) on top of ``page``.
 
     The overlay becomes a form XObject with its own resources, drawn after the
-    page's untouched content. ``merge_page`` instead parsed the page's content to
-    merge the two - the step a strict parser can fail on, losing the export -
-    and renamed resources to avoid collisions; a form needs neither.
+    page's unmodified content. Unlike ``merge_page``, this does not parse the
+    page content or rename resources.
     """
     from pypdf.generic import ArrayObject, DictionaryObject, FloatObject, NameObject
 
@@ -554,8 +546,7 @@ def stamp(page, overlay) -> None:
     })
     name = NameObject("/PCStamp%d" % next(_stamp_counter))
 
-    # A copy of the page's resources, so a dictionary other pages share is not
-    # changed under them.
+    # Copy the page's resources, which other pages may share.
     existing = page.get("/Resources")
     resources = DictionaryObject(dict.items(existing.get_object())) if existing else DictionaryObject()
     xobjects = resources.get("/XObject")
@@ -568,7 +559,7 @@ def stamp(page, overlay) -> None:
 
 
 def _title_page(width: float, height: float, label: str, index: int) -> object:
-    """A generated cover page for one source document."""
+    """Return a generated title page for one source document."""
 
     def draw(canvas) -> None:
         canvas.setFillGray(0.1)
@@ -587,14 +578,15 @@ def _title_page(width: float, height: float, label: str, index: int) -> object:
 # --------------------------------------------------------------------- merge
 
 
-# Resolution of a page that has to be included as a picture of itself.
+# Resolution (DPI) for pages included as rendered images.
 FALLBACK_DPI = 200
 
 
 def _page_as_image(path: Path, index: int):
-    """A one-page PDF holding a rendering of one page, for a page that cannot be
-    copied. Rendered by pdfium, the preview's engine, so it looks as the preview
-    did; the text is no longer selectable, which the report says."""
+    """Return a one-page PDF with a rendered image of a page that cannot be copied.
+
+    pdfium renders it, matching the preview. The text is no longer selectable;
+    the merge report lists such pages."""
     import img2pdf
     import pypdfium2 as pdfium
 
@@ -616,14 +608,11 @@ def _page_as_image(path: Path, index: int):
 
 
 def open_pdf(path: Path):
-    """Open a PDF for merging, unlocking one that only *looks* locked.
+    """Open a PDF for merging, decrypting it if it has no user password.
 
-    Plenty of real attachments are "protected" with no user password at all: a
-    scanner or a bank sets an owner password and prints permissions, and every
-    reader opens the file for anyone who asks. Refusing those dropped the whole
-    attachment from the output, which is how a section of a document goes missing
-    without a word. Returns ``(reader, reason)``; ``reader`` is None when the file
-    really does need a password.
+    Many encrypted PDFs (e.g. from scanners or banks) set only an owner password
+    and permissions, and any reader can open them with an empty password.
+    Returns ``(reader, reason)``; ``reader`` is None when a password is needed.
     """
     reader = PdfReader(str(path))
     if not reader.is_encrypted:
@@ -641,13 +630,12 @@ _NUMBERED = re.compile(r"^(?P<base>.*) \((?P<n>\d+)\)$")
 
 
 def reserve_output(dest: Path) -> Path:
-    """Claim a name for the output that no existing file has.
+    """Reserve an output path that does not exist yet.
 
-    ``dest`` itself if it is free, otherwise ``name (1).pdf``, ``name (2).pdf``
-    and so on - the way Explorer names copies. A name that already ends in
-    ``(N)`` continues from N rather than growing ``(1) (1)``. The name is claimed
-    by creating it exclusively, so two exports at the same moment cannot both
-    pick it; the caller replaces the empty placeholder with the real file.
+    Returns ``dest`` if it is free, otherwise ``name (1).pdf``, ``name (2).pdf``
+    and so on, like Explorer. A name ending in ``(N)`` continues from N instead
+    of becoming ``(1) (1)``. The file is created exclusively, so concurrent
+    exports cannot pick the same name; the caller replaces the empty file.
     """
     dest = Path(dest)
     stem, suffix = dest.stem, dest.suffix
@@ -676,12 +664,10 @@ def merge(
 ) -> MergeReport:
     """Merge ``entries`` in order into ``dest``, written atomically.
 
-    ``options`` carries the richer settings (numbering, headers, separators);
-    the individual keyword arguments are kept for simple callers and tests. Each
-    of those arguments overrides ``options`` **only when given**: ``bookmarks``
-    used to default to ``True`` and be assigned unconditionally, so a caller who
-    passed ``options`` with bookmarks switched off got them anyway - which is why
-    ``--no-bookmarks`` produced a document full of bookmarks.
+    ``options`` holds the full settings (numbering, headers, separators); the
+    keyword arguments are for simple callers and tests. Each keyword argument
+    overrides ``options`` only when given, so for example ``bookmarks=None``
+    keeps ``options.bookmarks``.
     """
     if options is None:
         options = MergeOptions(page_size=page_size, margin=margin,
@@ -701,7 +687,7 @@ def merge(
     writer = PdfWriter()
     report = MergeReport()
 
-    # A first pass is needed to know the total page count for "{total}".
+    # First pass: count the total pages for "{total}".
     planned: list[tuple[MergeEntry, list]] = []
     total_pages = 0
     for entry in entries:
@@ -720,9 +706,7 @@ def merge(
                 report.skipped.append((entry.label or path.name, "no pages selected"))
                 continue
             if len(specs) != requested:
-                # Pages were asked for that the file does not have. Saying so is
-                # the difference between "the document is shorter than it looks"
-                # and a mystery.
+                # Report requested pages that are past the end of the file.
                 report.skipped.append(
                     (entry.label or path.name,
                      "%d page(s) requested beyond the end of the file"
@@ -741,14 +725,13 @@ def merge(
     page_number = options.numbering.start
     first = True
     decorating = _wants_decoration(options)
-    # Readers of pages included as images; their pages are written at the end.
+    # Keep readers of image-fallback pages open until the file is written.
     keep_alive: list = []
 
     for entry_index, (entry, specs) in enumerate(planned):
         path = Path(entry.path)
         label = entry.label or path.stem
 
-        # Per-document numbering restarts for each source document.
         if options.numbering.mode == "per-document":
             page_number = options.numbering.start
 
@@ -761,7 +744,7 @@ def merge(
                 separator_page = _make_overlay(width, height, lambda c: None)
             writer.add_page(separator_page)
             report.page_map.append(None)
-            # A separator is a page in the output, so it is numbered like one.
+            # Separators are numbered like other pages.
             _decorate(writer.pages[-1], options, number=page_number, total=total_pages,
                       document=label, page_in_doc=0, pages_in_doc=0)
             report.separators += 1
@@ -769,19 +752,17 @@ def merge(
 
         reader, reason = open_pdf(path)
         if reader is None:
-            # It opened in the planning pass, so this is unexpected - report it
-            # rather than writing a document that is quietly short.
+            # Opened in the first pass but not now; report it as skipped.
             report.skipped.append((label, reason or "could not be opened"))
             continue
         start_index = len(writer.pages)
 
         for position, spec in enumerate(specs, start=1):
             def finish(page, extra_rotation: int) -> None:
-                # The rotation is folded into the geometry whenever anything
-                # else is done to the page: left as /Rotate, a fit was computed
-                # in the unrotated frame (a landscape page turned to portrait
-                # lost its sides) and page numbers came out sideways. A page
-                # nothing is done to keeps its content as is, rotated by /Rotate.
+                # Fold the rotation into the geometry when the page is fitted or
+                # decorated; otherwise the fit is computed in the unrotated frame
+                # and overlays are drawn sideways. Pages that are not fitted or
+                # decorated are rotated with /Rotate only.
                 if options.page_size:
                     normalise(page, extra_rotation, options.page_size, options.margin)
                 elif decorating:
@@ -798,8 +779,8 @@ def merge(
                 finish(writer.pages[-1], spec.rotation)
                 report.page_map.append((path, spec.index, label))
             except Exception as exc:
-                # One page that cannot be copied must not cost the whole export.
-                # It is included as a picture of itself instead, and named.
+                # If a page cannot be copied, include a rendered image of it
+                # and record it in the report, instead of failing the export.
                 while len(writer.pages) > before:
                     writer.remove_page(len(writer.pages) - 1)
                 reason = "%s: %s" % (type(exc).__name__, exc)
@@ -844,11 +825,10 @@ def merge(
             writer.write(handle)
         os.replace(tmp, target)
     except OSError as exc:
-        # Never leave a half-written file where a complete one is expected -
-        # nor the empty placeholder that reserved a numbered name.
+        # Remove the partial temp file and the empty file from reserve_output().
         leftovers = [tmp]
         if not options.overwrite:
-            leftovers.append(target)        # the empty placeholder we created
+            leftovers.append(target)        # empty file created by reserve_output()
         for leftover in leftovers:
             try:
                 if leftover.exists() and (leftover == tmp or leftover.stat().st_size == 0):

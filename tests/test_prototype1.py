@@ -1,7 +1,6 @@
 """Prototype 1 tests.
 
-The LibreOffice-backed tests are skipped automatically when no engine is
-installed, so the suite still runs on a machine without it.
+Tests that need LibreOffice are skipped when it is not installed.
 """
 
 from __future__ import annotations
@@ -52,7 +51,7 @@ def test_gather_skips_directories_but_recurses(tmp_path):
 
 
 def _blank_pdfs(tmp_path, count: int) -> list[Path]:
-    """PDFs copy through byte-for-byte, so these need no converter."""
+    """Write ``count`` blank one-page PDFs. PDFs are copied as-is, so no converter runs."""
     from pypdf import PdfWriter
 
     sources = []
@@ -67,7 +66,7 @@ def _blank_pdfs(tmp_path, count: int) -> list[Path]:
 
 
 def test_progress_is_reported_for_every_file(tmp_path):
-    """A few hundred files need a progress bar, so the count has to be real."""
+    """Progress is reported for every file, in order, ending at the total."""
     sources = _blank_pdfs(tmp_path, 6)
     seen: list[tuple[int, int, str]] = []
 
@@ -85,7 +84,7 @@ def test_progress_is_reported_for_every_file(tmp_path):
 
 
 def test_web_pages_are_supported_documents_not_text():
-    """A page is laid out by LibreOffice, not read as literal markup."""
+    """Web pages are rendered by LibreOffice, not treated as plain text."""
     from consolidator import convert
 
     for ext in (".html", ".htm", ".xhtml"):
@@ -108,7 +107,7 @@ def test_plain_text_is_a_supported_document():
 
 @requires_lo
 def test_a_web_page_becomes_a_rendered_page(tmp_path):
-    """The markup must be laid out, and its text must survive."""
+    """A web page is rendered with its text and without raw markup."""
     from pypdf import PdfReader
 
     from consolidator import convert
@@ -130,7 +129,7 @@ def test_a_web_page_becomes_a_rendered_page(tmp_path):
 
 @requires_lo
 def test_an_html_source_converts_end_to_end(tmp_path):
-    """Through the pipeline, so it is the real path a dropped file takes."""
+    """An HTML file converts through the full pipeline."""
     page = tmp_path / "saved-page.html"
     page.write_text("<html><body><h2>Saved page</h2><p>Body text.</p></body></html>",
                     encoding="utf-8")
@@ -142,11 +141,10 @@ def test_an_html_source_converts_end_to_end(tmp_path):
 
 
 def test_bookmarks_can_actually_be_switched_off(tmp_path):
-    """--no-bookmarks produced a document full of bookmarks.
+    """Bookmarks are omitted when the options or the keyword turn them off.
 
-    ``merge`` had its own ``bookmarks`` argument defaulting to True and assigned it
-    to the options unconditionally, so a caller passing options with bookmarks off
-    was overruled.
+    Guards against ``merge`` overriding ``MergeOptions.bookmarks`` with the
+    default of its own ``bookmarks`` keyword.
     """
     from pypdf import PdfReader, PdfWriter
 
@@ -175,18 +173,17 @@ def test_bookmarks_can_actually_be_switched_off(tmp_path):
     report = assemble.merge(entries, on, options=assemble.MergeOptions(bookmarks=True))
     assert report.outline_items == 2 and outline_count(on) == 2
 
-    # The keyword still works for callers that pass no options object.
+    # The keyword works when no options object is passed.
     keyword = tmp_path / "keyword.pdf"
     report = assemble.merge(entries, keyword, bookmarks=False)
     assert report.outline_items == 0 and outline_count(keyword) == 0
 
 
 def test_a_permissions_only_pdf_is_merged_not_dropped(tmp_path):
-    """A "protected" PDF with no user password must still contribute its pages.
+    """A PDF with only an owner password is merged with all its pages.
 
-    Scanners and banks set an owner password and print permissions; every reader
-    opens those for anyone who asks. Treating them as encrypted removed the whole
-    attachment from the output, silently - a section of the document simply gone.
+    Scanners and banks often set an owner password and permissions. Any reader
+    opens these files without a password, so they are not treated as encrypted.
     """
     from pypdf import PdfReader, PdfWriter
 
@@ -213,7 +210,7 @@ def test_a_permissions_only_pdf_is_merged_not_dropped(tmp_path):
 
 
 def test_a_password_protected_pdf_is_reported_not_ignored(tmp_path):
-    """If it genuinely needs a password, say so rather than writing a short file."""
+    """A PDF that needs a user password is reported as skipped."""
     from pypdf import PdfReader, PdfWriter
 
     from consolidator import assemble
@@ -234,7 +231,7 @@ def test_a_password_protected_pdf_is_reported_not_ignored(tmp_path):
 
 
 def test_pages_sharing_one_object_keep_their_place(tmp_path):
-    """Some PDFs point two page entries at one object; both must survive."""
+    """Two page entries that point to the same object are both kept."""
     from pypdf import PdfReader, PdfWriter
     from pypdf.generic import NameObject
 
@@ -262,7 +259,7 @@ def test_pages_sharing_one_object_keep_their_place(tmp_path):
 
 
 def test_asking_for_pages_beyond_the_end_of_a_file_is_reported(tmp_path):
-    """A page count that disagrees with the file must not be lost in silence."""
+    """Requested pages past the end of a file are reported as skipped."""
     from pypdf import PdfReader, PdfWriter
 
     from consolidator import assemble
@@ -288,7 +285,10 @@ def test_asking_for_pages_beyond_the_end_of_a_file_is_reported(tmp_path):
 
 
 def test_macro_enabled_and_template_office_formats_are_supported():
-    """An .xlsm is the same container as an .xlsx; refusing it was just a gap."""
+    """Macro-enabled and template Office formats are supported.
+
+    An .xlsm uses the same container as an .xlsx.
+    """
     from consolidator import convert
 
     for ext in (".xlsm", ".docm", ".pptm", ".xltx", ".dotx", ".potx",
@@ -336,7 +336,7 @@ def test_batch_chunk_sizes_are_adaptive():
 
 
 def test_conversion_worker_count_is_adaptive(monkeypatch):
-    """Half the cores, capped - and overridable for machines that dislike it."""
+    """Workers are half the cores, capped, and CONSOLIDATOR_WORKERS overrides it."""
     from consolidator import pipeline
 
     monkeypatch.delenv("CONSOLIDATOR_WORKERS", raising=False)
@@ -359,12 +359,11 @@ def test_conversion_worker_count_is_adaptive(monkeypatch):
 
 
 def test_a_chunk_that_fails_only_while_concurrent_is_redone_alone(tmp_path, monkeypatch):
-    """The reported failure: LibreOffice falls over when several run at once.
+    """A chunk that fails only under concurrency is retried alone afterwards.
 
-    Simulated by making the converter produce nothing whenever another call is in
-    flight. The retry must happen *after* the parallel wave, one at a time -
-    retrying immediately, with the other processes still running, would fail the
-    same way and lose the whole batch.
+    The fake converter produces nothing while another call is running. Retries
+    run one at a time after the parallel run, because retrying while other
+    processes are still running fails the same way.
     """
     from consolidator import libreoffice as lo
     from consolidator import pipeline
@@ -419,7 +418,7 @@ def test_concurrent_jobs_keep_their_order_and_retry_empty_chunks(tmp_path, monke
     retried: list[int] = []
 
     def fake_batch(files, workdir, timeout=0):
-        # The first attempt at job 2 converts nothing, as if the invocation died.
+        # The first attempt at job 2 produces nothing, as if the process crashed.
         workdir = Path(workdir)
         attempt = (str(workdir), len(calls))
         calls.append(str(workdir))
@@ -451,7 +450,10 @@ def test_concurrent_jobs_keep_their_order_and_retry_empty_chunks(tmp_path, monke
 
 
 def test_a_failed_document_is_not_retried_as_a_failed_chunk(tmp_path, monkeypatch):
-    """Per-document failure is normal; only an empty invocation looks like a crash."""
+    """A per-document failure does not retry the chunk.
+
+    Only a call that produces nothing is treated as a crash.
+    """
     from consolidator import libreoffice as lo
     from consolidator import pipeline
 
@@ -474,7 +476,7 @@ def test_a_failed_document_is_not_retried_as_a_failed_chunk(tmp_path, monkeypatc
 
 
 def test_a_big_office_batch_reports_progress_while_it_runs(tmp_path, monkeypatch):
-    """One invocation for the whole batch would freeze the bar for minutes."""
+    """A large Office batch is split into chunks so progress updates during the run."""
     from consolidator import libreoffice as lo
 
     sources = []
@@ -511,11 +513,10 @@ def test_a_big_office_batch_reports_progress_while_it_runs(tmp_path, monkeypatch
 
 @requires_lo
 def test_batch_conversion_survives_relative_paths(tmp_path, monkeypatch):
-    """LibreOffice fails silently on a relative path; the builder must not.
+    """Batch conversion works with relative paths.
 
-    Found by converting from a script that used relative paths: every file came
-    back "LibreOffice crashed while converting this file", with
-    "Error: source file could not be loaded" on stderr and nothing else.
+    LibreOffice cannot load a relative source path. It prints only
+    "Error: source file could not be loaded" and produces nothing.
     """
     source = tmp_path / "note.html"
     source.write_text("<html><body><p>relative paths</p></body></html>",
@@ -530,11 +531,10 @@ def test_batch_conversion_survives_relative_paths(tmp_path, monkeypatch):
 
 @requires_lo
 def test_a_lock_left_behind_does_not_block_the_next_conversion(tmp_path):
-    """LibreOffice leaves a read-only lock beside every PDF it writes.
+    """A leftover LibreOffice lock file does not block the next conversion.
 
-    While ``.~lock.note.pdf#`` exists it cannot write ``note.pdf`` again: the
-    store aborts, nothing is produced, and every retry into that directory was
-    reported as "LibreOffice crashed while converting this file".
+    While ``.~lock.note.pdf#`` exists, LibreOffice cannot write ``note.pdf``
+    and produces nothing.
     """
     import os
     import stat
@@ -554,14 +554,14 @@ def test_a_lock_left_behind_does_not_block_the_next_conversion(tmp_path):
 
 
 def test_a_batch_can_be_stopped_part_way(tmp_path):
-    """500 files is a long wait; stopping has to keep what was converted."""
+    """Stopping a batch part way keeps the files already converted."""
     sources = _blank_pdfs(tmp_path, 5)
     converted: list[Path] = []
 
     def stop_after_two():
         return len(converted) >= 2
 
-    # should_stop is polled after each source, so count them as they land.
+    # should_stop is checked after each source, so count sources as they convert.
     original = pipeline._convert_one_to_segment
 
     def counting(src, *args, **kwargs):
@@ -607,7 +607,7 @@ def test_text_conversion_treats_markdown_literally(tmp_path):
     from pypdf import PdfReader
 
     text = PdfReader(str(dest)).pages[0].extract_text()
-    # The Markdown must survive verbatim rather than being interpreted.
+    # The Markdown appears verbatim, not interpreted.
     assert "# Heading" in text
     assert "- bullet" in text
 
@@ -707,7 +707,10 @@ def test_office_conversion_produces_pdf(tmp_path, fixtures, name):
 
 @requires_lo
 def test_libreoffice_env_has_no_python_vars(tmp_path, monkeypatch):
-    """The host's PYTHONPATH breaks LibreOffice's own bootstrap."""
+    """PYTHONPATH is removed from LibreOffice's environment.
+
+    The host's PYTHONPATH breaks LibreOffice's startup.
+    """
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "elsewhere"))
     env = libreoffice.clean_env(tmp_path)
     assert "PYTHONPATH" not in env
@@ -716,10 +719,10 @@ def test_libreoffice_env_has_no_python_vars(tmp_path, monkeypatch):
 
 @requires_lo
 def test_convert_one_leaves_no_scratch_behind(tmp_path, fixtures, monkeypatch):
-    """Regression: LibreOffice marks its ~lock files read-only.
+    """convert_one removes its scratch directory.
 
-    Windows refuses to delete a read-only file, so a plain rmtree fails with
-    WinError 5 and every conversion silently leaks its scratch directory.
+    LibreOffice marks its lock files read-only. Windows does not delete
+    read-only files, so a plain rmtree fails with WinError 5.
     """
     import tempfile
 
@@ -750,7 +753,7 @@ def test_end_to_end_build(tmp_path, fixtures):
 
 
 def test_end_to_end_without_office(tmp_path, fixtures):
-    """The merge half works with no Office engine involved at all."""
+    """Merging works without LibreOffice."""
     sources = [p for p in pipeline.gather([str(fixtures)]) if p.suffix.lower() != ".docx"]
     sources = [p for p in sources if p.suffix.lower() in (".pdf", ".jpg", ".png", ".txt", ".md")]
     dest = tmp_path / "combined.pdf"
@@ -766,7 +769,7 @@ def test_end_to_end_without_office(tmp_path, fixtures):
 
 @requires_lo
 def test_selftest_passes(tmp_path, monkeypatch):
-    """The self-test is how the frozen build proves itself, so it must pass."""
+    """The self-test passes. The frozen build uses it to check itself."""
     from consolidator import cli
 
     monkeypatch.chdir(tmp_path)

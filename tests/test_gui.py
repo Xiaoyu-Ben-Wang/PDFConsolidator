@@ -1,6 +1,6 @@
 """GUI tests.
 
-The document model is deliberately Qt-free, so most of it is tested without a
+The document model does not depend on Qt, so most of it is tested without a
 display. The window tests need a QApplication but not a visible window.
 """
 
@@ -121,7 +121,7 @@ def test_toggle_segment_off_then_on(model):
 
 
 def test_to_entries_regroups_interleaved_pages(model):
-    """Pages from A, then B, then A again must become three entries."""
+    """Pages from A, then B, then A again form three entries."""
     model.pages = [model.pages[0], model.pages[3], model.pages[1]]
     entries = model.to_entries()
     assert [e.label for e in entries] == ["A", "B", "A"]
@@ -141,7 +141,7 @@ def test_to_entries_skips_disabled_segments(model):
 
 
 def test_interleaving_preserves_output_order(model):
-    """The assembled order must match the on-screen order exactly."""
+    """The assembled order matches the on-screen order exactly."""
     model.pages = [model.pages[3], model.pages[0], model.pages[4]]
     entries = model.to_entries()
     ordered = [(e.label, s.index) for e in entries for s in e.pages]
@@ -166,7 +166,7 @@ def test_window_constructs(window):
 
 
 def test_page_list_is_a_single_vertical_column(window):
-    """The user asked for one column with a preview beside it."""
+    """The page list is a single column with the preview beside it."""
     from PySide6.QtWidgets import QListView
 
     assert window.page_list.viewMode() == QListView.ListMode
@@ -289,7 +289,7 @@ def test_policy_exclusions_are_not_failures():
 
 
 def test_row_label_leads_with_the_original_filename(tmp_path):
-    """The filename must lead the row so the column sorts and scans by source."""
+    """The row label starts with the filename, so rows sort by source."""
     from consolidator.gui.main_window import row_description
     from consolidator.model import Segment
 
@@ -298,8 +298,7 @@ def test_row_label_leads_with_the_original_filename(tmp_path):
 
 
 def test_row_label_names_the_email_part(tmp_path):
-    """An email's body and attachments must be distinguishable, and the repeated
-    message stem must not be repeated on every row."""
+    """Email body and attachment rows are distinct and omit the message stem."""
     from consolidator.gui.main_window import row_description
     from consolidator.model import ATTACHMENT, Segment
 
@@ -339,7 +338,7 @@ def test_embedded_messages_are_drilled_into_by_default():
 
 
 def test_the_file_dialog_filter_covers_everything_that_converts():
-    """The dialog list is built from the converters, so it cannot drift."""
+    """The dialog list is built from the converters, so the two stay in sync."""
     from consolidator import convert
     from consolidator.gui.main_window import SUPPORTED_FILTER
 
@@ -464,7 +463,7 @@ def test_unticking_a_nested_message_leaves_out_everything_inside_it(window, tmp_
 
 
 def test_indexes_keep_up_with_removal(tmp_path):
-    """The lookup indexes must not go stale when segments come and go."""
+    """The lookup indexes stay current when segments are added and removed."""
     model = DocumentModel()
     a = model.add_segment(Path("a.docx"), "a", make_pdf(tmp_path / "a.pdf", 2),
                           True, page_count=2)
@@ -486,7 +485,7 @@ def test_indexes_keep_up_with_removal(tmp_path):
 
 def test_progress_bar_counts_files_and_shows_what_is_happening(window):
     # isHidden() rather than isVisible(): the test window is never shown, so
-    # every child would report itself invisible.
+    # every child reports itself invisible.
     window._begin_progress(4, "Converting 4 file(s)\u2026")
     assert not window.progress.isHidden()
     assert (window.progress.minimum(), window.progress.maximum()) == (0, 4)
@@ -503,13 +502,12 @@ def test_progress_bar_counts_files_and_shows_what_is_happening(window):
 
 
 def test_thumbnails_survive_two_threads_and_a_tiny_document_cache(tmp_path):
-    """The reported bug: a page that "fails to render" on a large folder.
+    """Thumbnails render when two threads share a small document cache.
 
-    The thumbnail worker renders on one thread while the preview renders on the
-    GUI thread. The document cache evicts and *closes* documents once it is full -
-    which a large folder always fills - so without a lock a document could be
-    closed midway through rendering it. pypdfium2 raises, the failure was
-    swallowed, and those thumbnails simply never appeared.
+    The thumbnail worker renders on one thread and the preview on the GUI thread.
+    The document cache closes the documents it evicts, so without a lock a document
+    can be closed during rendering. pypdfium2 then raises and the thumbnail is
+    missing. Guards against pages that fail to render in large folders.
     """
     import threading
     from consolidator.gui.thumbs import ThumbnailCache
@@ -543,7 +541,7 @@ def test_thumbnails_survive_two_threads_and_a_tiny_document_cache(tmp_path):
 
 
 def test_a_failed_thumbnail_is_reported_not_hidden(window, tmp_path):
-    """A silent gap cannot be told from a page that was never there."""
+    """A failed thumbnail is reported, since a blank gap looks like a missing page."""
     pdf = make_pdf(tmp_path / "alpha.pdf", 1)
     window.model.add_segment(Path("alpha.docx"), "alpha", pdf, True, page_count=1)
     window.refresh_pages()
@@ -570,7 +568,7 @@ def test_a_clean_thumbnail_run_says_nothing(window, tmp_path):
 
 
 def test_only_the_visible_pages_are_rendered(window, tmp_path):
-    """Several hundred files must not mean several hundred rendered thumbnails."""
+    """Only thumbnails near the visible rows are rendered, not one per page."""
     from consolidator.gui.main_window import (
         THUMBNAIL_MARGIN, VISIBLE_PAGES,
     )
@@ -615,7 +613,7 @@ def test_cancel_stops_a_batch_part_way(window):
 
 
 def test_a_cancelled_run_is_reported_as_stopped_not_as_failures(window):
-    """Whatever did not get converted was cancelled, not broken."""
+    """Files left unconverted by a cancel are reported as stopped, not failed."""
     from types import SimpleNamespace
 
     report = SimpleNamespace(sources=[], all_segments=[], segments=[], cancelled=True)
@@ -625,7 +623,7 @@ def test_a_cancelled_run_is_reported_as_stopped_not_as_failures(window):
 
 
 def test_a_second_pass_is_reported_so_the_user_can_act_on_it(window):
-    """If LibreOffice needed a single-file pass, say so and suggest the remedy."""
+    """A single-file LibreOffice pass is reported along with the suggested fix."""
     from types import SimpleNamespace
 
     report = SimpleNamespace(sources=[], all_segments=[], segments=[],
@@ -648,7 +646,7 @@ def test_a_clean_run_says_nothing_about_a_second_pass(window):
 
 
 def test_a_merge_that_skipped_something_says_so(window, monkeypatch):
-    """A document that is quietly short is worse than one that fails."""
+    """Items skipped during the merge are reported to the user."""
     from types import SimpleNamespace
     from PySide6.QtWidgets import QMessageBox
 
@@ -682,7 +680,7 @@ def test_a_merge_without_skips_hides_the_banner(window, monkeypatch):
 
 
 def test_failures_are_reported_without_blocking_the_window(window):
-    """A few failures in a big batch must not stop the interface to announce it."""
+    """Failures are shown in a banner instead of a blocking dialog."""
     from consolidator.model import ATTACHMENT, Segment
 
     failures = [
@@ -703,7 +701,7 @@ def test_failures_are_reported_without_blocking_the_window(window):
 
 
 def test_retry_from_the_banner_covers_each_source_once(window):
-    """Retrying a message with three broken parts must not convert it three times."""
+    """Retrying converts each failed source once, even with several failed parts."""
     from consolidator.model import ATTACHMENT, Segment
 
     asked = []
@@ -749,7 +747,7 @@ def test_about_text_states_the_licence_and_the_warranty_position():
 
 
 def test_licences_are_found_beside_a_frozen_executable(qapp, tmp_path, monkeypatch):
-    """In the bundle the texts sit beside the exe, not in a checkout."""
+    """In the bundled build the texts are found beside the exe."""
     from consolidator.gui import licences
 
     bundle = tmp_path / "PDFConsolidator"
@@ -773,7 +771,7 @@ def test_licences_are_found_beside_a_frozen_executable(qapp, tmp_path, monkeypat
 
 
 def test_the_window_offers_the_licences(qapp):
-    """The About button and the Help menu both have to exist and be wired."""
+    """The About button and the Help menu exist and are connected."""
     from consolidator.gui.main_window import MainWindow
 
     win = MainWindow()
@@ -810,7 +808,7 @@ def _jump(window, text: str) -> bool:
 
 
 def test_the_jump_is_an_icon_button_not_a_row_click(window, tmp_path):
-    """Clicking a row must not move the page list; the button is the action."""
+    """Clicking a row does not move the page list; only the jump button does."""
     from PySide6.QtWidgets import QStyle
 
     assert window.btn_jump.toolTip().startswith("Show the selected item's pages")
@@ -1027,7 +1025,7 @@ def test_a_row_click_away_from_the_arrow_still_does_not_jump(window, tmp_path):
 
 
 def test_a_reticked_attachment_returns_to_its_place(tmp_path):
-    """Its pages used to be re-inserted at the very top of the document."""
+    """Re-ticked pages return to their original position, not the top of the document."""
     model = DocumentModel()
     for name, count in (("a", 2), ("b", 1), ("c", 2)):
         model.add_segment(Path(name + ".pdf"), name,
@@ -1085,7 +1083,7 @@ def test_policy_defaults_to_the_global_setting(window_with_emails):
 
 
 def test_each_email_keeps_its_own_policy(window_with_emails):
-    """The user asked for extraction to be decided email by email."""
+    """Extraction settings apply to each email separately."""
     window = window_with_emails
 
     _select_source(window, "first.eml")
@@ -1094,7 +1092,7 @@ def test_each_email_keeps_its_own_policy(window_with_emails):
     assert first.documents is False
 
     _select_source(window, "second.eml")
-    # The second email must still have the default.
+    # The second email still has the default.
     assert window.policy_for(Path("second.eml")).documents is True
     assert window.policy_checks["documents"].isChecked() is True
 
@@ -1176,14 +1174,14 @@ def test_remove_failed_for_ignores_successes(tmp_path):
 
 
 def test_retry_replaces_failed_segments_with_pages(window, tmp_path, monkeypatch):
-    """What 'Retry failed' does once a conversion finally succeeds."""
+    """'Retry failed' replaces failed segments with pages once conversion succeeds."""
     from PySide6.QtWidgets import QMessageBox
 
     from consolidator.gui import main_window as mw
     from consolidator.model import Segment, SourceResult
     from consolidator.pipeline import BuildReport
 
-    # The success path pops a dialog; answering it is not what is under test.
+    # The success path opens a dialog; stub it out.
     monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
 
     window.model.add_segment(Path("broken.doc"), "broken", None, False,
@@ -1252,18 +1250,17 @@ def test_retry_uses_a_separate_scratch_subdirectory(window, tmp_path, monkeypatc
 
 
 def test_adding_files_schedules_conversion(window, tmp_path):
-    """Pages should appear without the user pressing Convert."""
+    """Adding files queues conversion without pressing Convert."""
     pdf = make_pdf(tmp_path / "a.pdf", 1)
     window._add([pdf])
     assert window._autoconvert.isActive(), "conversion should be queued"
 
 
 def test_autoconvert_timer_runs_the_incremental_path(window, tmp_path, monkeypatch):
-    """Regression: the timer was wired to the full re-convert.
+    """The autoconvert timer runs the incremental conversion, not a full re-convert.
 
-    That would have discarded page edits every time a file was added, which is
-    the exact thing the incremental design exists to prevent. This asserts the
-    wiring rather than just the method.
+    A full re-convert discards page edits each time a file is added. This checks
+    the timer wiring, not only the method.
     """
     calls = []
     monkeypatch.setattr(
@@ -1284,7 +1281,7 @@ def test_autoconvert_timer_runs_the_incremental_path(window, tmp_path, monkeypat
 
 
 def test_convert_button_is_still_a_full_reconvert(window, tmp_path, monkeypatch):
-    """The Convert button stays, and does rebuild everything."""
+    """The Convert button rebuilds everything."""
     calls = []
     monkeypatch.setattr(
         window, "_run_conversion",
@@ -1381,7 +1378,7 @@ def test_page_list_also_handles_delete(window, tmp_path):
 
 
 def test_preview_reflects_rotation(window, tmp_path):
-    """Rotating must be visible in the preview, or it looks like nothing happened."""
+    """Rotating a page updates the preview."""
     pdf = make_pdf(tmp_path / "a.pdf", 1)          # 612x792, portrait
     window.model.add_segment(Path("a.docx"), "a", pdf, True, page_count=1)
     window.refresh_pages()
@@ -1398,7 +1395,7 @@ def test_preview_reflects_rotation(window, tmp_path):
 
 
 def test_qt_rotation_is_clockwise_matching_pdf():
-    """PDF /Rotate turns clockwise; the preview must agree."""
+    """The preview rotates clockwise, matching PDF /Rotate."""
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QColor, QImage, QTransform
 
@@ -1429,7 +1426,7 @@ def test_rotating_270_returns_the_marker_to_the_bottom_left():
 
 
 def test_closing_is_prompt(window):
-    """Waiting the full cancel timeout per worker made closing feel sluggish."""
+    """Closing does not wait the full cancel timeout for each worker."""
     import time as _time
 
     from PySide6.QtGui import QCloseEvent

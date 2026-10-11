@@ -1,20 +1,15 @@
 """Page thumbnail rendering.
 
-Rendering happens off the GUI thread, so the cache returns ``QImage`` rather than
-``QPixmap``: Qt only permits pixmaps to be built on the GUI thread, and creating
-one in a worker is a crash rather than an error.
+Rendering runs off the GUI thread, so the cache returns ``QImage`` rather than
+``QPixmap``: Qt only allows pixmaps on the GUI thread, and creating one in a
+worker crashes.
 
-Both caches are bounded. A folder of several hundred files can hold tens of
-thousands of pages, and keeping every rendered thumbnail and every PDF handle for
-that would cost more memory than the documents themselves - and, on Windows, more
-file handles than the process is allowed.
+Both caches are bounded, so large batches do not use excessive memory or, on
+Windows, exceed the process file-handle limit.
 
-**Two threads use this**: the thumbnail worker renders rows, and the GUI thread
-renders the preview. Bound caches mean eviction, and eviction closes documents, so
-every entry point takes a lock. Without it, the preview opening a new document
-could close the very document the worker was rendering from - and a thumbnail that
-fails to render is invisible, so a scatter of pages simply never appeared. That is
-what "a section of the document fails to render" looked like on a large folder.
+Two threads use this class: the thumbnail worker renders rows and the GUI thread
+renders the preview. Eviction closes documents, so every entry point takes a
+lock; otherwise one thread could close a document the other is rendering from.
 """
 
 from __future__ import annotations
@@ -28,24 +23,21 @@ from PySide6.QtGui import QImage
 
 from ..pdfium_guard import PDFIUM_LOCK
 
-# Thumbnails are rendered at this pixel height and cached.
+# Thumbnail size in pixels.
 THUMB_HEIGHT = 150
 THUMB_WIDTH = 116
 
-# How many rendered thumbnails to keep, and how many documents to hold open. The
-# defaults cover far more than a screenful - the page column only ever asks for
-# what is near the viewport - while staying small enough to be irrelevant to
-# memory.
+# Maximum number of cached thumbnails and of open documents. Both are well
+# above what the page list requests near the viewport, and small in memory.
 IMAGE_CACHE_SIZE = 600
 DOCUMENT_CACHE_SIZE = 24
 
 
 def fit_scale(page_size: tuple[float, float], height: int, width: int) -> float:
-    """The pdfium render scale that fits a page inside ``width`` x ``height``.
+    """Return the pdfium scale that fits a page in ``width`` x ``height``.
 
-    Fitting by height alone is fine for paper and dangerous for anything else: a
-    banner or a long drawing a few points tall asked pdfium for a bitmap millions
-    of pixels wide, which fails at best and takes the process down at worst.
+    Width is bounded as well as height, because a very wide, short page scaled
+    by height alone would request a huge bitmap that can crash pdfium.
     """
     page_width = max(float(page_size[0]), 1.0)
     page_height = max(float(page_size[1]), 1.0)
@@ -53,12 +45,10 @@ def fit_scale(page_size: tuple[float, float], height: int, width: int) -> float:
 
 
 class ThumbnailCache:
-    """Lazily renders and caches page thumbnails, keyed by (pdf, page index).
+    """Render and cache page thumbnails, keyed by (pdf, page index).
 
-    Documents are opened once and kept while they are being used, because
-    reopening a PDF per page is far more expensive than rendering from an open
-    handle. Least recently used documents are closed again, which is what keeps
-    the handle count flat as files are added.
+    Documents stay open while in use, because reopening a PDF per page is slow.
+    Least recently used documents are closed to keep the handle count bounded.
     """
 
     def __init__(self, height: int = THUMB_HEIGHT,
@@ -69,14 +59,12 @@ class ThumbnailCache:
         self._document_limit = document_cache
         self._documents: OrderedDict[str, object] = OrderedDict()
         self._images: OrderedDict[tuple[str, int], QImage] = OrderedDict()
-        # Held for the whole of every render, so a document cannot be closed by
-        # another thread midway through using it. It is the process-wide pdfium
-        # lock, because pdfium is not safe to enter from two threads at all - and
-        # the output verifier uses it from a third. Re-entrant because the public
-        # methods call the private helpers that also take it.
+        # Held for each whole render, so another thread cannot close the
+        # document mid-render. Uses the process-wide pdfium lock because pdfium
+        # is not thread-safe and the output verifier also uses it. Re-entrant
+        # because public methods call helpers that also take it.
         self._lock = PDFIUM_LOCK
-        # Renders that raised. A missing thumbnail is otherwise silent, and a
-        # silent gap is impossible to tell from a page that was never there.
+        # Count and last message of failed renders, so the GUI can report them.
         self.failed = 0
         self.last_error = ""
 
@@ -131,7 +119,7 @@ class ThumbnailCache:
                 if index < 0 or index >= len(document):
                     return None
                 page = document[index]
-                # Twice the displayed size, so the thumbnail is sharp when shrunk.
+                # Render at twice the displayed size so the thumbnail stays sharp.
                 scale = fit_scale(page.get_size(), THUMB_HEIGHT * 2, THUMB_WIDTH * 2)
                 pil = page.render(scale=scale).to_pil()
                 pil.thumbnail((THUMB_WIDTH * 2, THUMB_HEIGHT * 2))
@@ -165,10 +153,9 @@ class ThumbnailCache:
                 self._images.pop(cached_key, None)
 
     def render(self, pdf: Path, index: int, height: int) -> QImage | None:
-        """Render one page at an arbitrary height, for the preview pane.
+        """Render one page at the given height for the preview pane.
 
-        Not cached: the preview changes as the user clicks around, and caching
-        every size would grow without bound.
+        Not cached, because caching every requested size would grow without bound.
         """
         with self._lock:
             try:
@@ -176,7 +163,7 @@ class ThumbnailCache:
                 if index < 0 or index >= len(document):
                     return None
                 page = document[index]
-                # Bounded in width too: the preview pane is never wider than this.
+                # Also limit width to twice the height.
                 scale = fit_scale(page.get_size(), height, height * 2)
                 pil = page.render(scale=scale).to_pil()
                 if pil.height > height:

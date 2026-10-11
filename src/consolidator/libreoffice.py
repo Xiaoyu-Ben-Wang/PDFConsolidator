@@ -1,23 +1,22 @@
-"""LibreOffice headless conversion engine.
+"""Convert documents to PDF with headless LibreOffice.
 
-LibreOffice is driven as a subprocess rather than through COM, which makes it
-deterministic, dialog-free and safely killable - the properties Office COM could
-not provide here.
+LibreOffice runs as a subprocess, which shows no dialogs and can be killed
+safely.
 
-Three behaviours of the command line drive the design:
+Command-line behaviour that shapes this module:
 
-1. **Startup dominates.** Converting N files in one invocation is dramatically
-   faster than N invocations, because each ``soffice`` start costs seconds. So the
-   primary entry point takes a batch.
-2. **The output name is not controllable.** Output is always
-   ``<input-stem>.pdf`` in ``--outdir``, so two inputs sharing a stem collide. The
-   caller must give each file a unique stem in its own scratch directory.
-3. **Exit codes lie.** ``soffice`` can exit 0 having done nothing, and exit 1
-   having succeeded. Every result is therefore verified by checking that a
-   non-empty output file actually exists.
+1. **Startup is slow.** Each ``soffice`` start takes seconds, so converting
+   many files in one invocation is much faster. The main entry point takes a
+   batch.
+2. **Output names are fixed.** Output is always ``<input-stem>.pdf`` in
+   ``--outdir``, so inputs with the same stem collide. Callers must give each
+   file a unique stem.
+3. **Exit codes are unreliable.** ``soffice`` can exit 0 without output and
+   exit 1 after succeeding. Success is checked by looking for a non-empty
+   output file.
 
-A further trap: two ``soffice`` processes sharing a user profile fail *silently*.
-Each run therefore gets its own profile directory via ``-env:UserInstallation``.
+Two ``soffice`` processes that share a user profile fail without an error, so
+each run gets its own profile via ``-env:UserInstallation``.
 """
 
 from __future__ import annotations
@@ -35,29 +34,27 @@ from pathlib import Path
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-# Distinguishes concurrent profiles within one process.
+# Gives concurrent profiles in one process distinct names.
 _profile_counter = itertools.count(1)
 
-# A start-up plus conversion budget for a batch. Large batches may need more.
+# Timeout in seconds for one batch, including startup. Large batches may need more.
 DEFAULT_TIMEOUT = 600
 
 
-# Every soffice this process has running, so they can all be stopped at once when
-# the application closes. A conversion is a blocking call that can last minutes;
-# without a way to end it, closing the window mid-run either waited that long or
-# left the worker thread running while Python shut down underneath it - which Qt
-# answers by aborting the whole process.
+# All running soffice processes, so they can be stopped when the application
+# closes. A conversion blocks for up to minutes; if the worker thread is still
+# running when Python shuts down, Qt aborts the process.
 _running: set[subprocess.Popen] = set()
 _running_lock = threading.Lock()
 _stopping = threading.Event()
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
-    """End ``soffice`` *and* the ``soffice.bin`` it starts.
+    """Kill ``soffice`` and the ``soffice.bin`` process it starts.
 
-    ``soffice.exe`` is only a launcher. Killing it alone - which is all
-    ``Popen.kill`` and ``subprocess.run``'s timeout do - leaves the real process
-    running, holding the files it was converting open.
+    ``soffice.exe`` is only a launcher. ``Popen.kill`` and the timeout in
+    ``subprocess.run`` kill only the launcher, leaving ``soffice.bin`` running
+    with its files open.
     """
     if proc.poll() is not None:
         return
@@ -74,10 +71,10 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 
 
 def stop_all() -> None:
-    """Stop every running conversion, and refuse to start new ones.
+    """Stop all running conversions and block new ones.
 
-    For shutdown. The conversions in progress fail and report so; nothing is
-    half-written in their place, because outputs are verified before use.
+    Used at shutdown. Running conversions report failure; partial outputs are
+    not used because outputs are verified before use.
     """
     _stopping.set()
     with _running_lock:
@@ -87,24 +84,23 @@ def stop_all() -> None:
 
 
 def stopping() -> bool:
-    """Whether :func:`stop_all` has been called and not yet undone."""
+    """Return True if :func:`stop_all` was called and :func:`resume` was not."""
     return _stopping.is_set()
 
 
 def resume() -> None:
-    """Allow conversions again after :func:`stop_all` (a window closed, the app did not)."""
+    """Allow conversions again after :func:`stop_all` (a window closed, the app still runs)."""
     _stopping.clear()
 
 
 class _Gate:
-    """Lets conversions run side by side, or one run entirely alone.
+    """Shared/exclusive lock for conversions.
 
-    LibreOffice is known to fall over when several of its processes work at once
-    on one machine. Ordinary conversions share the gate; a retry of something
-    that failed takes it exclusively - it waits for the running ones to finish,
-    and no new one starts until it is done - so the retry has no concurrency to
-    lose to. The thread holding it exclusively may still convert (that is the
-    point), so the gate is re-entrant for that thread.
+    LibreOffice can fail when several of its processes run at once. Normal
+    conversions take the gate shared. A retry of a failed conversion takes it
+    exclusively: it waits for running conversions to finish and blocks new ones
+    until it is done. The exclusive holder must still be able to convert, so
+    the gate is re-entrant for that thread.
     """
 
     def __init__(self) -> None:
@@ -119,7 +115,7 @@ class _Gate:
     def acquire_shared(self) -> bool:
         with self._condition:
             if self._mine():
-                return False                    # inside our own exclusive section
+                return False                    # this thread holds the gate exclusively
             while self._owner is not None:
                 self._condition.wait()
             self._shared += 1
@@ -154,7 +150,7 @@ _gate = _Gate()
 
 
 class alone:
-    """``with libreoffice.alone():`` - convert with no other soffice running."""
+    """Context manager that runs conversions with no other soffice running."""
 
     def __enter__(self):
         _gate.acquire_exclusive()
@@ -164,9 +160,9 @@ class alone:
         _gate.release_exclusive()
 
 
-# Where failed invocations are described, if the application has set it. A
-# failure on a user's machine is otherwise impossible to diagnose without their
-# documents; this records what LibreOffice said, which names no content.
+# Optional log file for failed invocations. It records LibreOffice's output,
+# which helps diagnose failures without the user's documents and contains no
+# document content.
 failure_log: Path | None = None
 
 
@@ -183,7 +179,7 @@ def _log_failure(cmd: list[str], detail: str) -> None:
 
 
 def _run(cmd: list[str], timeout: int, env: dict[str, str]) -> tuple[str, str, bool]:
-    """Run ``soffice`` to completion, through the gate. See :func:`_run_now`."""
+    """Run ``soffice`` under the shared gate. See :func:`_run_now`."""
     shared = _gate.acquire_shared()
     try:
         return _run_now(cmd, timeout, env)
@@ -236,10 +232,10 @@ class BatchResult:
 
 
 def app_root() -> Path:
-    """Directory that holds the application's bundled resources.
+    """Return the directory that holds the application's bundled resources.
 
-    Frozen by PyInstaller this is the folder containing the executable; running
-    from source it is the repository root (two levels above this file).
+    In a PyInstaller build this is the executable's folder; from source it is
+    the repository root (two levels above this file).
     """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
@@ -280,13 +276,12 @@ def require_soffice() -> Path:
 def _remove_tree(path: Path, attempts: int = 6, delay: float = 0.4) -> None:
     """Remove a scratch directory, including LibreOffice's lock files.
 
-    Two obstacles, both silent under ``rmtree(ignore_errors=True)``:
+    ``rmtree(ignore_errors=True)`` hides two problems:
 
-    * ``soffice`` can still hold its ``.~lock.<name>#`` file open for a moment
-      after it appears to have exited, so removal is retried briefly.
-    * It marks those lock files **read-only**, and Windows refuses to delete a
-      read-only file (``WinError 5``). The attribute must be cleared first -
-      otherwise every conversion leaves its scratch directory behind.
+    * ``soffice`` can hold its ``.~lock.<name>#`` file open briefly after it
+      exits, so removal is retried.
+    * The lock files are read-only, and Windows does not delete read-only files
+      (``WinError 5``), so the attribute is cleared first.
     """
     for _ in range(attempts):
         if not path.exists():
@@ -317,20 +312,16 @@ def _remove_lock(directory: Path, name: str) -> None:
 
 
 def _profile_dir(workdir: Path) -> Path:
-    """A per-run LibreOffice user profile, at a deliberately **short** path.
+    """Create a per-run LibreOffice user profile at a short path.
 
-    Two constraints shape this:
+    * Two ``soffice`` processes that share a profile fail without an error, so
+      each run needs its own.
+    * LibreOffice does not opt in to Windows long paths. Its profile contains
+      deep internal paths, and placing it under a deep working directory pushes
+      them past ``MAX_PATH`` and crashes LibreOffice.
 
-    * Two ``soffice`` processes sharing a profile fail *silently*, so every run
-      needs its own.
-    * LibreOffice is not manifested for long paths. Its profile holds very deep
-      internal paths, and nesting the profile under a deep working directory
-      pushes those past ``MAX_PATH`` and crashes it - Windows' long-path setting
-      does not help, because it only applies to applications that opt in.
-
-    So the profile lives at a short fixed prefix beside the application rather
-    than under the run's working directory. ``workdir`` is accepted so callers
-    have one place to pass it, but is deliberately not where the profile goes.
+    The profile is therefore created under a short fixed directory beside the
+    application. ``workdir`` is accepted but not used for the profile location.
     """
     home = app_root() / "lo-profiles"
     home.mkdir(parents=True, exist_ok=True)
@@ -342,28 +333,19 @@ def _profile_dir(workdir: Path) -> Path:
 
 
 def clean_env(tmpdir: Path | None = None) -> dict[str, str]:
-    """Environment for launching ``soffice``.
+    """Return the environment for launching ``soffice``.
 
-    Two corrections are applied, both learned the hard way:
-
-    **1. Strip the host's Python variables.** LibreOffice bundles its own Python
-    and its bootstrap reads ``PYTHONPATH``/``PYTHONHOME``. Because this
-    application is itself Python, those variables point at the *host's*
-    libraries and break LibreOffice's start-up with::
+    **1. Remove Python variables.** LibreOffice bundles its own Python, and its
+    startup reads ``PYTHONPATH``/``PYTHONHOME``. The subprocess inherits this
+    application's environment (or a user's global ``PYTHONPATH``), which points
+    at the wrong libraries and makes startup fail with::
 
         Could not find platform independent libraries <prefix>
 
-    A user with ``PYTHONPATH`` set globally would hit this too, and a subprocess
-    inherits our environment, so they must be removed explicitly.
-
-    **2. Point TMP/TEMP at a directory we know is writable.** LibreOffice creates
-    work files while loading a document, and if it cannot, it fails with the
-    unhelpful ``Error: source file could not be loaded``. The system temp
-    directory can be missing, full, or - as on the machine this was developed on
-    - simply not writable by the process launching it. Giving the engine its own
-    scratch directory removes an entire class of environmental failure, which
-    matters a great deal for an application meant to run from a USB stick on an
-    unfamiliar machine.
+    **2. Set TMP/TEMP to a writable directory.** LibreOffice writes temporary
+    files while loading a document; if it cannot, it fails with ``Error: source
+    file could not be loaded``. The system temp directory may be missing, full
+    or not writable, so ``tmpdir`` is used instead when given.
     """
     env = os.environ.copy()
     for name in (
@@ -404,11 +386,9 @@ def convert_batch(
     if not sources:
         return BatchResult()
 
-    # LibreOffice cannot cope with a relative source path or a relative --outdir:
-    # it reports "Error: source file could not be loaded" and produces nothing,
-    # with no hint that the path was the problem. Everything it is told about is
-    # therefore absolute. The result dictionaries stay keyed by the paths the
-    # caller passed, so callers can still look up their own paths.
+    # LibreOffice fails on a relative source path or --outdir with "Error: source
+    # file could not be loaded", so all paths passed to it are absolute. Results
+    # stay keyed by the caller's original paths.
     outdir = workdir.resolve()
     targets = [(src, src.resolve()) for src in sources]
 
@@ -430,12 +410,10 @@ def convert_batch(
         str(outdir),
     ] + [str(target) for _src, target in targets]
 
-    # A stale output would masquerade as success, so clear expected names first.
-    # So must a stale *lock*: LibreOffice leaves a read-only ``.~lock.<name>#``
-    # beside every PDF it writes, even on success, and while one exists it cannot
-    # write that name again - it fails with an I/O abort and no output, which
-    # read as "LibreOffice crashed" on every retry or re-conversion into the
-    # same directory.
+    # Remove old outputs so they are not mistaken for new ones. Also remove old
+    # locks: LibreOffice leaves a read-only ``.~lock.<name>#`` beside each PDF it
+    # writes, even on success, and cannot write that name again while the lock
+    # exists (it aborts with an I/O error and no output).
     for src in sources:
         stale = outdir / (src.stem + ".pdf")
         if stale.exists():
@@ -449,10 +427,10 @@ def convert_batch(
 
     result = BatchResult(seconds=seconds, stdout=stdout, stderr=stderr, timed_out=timed_out)
 
-    # A crash dump in the profile explains an otherwise silent empty result.
+    # A crash dump in the profile can explain an empty result.
     crashed = (profile / "crash" / "dump.ini").exists()
 
-    # Never trust the exit code - verify each expected artifact.
+    # Ignore the exit code; check each expected output file.
     missing = []
     for src in sources:
         out = outdir / (src.stem + ".pdf")
@@ -462,11 +440,9 @@ def convert_batch(
             missing.append(src)
 
     if missing:
-        # LibreOffice leaves a crash dump behind on an ordinary exit as well as a
-        # real one, so "there is a dump" only explains a failure when the whole
-        # invocation produced nothing. Blaming a crash for one file in a batch
-        # that otherwise converted was simply wrong, and hid the real reason -
-        # which is usually on stderr.
+        # LibreOffice can write a crash dump on a normal exit too, so report a
+        # crash only when the whole batch produced nothing. Otherwise use the
+        # last line of stderr, which usually gives the reason.
         detail = (stderr or stdout or "").strip().splitlines()
         fallback = detail[-1] if detail else "no output produced"
         if timed_out:
@@ -485,7 +461,7 @@ def convert_batch(
     for src in sources:
         _remove_lock(outdir, src.stem + ".pdf")
 
-    # The profile is large and belongs to this run only.
+    # The profile is large and used only by this run.
     _remove_tree(profile)
 
     return result
@@ -499,9 +475,9 @@ def convert_one(
 ) -> Path:
     """Convert a single file to ``dest``.
 
-    ``soffice`` always names its output after the input, so the file is converted
-    into a private directory and then moved into place. A private directory this
-    function created is removed again; one the caller supplied is left alone.
+    ``soffice`` always names its output after the input, so the file is
+    converted in a scratch directory and then moved to ``dest``. The scratch
+    directory is removed only if this function created it.
     """
     src = Path(src)
     dest = Path(dest)

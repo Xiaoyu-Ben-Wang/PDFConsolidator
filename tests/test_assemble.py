@@ -63,15 +63,15 @@ def test_rotation_is_applied(tmp_path, two_pdfs):
     assemble.merge([entry], dest, page_size=pages.LETTER)
 
     page = PdfReader(str(dest)).pages[0]
-    # Fitting folds the rotation into the content, so the sheet keeps the size
-    # asked for. Leaving it as /Rotate fitted the page in its unrotated frame,
-    # which clipped the sides of a rotated landscape page (see test_verify).
+    # Fitting applies the rotation to the content, so the page keeps the
+    # requested size. A /Rotate entry would fit the page in its unrotated frame
+    # and clip a rotated landscape page (see test_verify).
     assert int(page.get("/Rotate", 0) or 0) % 360 == 0
     assert (round(float(page.mediabox.width)), round(float(page.mediabox.height))) ==         (round(pages.LETTER[0]), round(pages.LETTER[1]))
 
 
 def test_rotation_without_fitting_stays_a_rotate_entry(tmp_path, two_pdfs):
-    """Without a page size nothing is rewritten: the rotation is just /Rotate."""
+    """Without a page size, the rotation is stored as a /Rotate entry."""
     entry = assemble.MergeEntry(two_pdfs[0], "alpha", pages=[assemble.PageSpec(0, 90)])
     dest = tmp_path / "rot.pdf"
     assemble.merge([entry], dest)
@@ -272,7 +272,7 @@ LONG_NAME = ("Quarterly_financial_report_for_the_northern_region_including_all_"
 
 
 def _words_inside(path, index):
-    """(text, x0, x1) for each run of text on a page, from pdfium."""
+    """Return the page width, its text and each character's box, using pdfium."""
     import pypdfium2 as pdfium
 
     document = pdfium.PdfDocument(str(path))

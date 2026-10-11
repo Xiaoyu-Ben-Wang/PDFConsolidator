@@ -1,19 +1,16 @@
 """Phase A orchestration: gather sources, convert each to PDF segment(s), assemble.
 
-Two things shape this module:
-
 * **A source can yield several segments.** An Outlook item produces a body
-  segment plus one per extracted attachment, and those all become pages. So the
-  pipeline works in segments, not files.
-* **LibreOffice start-up dominates.** Documents it lays out - Office files and web
-  unique names and converted in a single batched invocation, which is far faster
-  than one invocation each. Staging with an index prefix also removes any chance
-  of two files with the same name colliding, since ``soffice`` always names its
-  output after its input.
+  segment plus one per extracted attachment, so the pipeline works in segments,
+  not files.
+* **LibreOffice start-up time dominates.** Documents it converts (Office files
+  and web pages) are staged under unique names and converted in batched
+  invocations instead of one invocation per file. The index prefix on staged
+  names also prevents collisions between files with the same name, since
+  ``soffice`` names its output after its input.
 
-Conversion and assembly are separate entry points on purpose: the GUI converts
-once, then lets the user edit for as long as they like without repeating any of
-the expensive work.
+Conversion and assembly are separate entry points so the GUI can convert once
+and let the user edit without repeating the conversion.
 """
 
 from __future__ import annotations
@@ -32,13 +29,11 @@ from .model import DOCUMENT, Segment, SourceResult
 
 OFFICE_BATCH_TIMEOUT = 900
 
-# How many LibreOffice conversions to run at once. Most of the wall clock for many
-# small documents is start-up, and start-ups overlap perfectly; what does not scale
-# is memory, because each invocation gets its own profile and a loaded document.
-# Measured on a sixteen-core machine converting 48 documents: one at a time 63s,
-# four at a time 23s (2.7x). Eight was faster still (17s) but is deliberately not
-# used. CONSOLIDATOR_WORKERS can only lower this, for a machine that dislikes
-# several soffice processes.
+# Maximum number of concurrent LibreOffice conversions. Start-up time overlaps
+# well across processes; memory is the limit, since each invocation has its own
+# profile and loaded document. On a 16-core machine, 48 documents took 63s
+# sequentially and 23s with 4 workers. CONSOLIDATOR_WORKERS can only lower this
+# value, for machines that have trouble running several soffice processes.
 MAX_CONVERT_WORKERS = 4
 
 
@@ -51,13 +46,10 @@ def conversion_workers() -> int:
     return max(1, min(MAX_CONVERT_WORKERS, cores // 2))
 
 
-# LibreOffice reports nothing until it exits, so handing it every file at once
-# means a progress bar that does not move for minutes - which on a folder of a
-# thousand files is indistinguishable from a crash. The batch is split into a
-# handful of chunks instead: each costs one extra start-up (about five seconds
-# measured here) and buys a progress update. The floor avoids pointless
-# start-ups on small batches; the ceiling keeps the ticks frequent enough on
-# huge ones.
+# LibreOffice reports nothing until it exits, so a large batch is split into
+# chunks to allow progress updates. Each chunk costs one extra start-up (about
+# five seconds). The minimum avoids extra start-ups on small batches; the
+# maximum keeps updates frequent on large ones.
 BATCH_TARGET_CHUNKS = 15
 BATCH_CHUNK_MIN = 25
 BATCH_CHUNK_MAX = 100
@@ -81,26 +73,18 @@ def _chunks(items: list, size: int) -> list[list]:
 def _convert_jobs(jobs: list[tuple[list, Path]], timeout: int,
                   workers: int, on_done=None, on_fallback=None,
                   should_stop=None) -> list:
-    """Run LibreOffice batches, several at a time, and return the results in order.
+    """Run LibreOffice batches concurrently and return the results in job order.
 
-    Each invocation is a separate ``soffice`` process with its own profile and its
-    own output directory, so they do not collide - they just cost memory.
+    Each invocation is a separate ``soffice`` process with its own profile and
+    output directory, so concurrent runs do not collide.
 
-    A chunk that produces *nothing at all* is the signature of an **invocation**
-    that failed rather than of documents that failed, and running several at once
-    is the likeliest reason: LibreOffice is known to fall over when several of its
-    processes work at the same time on the same machine. Those chunks are
-    therefore not retried on the spot. They are set aside and re-run **one at a
-    time, after every other invocation has finished** - the point being that the
-    retry then has no concurrency to lose to. It costs a second pass on the
-    affected chunks and turns "the whole batch failed" into "the batch took
-    slightly longer".
+    A chunk that produces no output at all indicates that the invocation failed,
+    not the documents. The likely cause is concurrency: LibreOffice can fail when
+    several of its processes run at once. Such chunks are deferred and re-run one
+    at a time after all other invocations finish.
 
-    Once ``should_stop`` says so, or the application is closing, no further chunk
-    is started and nothing is retried: a chunk not started is left without a
-    result, exactly as if the run had not reached it. Without this a cancelled
-    batch carried on through every remaining chunk, and a closing window waited
-    for retries of chunks whose soffice it had just ended.
+    Once ``should_stop`` returns True, or the application is closing, no new
+    chunk starts and nothing is retried. Chunks not started get no result.
     """
     results: list = [None] * len(jobs)
 
@@ -124,7 +108,7 @@ def _convert_jobs(jobs: list[tuple[list, Path]], timeout: int,
             on_done(index, result)
 
     def convert_with_retry(index: int):
-        """One invocation, and one quiet second attempt if it produced nothing."""
+        """Run one invocation, retrying once if it produced nothing."""
         result = convert(index)
         if result is not None and jobs[index][0] and not result.produced and not stopping():
             time.sleep(RETRY_PAUSE_SECONDS)
@@ -172,9 +156,9 @@ class BuildReport:
     seconds: float = 0.0
     policy: email_items.ExtractionPolicy | None = None
     cancelled: bool = False
-    # Batches LibreOffice produced nothing for while running concurrently, and
-    # which therefore had to be redone one at a time. Non-zero is worth telling
-    # the user about: it means their machine dislikes several soffice at once.
+    # Number of batches that produced nothing when run concurrently and were
+    # re-run one at a time. Non-zero suggests the machine has trouble running
+    # several soffice processes at once.
     retried_batches: int = 0
 
     @property
@@ -201,17 +185,15 @@ class BuildReport:
 
 
 def choose_scratch(preferred_parent: Path | None = None) -> Path:
-    """Pick a scratch directory, verified writable by actually writing to it.
+    """Pick a scratch directory and verify it is writable by writing a test file.
 
-    The system temp directory is deliberately **not** the first choice. It can be
-    missing, full, or - as on the machine this was developed on - simply not
-    writable by the process that needs it. LibreOffice reports that failure as a
-    misleading ``source file could not be loaded``, which costs a lot of time to
-    diagnose once and should never have to be diagnosed twice.
+    The system temp directory is not the first choice: it can be missing, full,
+    or not writable by the process. LibreOffice reports that case as the
+    misleading error ``source file could not be loaded``.
 
-    A portable application is copied somewhere writable by definition, so its own
-    directory is the natural home for scratch files. The system temp directory is
-    kept only as a last resort, for a read-only installation.
+    A portable install lives in a writable location, so its own directory is
+    tried first. The system temp directory is the last resort, for read-only
+    installations.
     """
     candidates: list[Path] = [libreoffice.app_root() / ".scratch"]
     if preferred_parent is not None:
@@ -239,7 +221,10 @@ OWNER_FILE = ".owner"
 
 
 def _pid_alive(pid: int) -> bool:
-    """Whether a process exists. Never signals it (os.kill would end it on Windows)."""
+    """Return whether a process exists, without signalling it.
+
+    On Windows, os.kill would terminate the process, so the Win32 API is used.
+    """
     if pid <= 0:
         return False
     if os.name == "nt":
@@ -281,13 +266,12 @@ def claim_scratch(directory: Path) -> None:
 
 
 def sweep_stale_scratch(root: Path | None = None) -> int:
-    """Remove scratch left by runs of the application that are no longer running.
+    """Remove scratch directories left by application runs that have exited.
 
-    A run that ended abruptly - closed mid-conversion, killed, a power cut -
-    leaves its scratch behind, and on a portable install that is a growing pile
-    beside the executable. Only directories whose owner is gone are touched, so a
-    second instance running at the same time keeps its files. Returns how many
-    were removed.
+    A run that ends abruptly (killed, closed mid-conversion, power loss) leaves
+    its scratch files behind. Only directories whose owning process is gone are
+    removed, so a concurrently running instance keeps its files. Returns the
+    number of directories removed.
     """
     removed = 0
     roots = []
@@ -300,7 +284,7 @@ def sweep_stale_scratch(root: Path | None = None) -> int:
             try:
                 owner = int((candidate / OWNER_FILE).read_text(encoding="ascii").strip())
             except (OSError, ValueError):
-                continue        # unowned: not ours to judge
+                continue        # no owner recorded: leave it
             if not _pid_alive(owner):
                 libreoffice._remove_tree(candidate)
                 removed += not candidate.exists()
@@ -316,8 +300,8 @@ def sweep_stale_scratch(root: Path | None = None) -> int:
     return removed
 
 
-# Content sniffing reads the whole file only for containers (OLE, ZIP) that
-# need it; past this size a file without a usable name is left unidentified.
+# Content sniffing may read the whole file for containers (OLE, ZIP). Files
+# larger than this are not sniffed.
 SNIFF_LIMIT_BYTES = 256 * 1024 * 1024
 
 
@@ -380,18 +364,15 @@ def convert_sources(
 ) -> BuildReport:
     """Convert sources into segments without assembling anything.
 
-    This is the expensive half, and the GUI calls it once and then edits freely.
-    ``workdir`` must outlive the result, because the segments it returns are
-    paths into it.
+    ``workdir`` must outlive the result, because the returned segments point to
+    files inside it.
 
-    ``policy_for`` optionally supplies a per-source policy, so what gets extracted
-    can be decided separately for each email rather than globally for the batch.
+    ``policy_for`` optionally returns a per-source extraction policy, so each
+    email can be handled differently.
 
-    ``on_progress`` is called as ``(done, total, label)``: how many sources have
-    finished, how many there are, and what is happening now. A folder of several
-    hundred files takes long enough that a still window is indistinguishable from
-    a hung one. ``should_stop`` is polled between sources so that work can be
-    abandoned part-way - a batch that big has to be interruptible.
+    ``on_progress`` is called as ``(done, total, label)``: sources finished,
+    total sources, and the current step. ``should_stop`` is polled between
+    sources so the run can be cancelled part-way.
     """
     policy = policy or email_items.ExtractionPolicy()
     workdir = Path(workdir)
@@ -413,7 +394,7 @@ def convert_sources(
     done = 0
 
     def progress(label: str = "", step: bool = False) -> bool:
-        """Report progress. Returns True when the caller should stop."""
+        """Report progress and return True if the caller should stop."""
         nonlocal done
         if step:
             done += 1
@@ -432,7 +413,7 @@ def convert_sources(
     stopped = False
 
     def _asked_to_stop() -> bool:
-        """The caller's stop request, read directly rather than at the next tick."""
+        """Check for a stop request immediately, not at the next progress update."""
         if libreoffice.stopping():
             return True
         try:
@@ -458,9 +439,9 @@ def convert_sources(
         ext = src.suffix.lower()
         convertible = src          # what the converters are pointed at
 
-        # A file whose name does not say what it is - no extension, or one we do
-        # not handle - is judged by its content, and converted from a copy that
-        # carries the right extension. The source keeps its own name throughout.
+        # A file with no extension or an unrecognised one is identified by its
+        # content and converted from a copy with the correct extension. The
+        # source keeps its original name.
         if (src.exists() and ext not in convert.SUPPORTED_EXTS
                 and ext not in convert.KNOWN_UNSUPPORTED):
             sniffed = _sniff_file(src)
@@ -511,8 +492,8 @@ def convert_sources(
         total_documents = len(document_batch)
         size = _chunk_size(total_documents)
         groups = _chunks(document_batch, size)
-        # The staged copy is what LibreOffice is pointed at; the triples in
-        # ``groups`` are what maps a produced file back to the source it came from.
+        # LibreOffice converts the staged copies; the triples in ``groups`` map
+        # each output back to its source.
         jobs = [([staged for _index, _src, staged in group],
                  work / ("office%03d" % index))
                 for index, group in enumerate(groups)]
@@ -589,8 +570,8 @@ def convert_sources(
             parsed.append((index, src, item, html_path))
             emit("  read %s (%d attachment(s))" % (src.name, len(item.attachments)))
 
-        # Message bodies are rendered in batches too: start-up dominates, and
-        # rendering them one at a time costs seconds per message.
+        # Render message bodies in batches to avoid one LibreOffice start-up per
+        # message.
         bodies: dict[str, str] = {}
         body_errors: dict[str, str] = {}
         htmls = [h for _, _, _, h in parsed if h is not None]
@@ -626,7 +607,7 @@ def convert_sources(
             nonlocal stopped
             if stopped or _asked_to_stop():
                 stopped = True
-                return          # not reached, exactly as in a sequential run
+                return          # leave unprocessed, as a sequential run would
             index, src, item, html_path = job
             key = str(html_path) if html_path else ""
             try:
@@ -645,11 +626,9 @@ def convert_sources(
             results[index] = SourceResult(src, segments)
             stopped = progress(src.name, step=True)
 
-        # Expanding is where an email's *attachments* get converted, and an Office
-        # attachment is one LibreOffice run of its own, as is a nested message's
-        # body. A mailbox of messages carrying documents is therefore the slowest
-        # shape there is, and each message is independent of the others - so they
-        # run several at a time, bounded by the same limit.
+        # Expansion converts each email's attachments; each Office attachment and
+        # each nested message body is a separate LibreOffice run. Messages are
+        # independent, so they are expanded concurrently, up to the same limit.
         workers = conversion_workers()
         if workers > 1 and len(parsed) > 1 and not stopped:
             with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -672,17 +651,11 @@ def convert_sources(
         emit("  %s   %s" % ("ok  " if segment.ok else "FAIL", src.name))
         stopped = progress(src.name, step=True)
 
-    # ---- every produced PDF is opened once, and only then believed ----
+    # ---- Verify every produced PDF by opening it once ----
     #
-    # A converter that "succeeded" and left behind a PDF nobody can read used to
-    # become a segment with zero pages: the item appeared in the list and simply
-    # contributed nothing, which is how a document goes missing without a word.
-    # A PDF cut short is exactly this case - the pages before the cut may read
-    # while the file as a whole does not - so it is reported, with the reason,
-    # instead of quietly becoming a shorter document.
-    #
-    # Reading the files back here also gives the interface its page counts, so it
-    # never has to reopen every one of them.
+    # A conversion can report success but leave an unreadable or truncated PDF.
+    # Such a segment is marked failed with a reason instead of contributing zero
+    # pages. Reading the files here also records page counts for the interface.
     for result in results.values():
         for segment in result.segments:
             if not (segment.ok and segment.pdf):
@@ -763,7 +736,7 @@ def build(
 
     emit("Assembling %d segment(s)..." % len(entries))
     report.merged = assemble.merge(entries, dest, options=options)
-    # Not necessarily dest: an existing file is never replaced.
+    # May differ from dest, because an existing file is never overwritten.
     report.output = report.merged.output or dest
     report.seconds = time.monotonic() - started
 
@@ -774,7 +747,7 @@ def build(
 
 
 def count_pages(pdf: Path) -> int:
-    """Page count of a produced PDF, or 0 if it cannot be read."""
+    """Return the page count of a PDF, or 0 if it cannot be read."""
     try:
         from pypdf import PdfReader
 

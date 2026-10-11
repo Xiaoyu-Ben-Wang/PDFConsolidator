@@ -55,7 +55,7 @@ from .worker import ConversionWorker, MergeWorker, ThumbnailWorker
 
 POLICY_EXCLUSION = "excluded by the extraction policy"
 
-# Row metrics. The page column is deliberately compact so more pages fit.
+# Row and thumbnail sizes, in pixels. Kept compact so more pages fit.
 LIST_THUMB_W = 64
 LIST_THUMB_H = 84
 ROW_HEIGHT = 92
@@ -63,62 +63,56 @@ PREVIEW_HEIGHT = 640
 TREE_ROW_HEIGHT = 20
 TREE_ICON = 16
 
-# Thumbnails are rendered for the rows on screen plus this much either side, so
-# that scrolling reveals finished rows rather than placeholders. Bounding this is
-# what keeps a batch of several hundred files - tens of thousands of pages - from
-# trying to render every page before the window becomes usable.
+# Thumbnails are rendered only for the rows on screen plus a margin on either
+# side, so scrolling shows finished rows. This keeps large batches (tens of
+# thousands of pages) from rendering every page up front.
 VISIBLE_PAGES = 40
 THUMBNAIL_MARGIN = 25
 
-# How each kind of segment is described in a row.
+# Row suffix for each segment kind.
 KIND_SUFFIX = {"body": "body", "attachment": "attachment", "document": ""}
 
-# Which role a navigator row plays, so a checkbox knows what it is toggling.
-# Segment ids are ints and source paths are strings, so guessing from the payload
-# stops being safe once nested messages introduce a third kind of row.
+# Item data role holding the row type ("source", "message" or "segment").
+# Stored explicitly because the payload type alone cannot tell three row kinds apart.
 ROW_ROLE = Qt.UserRole + 1
 
-# Every navigator row can take the page column to what it holds: the arrow at
-# the end of the row does it with one click, Ctrl+J for the selected row.
+# Tooltip suffix for navigator rows that explains how to jump to their pages.
 JUMP_HINT = "\n\nClick the arrow at the end of the row (or press Ctrl+J) to see its pages."
 
-# Navigator columns. The jump arrow has a narrow column of its own so it lines
-# up down the tree and never competes with a long name for space.
+# Navigator columns. The jump arrow has its own narrow column so it stays
+# aligned and does not compete with long names for space.
 NAME_COLUMN, PAGES_COLUMN, JUMP_COLUMN = 0, 1, 2
 JUMP_COLUMN_WIDTH = 24
 
 
-# Every extension the converters know about, built from the sets themselves so
-# the file dialog cannot drift from what actually converts - which is how .xlsm
-# and .htm came to be missing from it.
+# File dialog filter built from convert.SUPPORTED_EXTS so it always matches
+# the supported formats.
 SUPPORTED_FILTER = " ".join(
     "*" + ext for ext in sorted(convert.SUPPORTED_EXTS)
 )
 
 
 def is_policy_exclusion(segment) -> bool:
-    """True when a segment was deliberately skipped rather than failing.
+    """Return True if a segment was skipped by the extraction policy.
 
-    Attachment categories the user switched off are not failures, and reporting
-    them as such would train the user to ignore the dialog.
+    Attachment categories the user switched off are not reported as failures.
     """
     return POLICY_EXCLUSION in (segment.detail or "")
 
 
 def group_hue(key: str) -> int:
-    """A stable hue per message or file, derived from its identity."""
+    """Return a stable hue (0-359) for a message or file key."""
     digest = hashlib.md5(str(key).encode("utf-8", "replace")).digest()
     return digest[0] * 359 // 255
 
 
 def group_colour(key: str, parent_hue: int | None = None) -> QColor:
-    """A stable pastel colour per source file or nested message.
+    """Return a stable pastel colour for a source file or nested message.
 
-    Every page originating from the same file shares a colour, which is what
-    makes grouping visible at a glance - an email's body and its attachments all
-    carry the same tint. A nested message gets its own colour, nudged away from
-    the colour of the message it arrived inside, so a forwarded email never
-    blends into its carrier.
+    All pages from the same file share a colour, so an email's body and
+    attachments have the same tint. If ``parent_hue`` is given and the hue is
+    within 45 degrees of it, the hue is shifted so a nested message stays
+    distinct from the message that contains it.
     """
     hue = group_hue(key)
     if parent_hue is not None:
@@ -129,12 +123,12 @@ def group_colour(key: str, parent_hue: int | None = None) -> QColor:
 
 
 def source_colour(key: str) -> QColor:
-    """A stable pastel colour per source file."""
+    """Return a stable pastel colour for a source file."""
     return group_colour(key)
 
 
 def node_colour(node, parent=None) -> QColor:
-    """The colour of a segment's pages: its message's colour, not its file's."""
+    """Return the colour for a segment's pages, taken from its message, not its file."""
     if node is None:
         return source_colour("?")
     key = node.group or str(node.source)
@@ -146,11 +140,11 @@ def node_colour(node, parent=None) -> QColor:
 
 
 def part_name(node) -> str:
-    """The part of a segment, without the repeated message name.
+    """Return a segment's label without the message-name prefix.
 
-    ``with_pdf.eml`` plus the label ``with_pdf - invoice.pdf`` yields
-    ``invoice.pdf``, which is what the row should show. A nested message's label
-    leads with the name of the attachment that carried it instead.
+    For example, ``with_pdf.eml`` with label ``with_pdf - invoice.pdf`` gives
+    ``invoice.pdf``. For a nested message, the prefix is the name of the
+    attachment that contained it.
     """
     label = node.label or ""
     group_label = getattr(node, "group_label", "") or ""
@@ -162,12 +156,10 @@ def part_name(node) -> str:
 
 
 def row_description(node, page, position: int, trail: list[str] | None = None) -> str:
-    """One line naming a page and the file it came from.
+    """Return the one-line row text for a page.
 
-    The original filename always leads, so the column sorts and scans by source,
-    with the particular part of an email appended after an arrow. A page from a
-    message attached to that email carries the nesting with it: the trail names
-    the messages it was found inside.
+    Starts with the source filename, then an arrow and the part name for email
+    parts. ``trail`` lists the nested messages the page was found inside.
     """
     if node is None:
         return "%d.  (unknown)" % position
@@ -197,7 +189,7 @@ class MainWindow(QMainWindow):
         self.output_path: Path | None = None
 
         # Extraction settings. The checkboxes edit the default policy, or the
-        # policy of the email currently selected in the tree.
+        # policy of the email selected in the tree.
         self.default_policy = email_items.ExtractionPolicy()
         self.source_policies: dict[str, email_items.ExtractionPolicy] = {}
         self._loading_policy = False
@@ -209,21 +201,19 @@ class MainWindow(QMainWindow):
         self._conversion: ConversionWorker | None = None
         self._merge: MergeWorker | None = None
         self._thumbs: ThumbnailWorker | None = None
-        # Every thumbnail worker still alive, so shutdown can wait for them all.
+        # All live thumbnail workers, so shutdown can wait for them.
         self._thumb_workers: set[ThumbnailWorker] = set()
         self._thumb_range: tuple[int, int] | None = None
 
-        # Scrolling asks for the thumbnails that just came into view, once the
-        # user stops moving: rendering while they are still dragging would fight
-        # the scrollbar.
+        # Request thumbnails for newly visible rows after scrolling stops, so
+        # rendering does not compete with scrollbar dragging.
         self._thumb_timer = QTimer(self)
         self._thumb_timer.setSingleShot(True)
         self._thumb_timer.setInterval(120)
         self._thumb_timer.timeout.connect(self._start_thumbnails)
 
-        # Adding files converts automatically, shortly after the user stops
-        # adding. It must be the *incremental* entry point: a full re-convert
-        # would discard page edits the user has already made.
+        # Convert added files automatically after a short delay. Uses the
+        # incremental path so existing page edits are kept.
         self._pending_convert = False
         self._autoconvert = QTimer(self)
         self._autoconvert.setSingleShot(True)
@@ -242,10 +232,10 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ UI
 
     def _build_menu(self) -> None:
-        """A Help menu for the notices the GPL asks a GUI to offer.
+        """Build the Help menu with About and Licences entries.
 
-        The About box is the conventional home for a licence summary, and the
-        LGPL wants the texts themselves reachable rather than merely on disk.
+        The GPL recommends that a GUI show its notices in an About box, and the
+        LGPL requires the licence texts to be reachable from the program.
         """
         menu = self.menuBar().addMenu("&Help")
 
@@ -304,8 +294,8 @@ class MainWindow(QMainWindow):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(6, 6, 6, 6)
-        # The sources heading carries the jump button, so going to a row's pages
-        # is an explicit action rather than a side effect of clicking a row.
+        # The jump button sits in the sources heading, so jumping to a row's
+        # pages is an explicit action, not a side effect of selecting a row.
         heading = QHBoxLayout()
         heading.addWidget(QLabel("Sources"))
         heading.addStretch(1)
@@ -334,7 +324,7 @@ class MainWindow(QMainWindow):
         self.tree.setIndentation(14)
         self.tree.setRootIsDecorated(True)
         self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
-        # Compact rows: the default padding wastes a lot of vertical space.
+        # Compact rows; the default padding uses too much vertical space.
         self.tree.setStyleSheet(
             "QTreeWidget::item { height: %dpx; padding: 0px; }" % TREE_ROW_HEIGHT
         )
@@ -422,13 +412,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
     def _build_banner(self) -> QWidget:
-        """A non-blocking strip for reporting what went wrong.
+        """Build the non-blocking banner that reports failures.
 
-        A modal dialog is the wrong shape for this: a batch of several hundred
-        files is expected to contain a few failures, and stopping the interface
-        to announce them - right after an eleven-minute wait - is both an
-        interruption and a dead end. The banner says what happened, offers the
-        details and the retry, and gets out of the way.
+        Used instead of a modal dialog so a large batch with a few failures does
+        not block the window. Offers details, retry and dismiss.
         """
         self.banner = QFrame()
         self.banner.setFrameShape(QFrame.StyledPanel)
@@ -563,14 +550,13 @@ class MainWindow(QMainWindow):
         self.progress.setTextVisible(True)
         self.progress.setVisible(False)
         self.status.addPermanentWidget(self.progress)
-        # A batch of several hundred files is long enough to need a way out of.
+        # Cancel button for long conversion runs.
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setVisible(False)
         self.btn_cancel.setToolTip("Stop converting after the file in progress")
         self.btn_cancel.clicked.connect(self.cancel_conversion)
         self.status.addPermanentWidget(self.btn_cancel)
-        # A visible About button, so the licensing is one click away without
-        # hunting through a menu.
+        # About button in the status bar, so licence information is one click away.
         self.btn_about = QPushButton("About")
         self.btn_about.setToolTip(
             "Version, copyright and the licences this program is under."
@@ -582,7 +568,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------- progress
 
     def _begin_progress(self, total: int, label: str) -> None:
-        """Show a determinate bar: converting is a list of files, so count them."""
+        """Show a determinate progress bar that counts files."""
         self.progress.setRange(0, max(total, 1))
         self.progress.setValue(0)
         self.progress.setFormat("0 / %d" % total)
@@ -600,7 +586,7 @@ class MainWindow(QMainWindow):
             self.status.showMessage(label)
 
     def _begin_busy(self, label: str) -> None:
-        """Show an indeterminate bar for work whose size is not known up front."""
+        """Show an indeterminate progress bar for work of unknown size."""
         self.progress.setRange(0, 0)
         self.progress.setFormat("")
         self.progress.setVisible(True)
@@ -612,7 +598,7 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setVisible(False)
 
     def cancel_conversion(self) -> None:
-        """Stop after the file in progress; whatever is converted is kept."""
+        """Stop after the current file. Already converted files are kept."""
         worker = self._conversion
         if worker is None or not worker.isRunning():
             return
@@ -622,7 +608,7 @@ class MainWindow(QMainWindow):
 
 
     def _install_shortcuts(self) -> None:
-        """Delete and Backspace remove what the focused list has selected."""
+        """Install keyboard shortcuts: Delete/Backspace remove, Ctrl+J jumps."""
         for sequence in (QKeySequence.Delete, QKeySequence("Backspace")):
             for widget, slot in (
                 (self.tree, self.remove_selected_sources),
@@ -632,8 +618,7 @@ class MainWindow(QMainWindow):
                 shortcut.setContext(Qt.WidgetWithChildrenShortcut)
                 shortcut.activated.connect(slot)
 
-        # Ctrl+J is the keyboard half of the jump button: pick a row in the
-        # navigator, then go to its pages without reaching for the mouse.
+        # Ctrl+J is the keyboard equivalent of the jump button.
         for widget in (self.tree, self.page_list):
             jump = QShortcut(QKeySequence("Ctrl+J"), widget)
             jump.setContext(Qt.WidgetWithChildrenShortcut)
@@ -653,7 +638,7 @@ class MainWindow(QMainWindow):
         )
 
     def selected_email(self) -> Path | None:
-        """The email source currently selected in the tree, if any."""
+        """Return the email source selected in the tree, or None."""
         items = self.tree.selectedItems()
         if not items:
             return None
@@ -668,7 +653,7 @@ class MainWindow(QMainWindow):
         return candidate if candidate.suffix.lower() in convert.EMAIL_EXTS else None
 
     def policy_for(self, source: Path) -> email_items.ExtractionPolicy:
-        """Per-source extraction policy, falling back to the default."""
+        """Return the extraction policy for a source, or the default."""
         override = self.source_policies.get(str(source))
         return override or self.default_policy
 
@@ -707,12 +692,10 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- sources
 
     def file_icon(self, path: Path) -> QIcon:
-        """The real Windows icon for this file type, via the shell.
+        """Return the Windows shell icon for this file type.
 
-        Cached by extension. The shell lookup is the expensive part, and a folder
-        of a thousand files has only a handful of distinct extensions - without
-        this, drawing the navigator costs one shell round-trip per row, which at
-        ten thousand rows is seconds of the user's time per rebuild.
+        Cached by extension, because the shell lookup is slow and a large folder
+        usually has only a few distinct extensions.
         """
         key = path.suffix.lower()
         icon = self._icons.get(key)
@@ -754,8 +737,7 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Added %d file(s). Converting\u2026" % added)
         self.refresh_tree()
         self._update_actions()
-        # Convert on our own: making the user press Convert just to see pages
-        # was a pointless extra step.
+        # Convert new files automatically so pages appear without pressing Convert.
         self._autoconvert.start()
 
     def remove_selected_sources(self) -> None:
@@ -772,7 +754,7 @@ class MainWindow(QMainWindow):
         names = {root.text(0) for root in roots}
 
         self.selected_sources = [p for p in self.selected_sources if str(p) not in doomed]
-        # Removing a source removes what it contributed, not just the row.
+        # Also remove the source's segments and pages, not just the row.
         for path in list(doomed):
             self.model.drop_source(Path(path))
             self.source_policies.pop(path, None)
@@ -842,7 +824,7 @@ class MainWindow(QMainWindow):
             self._set_jump(root, pages_here)
             root.setExpanded(True)
 
-        # Segments left over (their source was removed) still need showing.
+        # Show segments whose source has been removed.
         leftovers: dict[str, list] = {}
         for segment in self.model.segments:
             if str(segment.source) not in shown:
@@ -860,10 +842,10 @@ class MainWindow(QMainWindow):
         self._on_tree_selection_changed()
 
     def _fill_source(self, root: QTreeWidgetItem, path: Path) -> None:
-        """Put a source's parts and nested messages under its row, in order.
+        """Add a source's parts and nested messages under its row.
 
-        In the order the email held them: a forwarded message sits between the
-        attachments it arrived between, rather than after all of them.
+        Entries keep the order they had in the email, so a forwarded message
+        appears between the attachments around it.
         """
         self._add_entries(root, self.model.navigator_entries(path))
 
@@ -877,13 +859,13 @@ class MainWindow(QMainWindow):
                 self._add_segment_item(parent_item, entry)
 
     def _set_jump(self, item: QTreeWidgetItem, page_count: int) -> None:
-        """Give a row the arrow that takes the page column to its first page."""
+        """Add the jump arrow to a row that has pages."""
         if page_count > 0:
             item.setIcon(JUMP_COLUMN, self.jump_icon)
             item.setToolTip(JUMP_COLUMN, "Show in the page list")
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
-        """A click on a row's arrow jumps to its pages; a click elsewhere selects."""
+        """Jump to a row's pages when its arrow column is clicked."""
         if column != JUMP_COLUMN:
             return
         position = self.first_page_of(item)
@@ -893,7 +875,7 @@ class MainWindow(QMainWindow):
         self.go_to_page(position)
 
     def part_icon(self, segment) -> QIcon:
-        """An attachment's own file-type icon; the generic document for a body."""
+        """Return the file-type icon for an attachment, or a generic icon for a body."""
         if segment.kind == "body":
             return self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
         name = Path(part_name(segment) or "")
@@ -902,11 +884,10 @@ class MainWindow(QMainWindow):
         return self.file_icon(segment.source)
 
     def _add_message_item(self, parent_item: QTreeWidgetItem, message) -> None:
-        """One nested message: a node of its own, holding its parts.
+        """Add a nested message as its own node, with its parts as children.
 
-        This is what makes a forwarded email navigable: its body and its own
-        attachments hang inside it rather than appearing as siblings of the
-        carrier's, with the message's own colour on every row.
+        A forwarded email's body and attachments appear under it rather than as
+        siblings of the outer message's parts.
         """
         item = QTreeWidgetItem(parent_item, ["  " + message.label,
                                              str(message.page_count)])
@@ -936,8 +917,7 @@ class MainWindow(QMainWindow):
             child.setData(0, ROW_ROLE, "segment")
             child.setIcon(0, self.part_icon(segment))
             self._set_jump(child, segment.page_count)
-            # Same tint as the pages, so the navigator and the page column agree
-            # about which message a row came from.
+            # Same tint as the page rows, so both views show the same grouping.
             child.setBackground(
                 0, QBrush(node_colour(segment, self.model.group_owner(segment)))
             )
@@ -964,8 +944,7 @@ class MainWindow(QMainWindow):
                 self.refresh_pages()
             return
 
-        # A source, or a message nested inside one: its checkbox governs the whole
-        # subtree, so unticking a forwarded email leaves out everything inside it.
+        # A source or nested message: its checkbox applies to the whole subtree.
         wanted = item.checkState(0) == Qt.Checked
         self.tree.blockSignals(True)
         self._set_subtree_enabled(item, wanted)
@@ -987,7 +966,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------- navigator to pages
 
     def _item_segment_ids(self, item: QTreeWidgetItem) -> list[int]:
-        """Every segment a navigator row stands for, itself or its subtree."""
+        """Return the segment ids for a navigator row and its subtree."""
         if item.data(0, ROW_ROLE) == "segment":
             segment_id = item.data(0, Qt.UserRole)
             return [segment_id] if isinstance(segment_id, int) else []
@@ -997,11 +976,10 @@ class MainWindow(QMainWindow):
         return found
 
     def first_page_of(self, item: QTreeWidgetItem) -> int | None:
-        """The row of the earliest page belonging to a navigator row.
+        """Return the page-list position of a navigator row's first page.
 
-        Earliest in the *page list*, not in the source: the user may have moved
-        pages around, and the point of the jump is to land on the page where it
-        lives now rather than where it started.
+        Uses the current page-list order, not the source order, because the user
+        may have reordered pages.
         """
         wanted = set(self._item_segment_ids(item))
         if not wanted:
@@ -1012,10 +990,9 @@ class MainWindow(QMainWindow):
         return None
 
     def jump_to_selected(self) -> bool:
-        """Take the page column to whatever the navigator has selected.
+        """Scroll the page list to the selected navigator row's first page.
 
-        Returns whether it moved, so a caller - or a test - can tell the
-        difference between "jumped" and "there was nothing to jump to".
+        Returns True if it jumped, False if there was nothing to jump to.
         """
         items = self.tree.selectedItems()
         if not items:
@@ -1031,7 +1008,7 @@ class MainWindow(QMainWindow):
         return True
 
     def go_to_page(self, position: int) -> None:
-        """Show and select one page row, scrolling it into view."""
+        """Select one page row and scroll it into view."""
         row = self.page_list.item(position)
         if row is None:
             return
@@ -1039,8 +1016,7 @@ class MainWindow(QMainWindow):
         row.setSelected(True)
         self.page_list.setCurrentItem(row)
         self.page_list.scrollToItem(row, QAbstractItemView.PositionAtCenter)
-        # A selection that did not change produces no signal, so refresh the
-        # preview directly rather than relying on it.
+        # An unchanged selection emits no signal, so refresh the preview directly.
         self._update_preview()
 
     # ---------------------------------------------------------------- pages
@@ -1048,9 +1024,8 @@ class MainWindow(QMainWindow):
     def refresh_pages(self) -> None:
         self.page_list.blockSignals(True)
         self.page_list.clear()
-        # Repopulating leaves the first row current, and in some styles current
-        # also means selected - which would silently act on a page the user never
-        # chose. Selection is always explicit.
+        # Repopulating makes the first row current, which some styles treat as
+        # selected. Clear it so actions only apply to pages the user selected.
         self.page_list.clearSelection()
 
         for position, page in enumerate(self.model.pages, start=1):
@@ -1063,23 +1038,22 @@ class MainWindow(QMainWindow):
                             % (node.label if node else "?",
                                page.index + 1,
                                node.page_count if node else 0))
-            # The row tint identifies the message the page came from, so an
-            # email's own pages read as one block and a forwarded message inside
-            # it reads as a block of a different colour.
+            # The row tint identifies the message the page came from; a nested
+            # message gets a different colour from its parent.
             item.setBackground(QBrush(tint))
             item.setForeground(QBrush(QColor("#202020")))
             item.setSizeHint(QSize(0, ROW_HEIGHT))
             self.page_list.addItem(item)
 
         self.page_list.blockSignals(False)
-        # The list was rebuilt, so every row is a placeholder again.
+        # The list was rebuilt, so all thumbnails must be requested again.
         self._thumb_range = None
         self._start_thumbnails()
         self._update_preview()
         self.status.showMessage(self.model.summary())
 
     def group_by_document(self) -> None:
-        """Bring every page from the same file together, keeping its own order."""
+        """Group pages by source file, keeping each file's page order."""
         if not self.model.pages:
             return
         self.model.group_by_source()
@@ -1089,20 +1063,17 @@ class MainWindow(QMainWindow):
         )
 
     def _start_thumbnails(self) -> None:
-        """Render the thumbnails near the viewport, not the whole document.
+        """Render thumbnails for the rows near the viewport.
 
-        A folder of several hundred files can run to tens of thousands of pages.
-        Rendering a thumbnail for every one of them, every time the list is
-        rebuilt, is what makes a large batch unusable - so only what the user can
-        actually see (plus a margin, so scrolling stays ahead of the rendering) is
-        asked for, and scrolling asks for more.
+        Only visible rows plus a margin are rendered, so large batches stay
+        responsive. Scrolling requests more.
         """
         if self._thumbs is not None and self._thumbs.isRunning():
             if self._thumb_range == self._visible_page_range():
                 return
-            # No waiting: the old worker stops after the page in hand, and the
-            # cache's lock keeps the two from rendering at once. Waiting here
-            # froze the window for up to two seconds per scroll on a slow page.
+            # Do not wait for the old worker: it stops after its current page,
+            # and the cache lock prevents concurrent renders. Waiting here would
+            # block the GUI thread on slow pages.
             self._thumbs.cancel()
 
         first, last = self._visible_page_range()
@@ -1118,7 +1089,7 @@ class MainWindow(QMainWindow):
 
         worker = ThumbnailWorker(jobs, self.thumbs, self)
         worker.ready.connect(self._on_thumbnail)
-        # A bound method of the window, so the slot is queued to the GUI thread.
+        # Bound method of the window, so the slot runs on the GUI thread.
         worker.finished.connect(self._on_thumbnail_worker_finished)
         self._thumb_workers.add(worker)
         self._thumbs = worker
@@ -1128,11 +1099,10 @@ class MainWindow(QMainWindow):
         self._on_thumbnails_finished(self.sender())
 
     def _on_thumbnails_finished(self, worker=None) -> None:
-        """Release a finished worker, and say so if any page could not be rendered.
+        """Release a finished worker and report any thumbnail render failures.
 
-        Every scroll starts a worker, and each used to stay parented to the window
-        for the rest of the session. A missing thumbnail is otherwise invisible,
-        and an invisible gap cannot be told apart from a page that was never there.
+        Each scroll starts a worker, so finished workers are deleted here.
+        Failures are reported because a missing thumbnail is otherwise not visible.
         """
         if worker is not None:
             self._thumb_workers.discard(worker)
@@ -1148,7 +1118,7 @@ class MainWindow(QMainWindow):
             )
 
     def _visible_page_range(self) -> tuple[int, int]:
-        """The rows worth rendering: what is on screen, padded either side."""
+        """Return the (first, last) rows to render: visible rows plus a margin."""
         count = self.page_list.count()
         if count == 0:
             return 0, 0
@@ -1159,7 +1129,7 @@ class MainWindow(QMainWindow):
         last = bottom.row() if bottom.isValid() else min(count, first + VISIBLE_PAGES)
         first = max(0, first - THUMBNAIL_MARGIN)
         last = min(count, max(last, first) + THUMBNAIL_MARGIN + 1)
-        # A single screenful is the floor, so the first paint is never empty even
+        # Render at least VISIBLE_PAGES rows, so the first paint is not empty
         # before the widget has been laid out.
         if last - first < VISIBLE_PAGES:
             last = min(count, first + VISIBLE_PAGES)
@@ -1170,7 +1140,7 @@ class MainWindow(QMainWindow):
         self._thumb_timer.start()
 
     def _on_thumbnail(self, position: int, rendered, image) -> None:
-        """Show a thumbnail - if its row still shows the page it was made for."""
+        """Show a thumbnail if its row still shows the page it was rendered for."""
         if not (0 <= position < self.page_list.count()
                 and position < len(self.model.pages)):
             return
@@ -1204,8 +1174,7 @@ class MainWindow(QMainWindow):
 
         image = self.thumbs.render(node.pdf, page.index, PREVIEW_HEIGHT)
         if image is not None and page.rotation:
-            # Show the page as it will be written, not as it sits in the source
-            # PDF - otherwise rotating a page appears to do nothing.
+            # Apply the page's rotation so the preview matches the output.
             image = image.transformed(
                 QTransform().rotate(page.rotation), Qt.SmoothTransformation
             )
@@ -1229,7 +1198,7 @@ class MainWindow(QMainWindow):
         return sorted(self.page_list.row(item) for item in self.page_list.selectedItems())
 
     def _on_pages_reordered(self, *_args) -> None:
-        """Adopt the order the user dragged the list into."""
+        """Update the model with the order after a drag-and-drop."""
         from .document import PageRef
 
         reordered = []
@@ -1299,10 +1268,10 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------- conversion
 
     def _ensure_scratch(self, reset: bool = False) -> Path:
-        """A scratch directory that survives incremental conversions.
+        """Return the scratch directory, creating it if needed.
 
-        Segments produced earlier point into this directory, so it must only be
-        cleared when everything is being converted again.
+        Earlier segments point into this directory, so it is only cleared
+        (``reset=True``) when everything is converted again.
         """
         import tempfile
 
@@ -1315,14 +1284,14 @@ class MainWindow(QMainWindow):
             self.scratch = Path(
                 tempfile.mkdtemp(prefix="gui_", dir=str(pipeline.choose_scratch()))
             )
-            # So a later start can tell this directory from a live one.
+            # Mark the directory as in use so a later start does not sweep it.
             pipeline.claim_scratch(self.scratch)
         return self.scratch
 
     def _next_run_dir(self) -> Path:
-        """A fresh subdirectory per run.
+        """Create and return a new scratch subdirectory for this run.
 
-        Intermediate files are named by index within their batch, so reusing a
+        Intermediate files are named by index within their batch, so sharing a
         directory across runs would overwrite them.
         """
         scratch = self._ensure_scratch()
@@ -1332,7 +1301,7 @@ class MainWindow(QMainWindow):
         return run_dir
 
     def start_conversion(self) -> None:
-        """Convert everything again from scratch, discarding current pages."""
+        """Convert all sources again, discarding the current pages."""
         if not self.selected_sources:
             return
         self._converted_sources.clear()
@@ -1341,8 +1310,7 @@ class MainWindow(QMainWindow):
     def _convert_new_sources(self) -> None:
         """Convert only sources added since the last run.
 
-        Adding a file must not throw away page edits the user has already made,
-        so this appends rather than rebuilding.
+        Appends to the model instead of rebuilding, so existing page edits are kept.
         """
         pending = [p for p in self.selected_sources if str(p) not in self._converted_sources]
         if pending:
@@ -1350,7 +1318,7 @@ class MainWindow(QMainWindow):
 
     def _run_conversion(self, sources: list[Path], replace: bool) -> None:
         if self._conversion is not None and self._conversion.isRunning():
-            # Files arrived mid-conversion; pick them up when it finishes.
+            # Files were added during a conversion; convert them when it finishes.
             self._pending_convert = True
             return
 
@@ -1360,7 +1328,7 @@ class MainWindow(QMainWindow):
             self.thumbs.clear()
             self.refresh_pages()
 
-        # Whatever the last run failed on has been superseded by this one.
+        # Clear failures from the previous run.
         self.banner.setVisible(False)
         self._failures = []
 
@@ -1381,7 +1349,7 @@ class MainWindow(QMainWindow):
         self._conversion.start()
 
     def _resume_pending_conversion(self) -> None:
-        """Convert anything that arrived while a run was in progress."""
+        """Convert sources that were added while a run was in progress."""
         if self._pending_convert:
             self._pending_convert = False
             self._autoconvert.start()
@@ -1401,8 +1369,7 @@ class MainWindow(QMainWindow):
                     segment.ok,
                     kind=segment.kind,
                     detail=segment.detail,
-                    # The pipeline verified this when it produced the segment;
-                    # count it here only if it came from somewhere that did not.
+                    # Use the pipeline's page count; count here only if it is missing.
                     page_count=segment.page_count or (
                         pipeline.count_pages(segment.pdf)
                         if segment.ok and segment.pdf else 0),
@@ -1418,8 +1385,7 @@ class MainWindow(QMainWindow):
         self._resume_pending_conversion()
 
         if cancelled:
-            # The user asked to stop; listing what did not get converted would be
-            # reporting the thing they just cancelled.
+            # The user cancelled, so do not report unconverted files as failures.
             self.status.showMessage(
                 "Stopped. %d segment(s), %d page(s) kept."
                 % (len(report.segments), self.model.page_count)
@@ -1437,15 +1403,15 @@ class MainWindow(QMainWindow):
                 message += " %d item(s) excluded by the extraction settings." % len(excluded)
             retried = getattr(report, "retried_batches", 0)
             if retried:
-                # Worth saying out loud: it means this machine dislikes several
-                # LibreOffice processes at once, and the second pass cost time.
+                # Some batches failed with parallel LibreOffice processes and were
+                # retried one file at a time. Suggest fewer workers.
                 message += (" LibreOffice needed a second, single-file pass on %d "
                             "batch(es) - set CONSOLIDATOR_WORKERS=2 if that keeps "
                             "happening." % retried)
             self.status.showMessage(message)
 
     def _report_failures(self, failures: list) -> None:
-        """Say what failed without stopping the interface to do it."""
+        """Show conversion failures in the banner."""
         self._failures = list(failures)
         first = self._failures[0]
         self.lbl_banner.setText(
@@ -1453,13 +1419,12 @@ class MainWindow(QMainWindow):
             "Everything else was converted."
             % (len(self._failures), first.source.name)
         )
-        # A conversion failure is retryable, unlike a merge that had to skip
-        # something, so the button comes back.
+        # Conversion failures can be retried (merge skips cannot), so show Retry.
         self.btn_banner_retry.setVisible(True)
         self.banner.setVisible(True)
 
     def failure_lines(self) -> list[str]:
-        """One line per failure, for the details view."""
+        """Return one entry per failure for the details view, capped at 200."""
         lines = []
         for segment in self._failures[:200]:
             lines.append("%s\n    %s" % (segment.display, segment.detail or "failed"))
@@ -1468,7 +1433,7 @@ class MainWindow(QMainWindow):
         return lines
 
     def show_failure_details(self) -> None:
-        """The list of failures, on request rather than on top of everything."""
+        """Show the list of failures in a dialog."""
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
         box.setWindowTitle("Items that could not be converted")
@@ -1477,7 +1442,7 @@ class MainWindow(QMainWindow):
         box.exec()
 
     def retry_failed(self) -> None:
-        """Convert just the failed sources again, keeping everything else."""
+        """Convert the failed sources again, keeping everything else."""
         unique: list[Path] = []
         seen = set()
         for segment in self._failures:
@@ -1488,11 +1453,10 @@ class MainWindow(QMainWindow):
         self.retry_sources(unique)
 
     def retry_sources(self, sources: list[Path]) -> None:
-        """Convert just the failed sources again, leaving everything else alone.
+        """Convert the given sources again, leaving everything else unchanged.
 
-        The retry uses its own scratch subdirectory: reusing the first run's
-        directory would collide with the intermediate files already there, since
-        those are named by index within their batch.
+        Each retry uses its own scratch subdirectory, because intermediate files
+        are named by index within their batch and would otherwise collide.
         """
         if not sources or self.scratch is None:
             return
@@ -1521,8 +1485,8 @@ class MainWindow(QMainWindow):
 
         recovered = 0
         for result in report.sources:
-            # In place: parts that worked stay put, recovered parts go back where
-            # they were in the email instead of to the end of the document.
+            # Replace in place: recovered parts return to their original position
+            # instead of being appended at the end.
             recovered += self.model.replace_source(
                 result.source, result.segments, count_pages=pipeline.count_pages)
 
@@ -1541,8 +1505,7 @@ class MainWindow(QMainWindow):
         if still_failing:
             self._report_failures(still_failing)
         elif recovered:
-            # The user asked for this, and the status bar already says it worked;
-            # a dialog to confirm a click is just one more thing to dismiss.
+            # The status bar already reports success, so just hide the banner.
             self.banner.setVisible(False)
 
     def _on_worker_crash(self, detail: str) -> None:
@@ -1559,10 +1522,10 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- output
 
     def choose_output(self) -> None:
-        """Pick the destination with the native Windows save dialog."""
+        """Choose the output path with the native save dialog."""
         start = str(self.output_path) if self.output_path else "consolidated.pdf"
-        # No "replace it?" question: an existing file is never replaced - the
-        # export goes beside it as "name (1).pdf" - so asking would mislead.
+        # Skip the overwrite prompt: an existing file is never replaced; the
+        # output is written beside it as "name (1).pdf".
         name, _ = QFileDialog.getSaveFileName(
             self, "Save merged PDF as", start, "PDF (*.pdf)",
             options=QFileDialog.Option.DontConfirmOverwrite,
@@ -1602,8 +1565,8 @@ class MainWindow(QMainWindow):
 
     def _merge_options(self, dest: Path) -> assemble.MergeOptions:
         footer_text = self.edt_footer.text().strip()
-        # The footer is drawn bottom centre, and a footer slot takes priority
-        # over the page number, so the number moves aside when there is one.
+        # The footer is drawn bottom centre and takes priority over the page
+        # number, so the number moves to bottom right when there is a footer.
         numbering = assemble.PageNumbering(
             mode=self.cmb_numbering.currentText(),
             position="bottom-right" if footer_text else "bottom-center",
@@ -1641,8 +1604,8 @@ class MainWindow(QMainWindow):
             message += ". %d page(s) could not be copied as they are and were "                        "included as images (page %s)" % (
                            len(pictures), ", ".join(str(p[0]) for p in pictures[:8]))
         if problems:
-            # The file was written, but a page in it lacks something its source
-            # page has. That is exactly the failure that otherwise goes unseen.
+            # The file was written, but some output pages lack content that
+            # their source pages have.
             pages_named = ", ".join(str(p.output_page) for p in problems[:8])
             if len(problems) > 8:
                 pages_named += ", \u2026"
@@ -1655,8 +1618,7 @@ class MainWindow(QMainWindow):
         self.status.showMessage(message + ".")
 
         if skipped:
-            # Anything the merge left out has to be said out loud: a document that
-            # is quietly short is worse than one that fails.
+            # Report items the merge left out, so a short output is not missed.
             self.status.showMessage(
                 "%s. %d item(s) could not be merged." % (message, len(skipped))
             )
@@ -1726,11 +1688,10 @@ class MainWindow(QMainWindow):
         self.act_convert.setEnabled(has_sources)
 
     def workers_running(self) -> bool:
-        """Whether any background thread is still going.
+        """Return True if any background worker is still running.
 
-        Checked on the way out: Python tearing down a QThread that is still
-        running makes Qt abort the process, so a run that will not stop in time
-        is left behind with ``os._exit`` instead (see ``app.run``).
+        Checked at exit: destroying a running QThread makes Qt abort the process,
+        so ``app.run`` exits with ``os._exit`` in that case.
         """
         workers = [self._conversion, self._merge, *self._thumb_workers]
         for worker in workers:
@@ -1742,7 +1703,7 @@ class MainWindow(QMainWindow):
         return False
 
     def confirm_close(self) -> bool:
-        """Ask before closing. Says what would be lost, when anything would be."""
+        """Ask the user to confirm closing, and say what would be lost."""
         if self._conversion is not None and self._conversion.isRunning():
             detail = "A conversion is still running and will be stopped."
         elif self._merge is not None and self._merge.isRunning():
@@ -1762,20 +1723,17 @@ class MainWindow(QMainWindow):
         return box.exec() == QMessageBox.Yes
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        """Shut down promptly.
+        """Stop workers, wait briefly, and delete scratch in the background.
 
-        Waiting the full cancel timeout for each worker made closing feel
-        sluggish, and deleting the scratch tree on the GUI thread could take
-        seconds for a large run. So: ask everything to stop, wait only briefly,
-        and clean up in the background.
+        Waits are short so closing stays fast, and the scratch tree is deleted
+        on a background thread because it can take seconds for a large run.
         """
         import threading
 
         from .. import libreoffice
 
-        # Only a close the user asked for from the window itself - the title
-        # bar's close button, Alt+F4 - is confirmed. A close issued by code is
-        # deliberate, and a dialog there would block whatever issued it.
+        # Confirm only user-initiated closes (title bar button, Alt+F4).
+        # Programmatic closes skip the dialog so they do not block the caller.
         if event.spontaneous() and not self.confirm_close():
             event.ignore()
             return
@@ -1788,9 +1746,8 @@ class MainWindow(QMainWindow):
             if worker.isRunning() and hasattr(worker, "cancel"):
                 worker.cancel()
 
-        # A conversion blocks inside LibreOffice for as long as a batch takes, so
-        # asking it to stop is not enough: its soffice processes are ended, which
-        # makes the call return and the worker finish.
+        # A conversion blocks inside LibreOffice for a whole batch, so end the
+        # soffice processes to make the call return and the worker finish.
         converting = self._conversion is not None and self._conversion.isRunning()
         if converting:
             libreoffice.stop_all()
@@ -1801,9 +1758,9 @@ class MainWindow(QMainWindow):
                 remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
                 worker.wait(remaining_ms)
         if converting:
-            # Closing a window is not quitting the process (tests, and any host
-            # embedding the window, carry on). app.run stops LibreOffice again
-            # if it has to leave with a worker still running.
+            # Closing the window does not end the process (for example in tests),
+            # so allow LibreOffice to start again. app.run stops it again if it
+            # exits with a worker still running.
             libreoffice.resume()
 
         scratch = self.scratch
@@ -1811,7 +1768,7 @@ class MainWindow(QMainWindow):
         if scratch and Path(scratch).exists():
             from .. import libreoffice
 
-            # A daemon thread so a slow delete cannot hold up the exit.
+            # Daemon thread, so a slow delete does not delay exit.
             threading.Thread(
                 target=libreoffice._remove_tree, args=(Path(scratch),), daemon=True
             ).start()

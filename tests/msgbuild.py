@@ -1,15 +1,14 @@
-"""Build ``.msg`` files from scratch, for tests.
+"""Build ``.msg`` files from scratch for tests.
 
-Outlook is the only thing that writes these for real, and it is not available on
-every machine - nor are real messages, which carry real people's mail. This writes
-the same OLE layout Outlook does ([MS-OXMSG]): a properties stream per object,
-string and binary properties as ``__substg1.0_`` streams, attachments in
-``__attach_version1.0_#`` storages and an attached Outlook item as a nested
-message storage. It covers what the consolidator reads and nothing more.
+Tests cannot rely on Outlook being installed or on real mail. This writes the
+OLE layout described in [MS-OXMSG]: a properties stream per object, string and
+binary properties as ``__substg1.0_`` streams, attachments in
+``__attach_version1.0_#`` storages, and an attached Outlook item as a nested
+message storage. It covers only what the consolidator reads.
 
-The point is to reproduce the shapes real mailboxes contain: an email carrying an
-appointment, a contact or a task as an *Outlook item*, an item of a class
-extract-msg refuses, an attachment with no data stream.
+It can produce an email carrying an appointment, contact or task as an
+*Outlook item*, an item of a class extract-msg refuses, and an attachment with
+no data stream.
 """
 
 from __future__ import annotations
@@ -52,14 +51,14 @@ class Item:
     html: bytes | None = None
     sender: str = ""
     to: str = ""
-    # Extra string properties by id, e.g. {0x8208: "Room 4"} would need named
-    # properties; plain tagged ones are enough for tests.
+    # Extra string properties by tag id. Only plain tagged properties are
+    # supported, not named ones such as 0x8208.
     strings: dict[int, str] = field(default_factory=dict)
     attachments: list[Att] = field(default_factory=list)
 
 
 def _prop(tag_id: int, ptype: int, value: bytes) -> bytes:
-    # tag, flags (readable | writable), 8-byte value.
+    # Type, tag id, flags (readable | writable), 8-byte value.
     return struct.pack("<HHI", ptype, tag_id, 6) + value.ljust(8, b"\x00")
 
 
@@ -144,7 +143,7 @@ def _write_attachment(writer: OleWriter, prefix: list[str], att: Att) -> None:
 
 
 def build(item: Item) -> bytes:
-    """The bytes of a ``.msg`` file holding ``item``."""
+    """Return the bytes of a ``.msg`` file holding ``item``."""
     import io
 
     writer = OleWriter()

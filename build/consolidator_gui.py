@@ -1,12 +1,10 @@
 """Frozen entry point.
 
-One executable serves both faces: run it with no arguments and the GUI opens;
-pass a subcommand (``build``, ``check``) and it behaves as the CLI. That keeps a
-single artifact to ship while preserving scripted use.
+With no arguments the executable opens the GUI. With a subcommand (``build``,
+``check``) it runs the CLI. One executable serves both uses.
 
-Startup failures are logged next to the executable and shown in a dialog, because
-a windowed build has no console to print to and a silent failure is the worst
-possible outcome for the user.
+Startup failures are logged next to the executable and shown in a dialog,
+because a windowed build has no console.
 """
 
 from __future__ import annotations
@@ -35,7 +33,7 @@ def _write_log(detail: str, name: str = "startup-error.log") -> None:
 
 
 def _report_gui(exc: BaseException) -> None:
-    """GUI startup failed: log it and say so, since there is no console."""
+    """Log a GUI startup failure and show it in a dialog."""
     detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     _write_log(detail)
     try:
@@ -58,8 +56,8 @@ def main() -> int:
     if argv and argv[0] in CLI_COMMANDS:
         from consolidator.cli import main as cli_main
 
-        # A command run from a script must never raise a dialog: report on
-        # stderr and in a log, and let the exit code carry the outcome.
+        # CLI commands never show a dialog. Errors go to stderr and a log,
+        # and the exit code reports the result.
         try:
             return cli_main(argv)
         except SystemExit:
@@ -80,6 +78,6 @@ if __name__ == "__main__":
         sys.exit(main())
     except SystemExit:
         raise
-    except BaseException as exc:  # noqa: BLE001 - last line of defence
+    except BaseException as exc:  # noqa: BLE001 - top-level handler
         _report_gui(exc)
         sys.exit(1)

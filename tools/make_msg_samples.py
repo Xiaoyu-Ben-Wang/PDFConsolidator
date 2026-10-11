@@ -1,7 +1,7 @@
 """Write the .msg test samples in tests/data/msg/.
 
-The samples are committed, so this only needs re-running to change them. They
-are built from scratch with tests/msgbuild.py and hold no real mail.
+The samples are committed; rerun this only to change them. They are built
+with tests/msgbuild.py and contain no real mail.
 """
 from __future__ import annotations
 

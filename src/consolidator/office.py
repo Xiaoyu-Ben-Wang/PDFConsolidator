@@ -1,17 +1,17 @@
-"""Parent-side driver for Office COM conversions.
+"""Run Office COM conversions in a subprocess and clean up after them.
 
-Every conversion runs in its own killable subprocess. This module owns the safety
-net around that subprocess:
+Each conversion runs in its own subprocess so it can be killed:
 
-1. Snapshot the Office processes already running *before* we start, so a user's
-   open Word window is never mistaken for one of ours.
-2. Run the worker with a hard timeout.
-3. On timeout, kill the worker's process tree, then kill any Office process that
-   appeared while it ran.
-4. Even on apparent success, sweep up any Office process we caused to appear.
+1. Record the Office processes already running, so the user's own Office
+   windows are never killed.
+2. Run the worker with a timeout.
+3. On timeout, kill the worker's process tree and any Office process that
+   started while it ran.
+4. After every run, including successful ones, kill any Office process that
+   started while it ran.
 
-Step 4 matters: a worker can exit cleanly while leaving WINWORD.EXE behind, which
-is exactly the failure this design exists to prevent.
+Step 4 is needed because a worker can exit cleanly and still leave
+WINWORD.EXE running.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 
-# Results are sentinel-prefixed so ordinary stdout noise cannot be mistaken for them.
+# Prefix for the result line, so other stdout output is not parsed as a result.
 RESULT_SENTINEL = "@@RESULT@@"
 
 OFFICE_IMAGES = {
@@ -31,7 +31,7 @@ OFFICE_IMAGES = {
     "powerpoint": "POWERPNT.EXE",
 }
 
-# src/ - so the worker subprocess can `import consolidator`
+# The src/ directory, added to PYTHONPATH so the worker can import consolidator.
 _SRC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -61,7 +61,7 @@ def _run_quiet(cmd: list[str], timeout: int = 30) -> str:
 
 
 def running_pids(image: str) -> set[int]:
-    """PIDs of processes with this image name, or an empty set if we cannot tell."""
+    """Return PIDs of processes with this image name, or an empty set on failure."""
     out = _run_quiet(["tasklist", "/FI", "IMAGENAME eq %s" % image, "/FO", "CSV", "/NH"])
     pids: set[int] = set()
     for line in out.splitlines():
@@ -135,7 +135,7 @@ def convert_office(kind: str, src: str, out: str, timeout: int = 180) -> OfficeR
 
     seconds = time.monotonic() - started
 
-    # Always sweep: even a clean exit can leave an Office process behind.
+    # Always clean up: a clean exit can still leave an Office process running.
     killed = kill_new_office(before)
 
     if timed_out:

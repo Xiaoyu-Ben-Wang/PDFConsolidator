@@ -1,18 +1,17 @@
-"""Office COM conversion worker - one process, one file, then exit.
+"""Office COM conversion worker: converts one file, then exits.
 
-Invoked by :mod:`consolidator.office` as::
+Called by :mod:`consolidator.office` as::
 
     python -m consolidator.office_worker --kind word --src <abs> --out <abs>
 
-Why a separate process: Microsoft does not support unattended Office automation,
-and the failure mode is a modal dialog that blocks forever. A separate process is
-the only thing that can be reliably killed. This module therefore assumes it may
-be terminated at any moment and does not try to be clever about it.
+Microsoft does not support unattended Office automation, and a failure can show
+a modal dialog that blocks forever. Running in a separate process lets the
+parent kill it reliably, so this module may be terminated at any time.
 
-The teardown order at the end of each converter is deliberate and load-bearing.
-Word's COM object graph is heavily cyclic; Python's reference counting never frees
-it, and a leaked reference is the root cause of orphaned WINWORD.EXE processes.
-``gc.collect()`` *before* ``Quit()`` is what makes the difference.
+The teardown order in each converter matters. Word's COM object graph has
+reference cycles that reference counting does not free, and a leaked reference
+leaves WINWORD.EXE running. Calling ``gc.collect()`` before ``Quit()`` prevents
+this.
 """
 
 from __future__ import annotations
@@ -35,7 +34,7 @@ MSO_AUTOMATION_SECURITY_FORCE_DISABLE = 3
 
 
 def emit(payload: dict) -> None:
-    """Write the single JSON result line the parent parses."""
+    """Write the JSON result line that the parent process parses."""
     sys.stdout.write("@@RESULT@@" + json.dumps(payload) + "\n")
     sys.stdout.flush()
 
@@ -80,7 +79,7 @@ def convert_excel(src: str, out: str) -> None:
 
         wb = app.Workbooks.Open(FileName=src, ReadOnly=True, UpdateLinks=0, AddToRecentFiles=False)
         try:
-            # Without explicit page setup, wide sheets fragment across many pages.
+            # Fit each sheet to one page wide; otherwise wide sheets split across many pages.
             for sheet in wb.Worksheets:
                 try:
                     ps = sheet.PageSetup
@@ -106,8 +105,8 @@ def convert_powerpoint(src: str, out: str) -> None:
 
     app = win32.DispatchEx("PowerPoint.Application")
     try:
-        # PowerPoint historically refuses to run headless; WithWindow=False is the
-        # supported way to keep the window out of the user's face.
+        # PowerPoint cannot run fully headless; WithWindow=False is the supported
+        # way to keep its window hidden.
         pres = app.Presentations.Open(src, ReadOnly=True, Untitled=False, WithWindow=False)
         try:
             pres.ExportAsFixedFormat(out, PP_TYPE_PDF)

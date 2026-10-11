@@ -1,10 +1,9 @@
-"""Outlook items attached to mail: appointments, contacts, tasks, odd classes.
+"""Outlook items attached to mail: appointments, contacts, tasks, other classes.
 
-Real mailboxes attach far more than files. Dragging a meeting, a contact or
-another mail onto a message attaches it as an *Outlook item*, and items of a
-class extract-msg refuses - a document stored in a mail folder, a recall - used
-to make it raise while opening the carrier, which lost the whole message. These
-build such messages from scratch (see ``msgbuild``) so no real mail is needed.
+Dragging a meeting, a contact or another mail onto a message attaches it as an
+*Outlook item*. extract-msg refuses some item classes, such as a document stored
+in a mail folder or a recall; the carrier message must still be read. The test
+messages are built from scratch (see ``msgbuild``), so no real mail is needed.
 """
 
 from __future__ import annotations
@@ -75,7 +74,7 @@ def test_an_item_of_an_unhandled_class_does_not_lose_the_carrier(tmp_path, messa
     assert _names(item) == ["odd item.msg", "after.pdf"]
     nested = item.attachments[0].item
     assert nested is not None and nested.body_text == "odd body"
-    # ...and the odd item's own attachment is still there, inside it.
+    # The odd item's own attachment is kept inside it.
     assert [a.filename for a in nested.attachments] == ["inside.pdf"]
     assert nested.attachments[0].data == PDF
 
@@ -129,7 +128,7 @@ def test_attached_outlook_items_are_read_as_what_they_are(tmp_path, message_clas
 
 
 def test_an_item_that_will_not_serialise_is_still_read(tmp_path, monkeypatch):
-    """Export-and-reparse was the old route, and its failures lost the item."""
+    """An embedded item is read even when exporting it to bytes fails."""
     from extract_msg.msg_classes.msg import MSGFile
 
     def refuse(self, *args, **kwargs):
@@ -221,7 +220,7 @@ def test_outlook_items_nested_three_deep_keep_every_page(tmp_path):
     ]
 
 
-# ------------------------------------------------- names that say nothing ---
+# ----------------------------------------- names without a file type ---
 
 
 def _docx_bytes() -> bytes:

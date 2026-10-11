@@ -1,4 +1,4 @@
-"""Text files and web pages must arrive whole: every encoding, script, column and picture."""
+"""Text files and web pages convert completely: encodings, scripts, long lines and pictures."""
 
 from __future__ import annotations
 

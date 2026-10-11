@@ -1,9 +1,9 @@
-"""One lock for every use of pdfium in the process.
+"""Process-wide lock for all pdfium calls.
 
-pdfium is not thread-safe - not even across separate documents - and two threads
-inside it at once is a native crash, not an exception. The thumbnail renderer
-and the preview run on two threads already, and the output verifier runs on a
-third, so all of them take this lock around every pdfium call.
+pdfium is not thread-safe, even across separate documents, and concurrent calls
+crash the process instead of raising. The thumbnail renderer, the preview and
+the output verifier run on separate threads, so each holds this lock around
+every pdfium call.
 """
 
 from __future__ import annotations

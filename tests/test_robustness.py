@@ -1,4 +1,4 @@
-"""Things that used to end the process, or could: each must now be survivable."""
+"""Failures that could end the process are handled."""
 
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ def test_a_stale_thumbnail_does_not_land_on_another_page(qapp, tmp_path):
         before = window.page_list.item(0).icon().cacheKey()
         image = QImage(10, 10, QImage.Format_RGB32)
 
-        # A worker rendered row 0 as "second" - the list has since changed.
+        # A worker rendered row 0 as "second", but the list has changed since.
         window._on_thumbnail(0, (str(second), 0), image)
         assert window.page_list.item(0).icon().cacheKey() == before
 
@@ -90,7 +90,7 @@ def test_a_stale_thumbnail_does_not_land_on_another_page(qapp, tmp_path):
 
 
 def test_stop_all_ends_a_running_conversion_promptly(monkeypatch, tmp_path):
-    """Closing mid-conversion must not wait for LibreOffice to finish a batch."""
+    """stop_all ends a running conversion without waiting for the batch to finish."""
     script = tmp_path / "slow.py"
     script.write_text("import time\ntime.sleep(60)\n")
     command = [sys.executable, str(script)]
@@ -113,12 +113,12 @@ def test_stop_all_ends_a_running_conversion_promptly(monkeypatch, tmp_path):
         assert time.monotonic() - started < 15
         assert not libreoffice._running
 
-        # While stopping, nothing new starts...
+        # While stopped, new runs are refused.
         assert libreoffice._run(command, timeout=120, env=None)[1] == \
             "the application is closing"
     finally:
         libreoffice.resume()
-    # ...and once resumed, conversions run again.
+    # After resume, runs work again.
     quick = tmp_path / "quick.py"
     quick.write_text("print('ok')\n")
     assert libreoffice._run([sys.executable, str(quick)], 60, None)[0].strip() == "ok"
@@ -192,7 +192,7 @@ def test_an_unexpected_exception_is_logged_and_shown_not_lost(qapp, tmp_path, mo
     assert "still running" in window.status.currentMessage()
 
 
-# ------------------------------------------- a body LibreOffice will not do ---
+# ---------------------------------- bodies LibreOffice fails to render ---
 
 
 def test_an_exclusive_conversion_waits_for_running_ones_and_blocks_new_ones():
@@ -229,7 +229,7 @@ def test_an_exclusive_conversion_waits_for_running_ones_and_blocks_new_ones():
 
 
 def _failing_renderer(monkeypatch, failures: int):
-    """render_body_pdf that fails the first ``failures`` calls, then works."""
+    """Patch render_body_pdf to fail the first ``failures`` calls, then work."""
     from consolidator import email_items
 
     calls = []

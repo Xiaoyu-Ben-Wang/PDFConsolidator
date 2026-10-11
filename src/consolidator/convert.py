@@ -1,14 +1,12 @@
-"""Per-format converters: everything that turns a source file into a PDF.
+"""Per-format converters that turn a source file into a PDF.
 
-Each converter takes a source path and a destination path and either produces a
-PDF or raises :class:`ConversionError` with a message worth showing a user.
+Each converter takes a source path and a destination path and either writes a
+PDF or raises :class:`ConversionError` with a message for the user.
 
-Office documents and web pages are delegated to LibreOffice (see
-:mod:`consolidator.libreoffice`), which lays out an HTML page the same way it
-renders an email body.
-Images go through ``img2pdf`` so JPEGs are copied losslessly rather than
-re-encoded. Plain text - including Markdown, which is deliberately *not*
-interpreted - is escaped and laid out with ReportLab.
+Office documents and web pages are converted by LibreOffice (see
+:mod:`consolidator.libreoffice`), which renders HTML the same way as an email
+body. Images go through ``img2pdf`` so JPEGs are embedded without re-encoding.
+Plain text, including Markdown (not interpreted), is laid out with ReportLab.
 """
 
 from __future__ import annotations
@@ -25,32 +23,28 @@ from . import libreoffice, pages
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
 TEXT_EXTS = {".txt", ".md", ".markdown", ".log", ".csv"}
 PDF_EXTS = {".pdf"}
-# Word, Excel and PowerPoint, plus the macro-enabled and template variants of the
-# same containers: LibreOffice reads them all through the same filters, and
-# refusing an .xlsm because it was not on a list was simply a gap.
+# Word, Excel and PowerPoint, including macro-enabled and template variants,
+# which LibreOffice reads with the same filters, plus OpenDocument and RTF.
 OFFICE_EXTS = {
     ".docx", ".doc", ".docm", ".dot", ".dotx", ".dotm",
     ".xlsx", ".xls", ".xlsm", ".xltx", ".xltm",
     ".pptx", ".ppt", ".pptm", ".potx", ".potm", ".pps", ".ppsx",
     ".rtf", ".odt", ".ods", ".odp", ".odg", ".odf",
 }
-# Web pages are rendered by LibreOffice, the same way an email body is - not read
-# as literal text, which would put markup on the page.
+# Web pages are rendered by LibreOffice, like email bodies, not shown as raw markup.
 WEB_EXTS = {".html", ".htm", ".xhtml"}
 MSG_EXTS = {".msg"}
 EML_EXTS = {".eml"}
 EMAIL_EXTS = MSG_EXTS | EML_EXTS
 
-# What one LibreOffice invocation can be handed: the same engine, batched.
+# Formats that can be batched into one LibreOffice invocation.
 LIBREOFFICE_EXTS = OFFICE_EXTS | WEB_EXTS
-# Everything that becomes pages as a document: laid out by LibreOffice or, for
-# plain text, by the text renderer.
+# Formats laid out as documents, by LibreOffice or the text renderer.
 DOCUMENT_EXTS = LIBREOFFICE_EXTS | TEXT_EXTS
-# Everything the application accepts as a source file.
+# All accepted source formats.
 SUPPORTED_EXTS = (PDF_EXTS | IMAGE_EXTS | DOCUMENT_EXTS | EMAIL_EXTS)
 
-# Formats we knowingly do not handle, so the error is a clear message rather
-# than a confusing "unsupported extension".
+# Known unsupported formats, each with a specific error message.
 KNOWN_UNSUPPORTED = {
     ".pub": "Microsoft Publisher is not supported",
     ".heic": "HEIC images need an extra codec that is not bundled",
@@ -72,14 +66,14 @@ def _is_office(ext: str) -> bool:
 
 
 def convert_with_libreoffice(src: Path, dest: Path, workdir: Path) -> None:
-    """Lay a document out with LibreOffice: Office formats and web pages alike."""
+    """Convert an Office document or web page with LibreOffice, retrying once on failure."""
     if Path(src).suffix.lower() in WEB_EXTS:
         staged = Path(workdir) / ("%s_page%s" % (Path(dest).stem, Path(src).suffix))
         try:
             stage_web_page(src, staged)
             src = staged
         except OSError:
-            pass    # convert the page as it is, without its pictures
+            pass    # convert the original page, without its local images
     try:
         libreoffice.convert_one(src, dest, workdir=workdir)
         return
@@ -87,10 +81,9 @@ def convert_with_libreoffice(src: Path, dest: Path, workdir: Path) -> None:
         first = exc
     if libreoffice.stopping():
         raise ConversionError(str(first)) from first
-    # One more attempt with no other soffice running. Single conversions - an
-    # Office attachment inside an email - run several at a time across emails,
-    # and LibreOffice is known to fail when its processes overlap; the batched
-    # path already retries alone, this one simply gave up.
+    # Retry once with no other soffice running. Single conversions (e.g. Office
+    # attachments in emails) can run concurrently, and LibreOffice can fail when
+    # its processes overlap.
     time.sleep(RETRY_PAUSE_SECONDS)
     try:
         with libreoffice.alone():
@@ -99,7 +92,7 @@ def convert_with_libreoffice(src: Path, dest: Path, workdir: Path) -> None:
         raise ConversionError(str(first)) from exc
 
 
-# Beyond this a picture is left as a link: the page is held in memory whole.
+# Larger images stay as links, because the whole page is held in memory.
 MAX_INLINE_IMAGE_BYTES = 32 * 1024 * 1024
 
 _IMG_SRC = re.compile(
@@ -107,12 +100,11 @@ _IMG_SRC = re.compile(
 
 
 def inline_local_images(html: bytes, base_dir: Path) -> bytes:
-    """Embed the pictures a saved web page links to, as ``data:`` URIs.
+    """Embed locally linked images in the HTML as ``data:`` URIs.
 
-    LibreOffice, run headless, does not load linked pictures at all - not by a
-    relative path, not by a ``file:`` URL - so every image of a page saved with
-    "Save page as..." (``page_files/...``) was missing from its PDF. A ``data:``
-    URI is the one form it renders. Remote pictures are left alone.
+    Headless LibreOffice does not load linked images (relative paths or
+    ``file:`` URLs), but does render ``data:`` URIs. Remote images are left
+    unchanged.
     """
     import base64
     import mimetypes
@@ -124,7 +116,7 @@ def inline_local_images(html: bytes, base_dir: Path) -> bytes:
         if parsed.scheme in ("", "file") or len(parsed.scheme) == 1:
             if parsed.scheme == "file":
                 target = Path(unquote(parsed.path.lstrip("/")))
-            elif len(parsed.scheme) == 1:          # C:\... read as a scheme
+            elif len(parsed.scheme) == 1:          # drive letter (C:\...) parsed as a scheme
                 target = Path(reference)
             else:
                 target = base_dir / unquote(parsed.path)
@@ -142,16 +134,15 @@ def inline_local_images(html: bytes, base_dir: Path) -> bytes:
 
 
 def stage_web_page(src: Path, staged: Path) -> None:
-    """Copy a web page for conversion, bringing its local pictures with it."""
+    """Copy a web page to ``staged`` with its local images embedded."""
     staged.write_bytes(inline_local_images(Path(src).read_bytes(), Path(src).parent))
 
 
 def convert_pdf(src: Path, dest: Path, workdir: Path) -> None:
-    """Existing PDFs are copied through untouched - never re-encoded.
+    """Copy an existing PDF unchanged.
 
-    The copy is verified by the pipeline, which opens every PDF it is handed: a
-    file that cannot be read is reported as a failure rather than becoming a
-    segment that silently contributes no pages.
+    The pipeline opens every PDF afterwards, so an unreadable file is reported
+    as a failure instead of contributing no pages.
     """
     try:
         shutil.copyfile(src, dest)
@@ -187,8 +178,8 @@ def convert_image(src: Path, dest: Path, workdir: Path, page_size: tuple | None)
             reencode = _needs_reencode(img)
 
         if reencode:
-            # Bake EXIF rotation and flatten transparency onto white. PDF has no
-            # alpha channel, and flattening onto black (the default) looks broken.
+            # Apply EXIF rotation and flatten transparency onto white. The PDF
+            # image has no alpha channel, and the default flattens onto black.
             with Image.open(src) as img:
                 img = ImageOps.exif_transpose(img)
                 if img.mode in ("RGBA", "LA", "P"):
@@ -199,10 +190,8 @@ def convert_image(src: Path, dest: Path, workdir: Path, page_size: tuple | None)
                 elif img.mode not in ("RGB", "L"):
                     img = img.convert("RGB")
 
-                # mkstemp returns an open descriptor as well as a path. Leaving
-                # it open leaks a handle per image, and on Windows an open handle
-                # prevents the file being deleted afterwards - so the scratch
-                # copy would survive every conversion.
+                # Close the descriptor from mkstemp; on Windows an open handle
+                # prevents deleting the temporary file afterwards.
                 handle, name = tempfile.mkstemp(suffix=".png", dir=str(workdir))
                 os.close(handle)
                 temp_path = Path(name)
@@ -230,11 +219,11 @@ def convert_image(src: Path, dest: Path, workdir: Path, page_size: tuple | None)
 
 
 def convert_text(src: Path, dest: Path, workdir: Path, page_size: tuple | None) -> None:
-    """Render a text file as literal, monospaced, whitespace-preserving text.
+    """Render a text file as monospaced text, preserving whitespace.
 
-    Markdown is intentionally *not* interpreted: ``# Title`` stays ``# Title``.
-    The encoding is detected, every script is drawn and long lines are wrapped
-    rather than cut off; see :mod:`consolidator.text_render`.
+    Markdown is not interpreted: ``# Title`` stays ``# Title``. See
+    :mod:`consolidator.text_render` for encoding detection, font fallback and
+    line wrapping.
     """
     from . import text_render
 
@@ -310,7 +299,7 @@ _MIME_EXTS = {
 
 
 def _sniff_ole(data: bytes) -> str:
-    """Which Office container an OLE2 file is: Outlook item, Word, Excel, PowerPoint."""
+    """Return the extension of an OLE2 file (.msg, .doc, .xls, .ppt), or ""."""
     import io
 
     try:
@@ -332,7 +321,7 @@ def _sniff_ole(data: bytes) -> str:
 
 
 def _sniff_zip(data: bytes) -> str:
-    """Which document a ZIP container is: OOXML or OpenDocument."""
+    """Return the extension of a ZIP-based document (OOXML or OpenDocument), or ""."""
     import io
     import zipfile
 
@@ -354,12 +343,11 @@ def _sniff_zip(data: bytes) -> str:
 
 
 def sniff_extension(data: bytes) -> str:
-    """The extension a file's *content* says it has, or "" if it is not recognised.
+    """Return the extension that matches the file's content, or "" if unknown.
 
-    Mail routinely names attachments ``image001``, ``scan``, ``ATT00001`` or
-    ``file.dat`` and labels them ``application/octet-stream``. Judged by name
-    alone they were "unsupported file type" and contributed nothing, although
-    the bytes were a perfectly ordinary PDF or picture.
+    Email attachments are often named ``image001``, ``scan``, ``ATT00001`` or
+    ``file.dat`` and typed ``application/octet-stream``, so the name alone does
+    not identify a PDF or image.
     """
     head = data[:2048]
     if b"%PDF-" in head[:1024]:
@@ -373,8 +361,8 @@ def sniff_extension(data: bytes) -> str:
     for signature, extension in signatures:
         if head.startswith(signature):
             if extension == ".bmp":
-                # "BM" alone also starts plenty of text; a real bitmap's header
-                # is followed by one of the few defined info-header sizes.
+                # Text can also start with "BM"; a real bitmap has one of the
+                # defined info-header sizes at offset 14.
                 if len(head) < 26 or int.from_bytes(head[14:18], "little") not in (
                         12, 40, 52, 56, 64, 108, 124):
                     continue
@@ -386,7 +374,7 @@ def sniff_extension(data: bytes) -> str:
     if head.startswith(b"PK\x03\x04"):
         return _sniff_zip(data)
 
-    # Text of some kind: decide between a web page, a message and plain text.
+    # Text: decide between HTML, an email message and plain text.
     if b"\x00" in head and not head.startswith((b"\xff\xfe", b"\xfe\xff")):
         return ""
     from .text_render import decode_text
@@ -407,11 +395,11 @@ def sniff_extension(data: bytes) -> str:
 
 
 def typed_name(name: str, data: bytes, mimetype: str = "") -> str:
-    """``name`` with an extension that matches what the file is, when it lacks one.
+    """Return ``name`` with an extension matching the file type, if it lacks one.
 
-    A name whose extension is already supported is trusted. Otherwise the
-    content decides, then the MIME type; the original name is kept in front so
-    the row still says what the sender called it (``scan`` becomes ``scan.pdf``).
+    A supported extension is kept as is. Otherwise the extension is taken from
+    the content, then the MIME type, and appended to the original name
+    (``scan`` becomes ``scan.pdf``).
     """
     name = name or "attachment"
     if Path(name).suffix.lower() in SUPPORTED_EXTS:
@@ -423,7 +411,7 @@ def typed_name(name: str, data: bytes, mimetype: str = "") -> str:
 
 
 def unsupported_reason(ext: str) -> str:
-    """Why a file could not be converted, in words a user can act on."""
+    """Return a user-facing message explaining why the file type is unsupported."""
     if not ext:
         return ("unsupported file type: the file has no extension, and its "
                 "content is not a type that can be converted")

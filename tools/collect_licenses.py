@@ -1,24 +1,22 @@
-"""Collect the third-party licence material that has to travel with the build.
+"""Collect the third-party licence files that ship with the build.
 
-PDF Consolidator is GPL-3.0-or-later, and the frozen bundle redistributes a lot
-of other people's code: Qt under the LGPL, LibreOffice under the MPL, and a pile
-of permissively licensed libraries. Those licences require their texts to be
-conveyed with the program, so this script gathers them.
+PDF Consolidator is GPL-3.0-or-later. The frozen bundle redistributes Qt
+(LGPL), LibreOffice (MPL) and many permissively licensed libraries, whose
+licences require their texts to ship with the program.
 
-It reads the *installed* distributions rather than a hand-written list of texts,
-because a hand-written list goes stale the moment a dependency is added. For
-each distribution in ``RUNTIME`` it copies the licence files the wheel actually
-ships into ``LICENSES/<name>/`` and writes ``THIRD-PARTY-NOTICES.md`` to index
-them.
+The script reads the installed distributions instead of a fixed list of
+texts, so new dependencies are picked up. For each distribution in
+``RUNTIME`` it copies the licence files the wheel ships into
+``LICENSES/<name>/`` and writes ``THIRD-PARTY-NOTICES.md`` as an index.
 
 Usage::
 
     python tools/collect_licenses.py
     python tools/collect_licenses.py --verify dist/PDFConsolidator/PDFConsolidator.exe
 
-``--verify`` reads the module list out of a built executable and fails if the
-bundle contains a distribution this script does not know about - which is how a
-new dependency gets caught before it ships unlicensed.
+``--verify`` reads the module list from a built executable and fails if the
+bundle contains a distribution not listed here, so a new dependency is caught
+before it ships.
 """
 
 from __future__ import annotations
@@ -36,16 +34,14 @@ ROOT = Path(__file__).resolve().parent.parent
 LICENCES_DIR = ROOT / "LICENSES"
 NOTICES_PATH = ROOT / "THIRD-PARTY-NOTICES.md"
 
-# Where the Corresponding Source for *this* application is published. GPL-3.0
-# section 6 lets you satisfy the source requirement by offering it from a
-# network server, but the offer has to say where. Set this before you hand the
-# bundle to anybody; leaving it empty makes the notices fall back to wording
-# that assumes the source travelled with the build.
+# Where the Corresponding Source for this application is published. GPL-3.0
+# section 6 allows offering the source from a network server, but the offer
+# must give the location. If empty, the notices describe the source as the
+# tree the bundle was built from.
 SOURCE_URL = "https://github.com/Xiaoyu-Ben-Wang/PDFConsolidator"
 
-# What actually ends up in the bundle, and what it does for us. Verified against
-# a real build by ``--verify``; a module in the bundle that is missing from this
-# list is reported as an error rather than silently going unlicensed.
+# Distributions in the bundle and what each is used for. ``--verify`` checks
+# this list against a real build and reports any bundled module missing from it.
 RUNTIME: list[tuple[str, str]] = [
     ("pypdf", "reading, merging and rewriting the PDFs"),
     ("reportlab", "page numbers, headers, footers and title pages"),
@@ -75,8 +71,8 @@ RUNTIME: list[tuple[str, str]] = [
     ("pywin32", "collected by the PyInstaller hook; not used by the application"),
 ]
 
-# Vendored by tools/vendor.py as unpacked source, so there is no installed
-# metadata to read: the licence lives in a comment at the top of the module.
+# Installed by tools/vendor.py as unpacked source, so there is no installed
+# metadata. The licence is in a comment at the top of the module.
 MANUAL: list[tuple[str, str, str, str]] = [
     (
         "red-black-tree-mod",
@@ -86,15 +82,15 @@ MANUAL: list[tuple[str, str, str, str]] = [
     ),
 ]
 
-# Licence texts several components share, published once at LICENSES/<file>
-# instead of only under each package. The marker is looked for near the start of
-# a collected file, which is how the text is found without hard-coding a path.
+# Licence texts shared by several components, also published once at
+# LICENSES/<file>. The text is found by looking for the marker near the start
+# of each collected file.
 SHARED_TEXTS: list[tuple[str, str]] = [
     ("LGPL-3.0.txt", "GNU LESSER GENERAL PUBLIC LICENSE"),
 ]
 
-# Components that ship inside the bundle but are not Python distributions, and
-# so are described in prose rather than discovered from metadata.
+# Components in the bundle that are not Python distributions. They are
+# described in fixed text instead of read from metadata.
 LIBREOFFICE_VERSION_INI = Path("libreoffice/program/version.ini")
 
 MSVC_NOTE = """\
@@ -103,8 +99,8 @@ MSVC_NOTE = """\
 the Microsoft Software License Terms for the Visual C++ Redistributable, which
 permit redistribution with an application built using Visual Studio."""
 
-# The one place where the licences impose a duty beyond shipping a text file, so
-# it is spelled out rather than left to the licence reading.
+# The LGPL requires that users can replace the Qt libraries, which is more than
+# shipping a text file, so the notices state it explicitly.
 QT_NOTE = """\
 **Qt** (`PySide6-Essentials`, `shiboken6`) is used under the **LGPL-3.0-only**
 option. The wheels ship only a commercial licence reference, so the LGPL text is
@@ -114,8 +110,7 @@ The Qt libraries are ordinary DLLs under `_internal/PySide6/`, loaded at run tim
 rather than linked in statically. You may replace any of them with your own build
 of the same Qt version; the program needs no rebuild or relink for that."""
 
-# LibreOffice's own notices are the authoritative ones for that tree; this is
-# only a pointer to where they are.
+# Points to LibreOffice's own notices, which are authoritative for that tree.
 LIBREOFFICE_NOTE = """\
 LibreOffice's own notices are the authoritative ones for that tree:
 `libreoffice/license.txt`, `LICENSE.html`, `NOTICE` and `CREDITS.fodt`. They cover
@@ -129,7 +124,7 @@ BINARY_SUFFIXES = {".py", ".pyc", ".pyd", ".dll", ".exe", ".so", ".json"}
 
 
 def canonical(name: str) -> str:
-    """PEP 503 name normalisation, so 'extract_msg' and 'extract-msg' match."""
+    """Normalise a name per PEP 503, so 'extract_msg' and 'extract-msg' match."""
     return re.sub(r"[-_.]+", "-", name).strip().lower()
 
 
@@ -143,7 +138,7 @@ def find_distribution(name: str):
 
 
 def licence_id(dist) -> str:
-    """The licence as the package declares it, preferring SPDX expressions."""
+    """Return the declared licence, preferring an SPDX expression."""
     expression = dist.metadata.get("License-Expression")
     if expression:
         return expression.strip()
@@ -169,7 +164,7 @@ def project_url(dist) -> str:
 
 
 def licence_files(dist) -> list[tuple[Path, Path]]:
-    """(path inside the distribution, real path on disk) for its licence files."""
+    """Return (path inside the distribution, path on disk) for each licence file."""
     found: list[tuple[Path, Path]] = []
     for relative in dist.files or ():
         path = Path(str(relative))
@@ -205,9 +200,9 @@ def split_off_dist_info(path: Path) -> Path:
 def copy_licence_files(dist, name: str) -> list[Path]:
     """Copy one distribution's licence texts; return the paths written."""
     written: list[Path] = []
-    # Windows folds case, so 'LICENSE.txt' and 'License.txt' are the same file.
-    # Without this, a package that ships both would overwrite one with the other
-    # and be listed twice.
+    # Windows paths are case-insensitive, so 'LICENSE.txt' and 'License.txt' are
+    # the same file. Skip the second so it does not overwrite the first or get
+    # listed twice.
     seen: set[str] = set()
     for relative, real in licence_files(dist):
         tail = split_off_dist_info(relative)
@@ -225,11 +220,11 @@ def copy_licence_files(dist, name: str) -> list[Path]:
 
 
 def promote_shared_texts() -> list[str]:
-    """Publish one canonical copy of each licence text shared between packages.
+    """Publish one copy of each licence text shared between packages.
 
-    PySide6 and shiboken6 are the reason this exists: their wheels carry only the
-    *commercial* licence reference and not the LGPL text, so it has to be taken
-    from a package that does ship it.
+    The PySide6 and shiboken6 wheels include only a commercial licence
+    reference, not the LGPL text, so the text is taken from another package
+    that ships it.
     """
     written: list[str] = []
     candidates = sorted(path for path in LICENCES_DIR.rglob("*") if path.is_file())
@@ -254,7 +249,7 @@ def promote_shared_texts() -> list[str]:
 
 
 def extract_comment_licence(source: Path) -> str:
-    """Pull the licence out of a '##'-commented header block."""
+    """Return the licence text from a '##'-commented header block."""
     lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
     block: list[str] = []
     for line in lines:
@@ -282,7 +277,7 @@ def write_manual_licence(name: str, source_name: str) -> list[Path]:
 
 
 def libreoffice_version(bundle: Path | None) -> str:
-    """The LibreOffice build bundled beside the executable, if there is one."""
+    """Return the version of the LibreOffice bundled beside the executable."""
     candidates = []
     if bundle is not None:
         candidates.append(bundle / LIBREOFFICE_VERSION_INI)
@@ -485,7 +480,7 @@ def collect(bundle: Path | None) -> tuple[list[dict], list[dict], list[dict]]:
 
 
 def archive_modules(exe: Path) -> set[str]:
-    """Top-level module names inside a frozen executable's archive."""
+    """Return the top-level module names in a frozen executable's archive."""
     viewer = Path(sys.executable).parent / "pyi-archive_viewer.exe"
     command = [str(viewer) if viewer.exists() else "pyi-archive_viewer",
                "-r", "-b", str(exe)]

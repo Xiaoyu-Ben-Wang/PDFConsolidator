@@ -1,15 +1,13 @@
 """Shared data model.
 
 A *source* is a file the user selected. It expands into one or more *segments*:
-an ordinary document yields a single segment, while an Outlook item yields a body
-segment plus one per extracted attachment. Segments - not sources - are what the
-assembler lays out, which is what lets an email attachment appear as its own
-pages in the middle of the output.
+an ordinary document yields one segment, and an Outlook item yields a body
+segment plus one per extracted attachment. The assembler lays out segments, not
+sources, so an email attachment can appear as its own pages in the output.
 
-A message attached to a message is expanded in place, and its segments carry the
-nesting (see :class:`Segment`), so the interface can show a forwarded message as
-a node inside the message that carried it instead of flattening it into a list of
-look-alike rows.
+A message attached to another message is expanded in place. Its segments record
+the nesting (see :class:`Segment`) so the interface can show a forwarded message
+as a child of the message that carried it.
 """
 
 from __future__ import annotations
@@ -34,18 +32,15 @@ class Segment:
     ok: bool = False
     detail: str = ""
     seconds: float = 0.0
-    # Pages the produced PDF actually has, verified once by the pipeline. The
-    # interface used to reopen every PDF to count them, which on a folder of
-    # thousands of files meant thousands of extra opens.
+    # Page count of the produced PDF, set once by the pipeline so the interface
+    # does not have to reopen every PDF to count pages.
     page_count: int = 0
 
-    # Message nesting. An attached message is expanded in place rather than kept
-    # as an opaque file, so its pages have to say which message they belong to,
-    # which message carried that one, and what to call it.
+    # Message nesting for attached messages that are expanded in place.
     #
     # ``group`` identifies the message; it is empty for an ordinary file, whose
-    # own path then serves as the group. ``parent`` is the group that embedded
-    # this one, which is what turns a flat list into a nested navigator.
+    # path then serves as the group. ``parent`` is the group that embedded this
+    # one. ``group_label`` is the message's display name.
     group: str = ""
     parent: str = ""
     group_label: str = ""

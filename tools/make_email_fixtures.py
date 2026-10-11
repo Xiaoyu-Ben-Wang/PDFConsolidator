@@ -1,9 +1,8 @@
 """Generate .eml fixtures covering the attachment-expansion cases.
 
-.eml is plain MIME text, so these are built directly and cover exactly the
-scenarios that matter: a PDF attachment (the required case), an image, an Office
-document, a nested message, an inline signature image, and a message with no
-attachments at all.
+.eml files are plain MIME text, so they are built directly. They cover a PDF
+attachment, an image, an Office document, a nested message, an inline signature
+image, and a message with no attachments.
 """
 from __future__ import annotations
 
@@ -48,7 +47,7 @@ def base(subject: str, body: str) -> EmailMessage:
 
 print("writing .eml fixtures to %s" % OUT)
 
-# 1. The required case: a PDF attachment.
+# 1. A PDF attachment.
 m = base("Invoice for March", "Please find the invoice attached.\n\nRegards,\nAlice")
 m.add_attachment(PDF.read_bytes(), maintype="application", subtype="pdf", filename="invoice.pdf")
 write("with_pdf.eml", m)
@@ -88,8 +87,8 @@ m.add_alternative(
     </body></html>""",
     subtype="html",
 )
-# The inline image goes in a related part so it carries the Content-ID the HTML
-# refers to, without being promoted to an attachment.
+# The inline image goes in a related part so it has the Content-ID the HTML
+# refers to and is not treated as an attachment.
 m.get_payload()[1].add_related(
     PNG.read_bytes(), maintype="image", subtype="png",
     cid="<signature-logo@example.com>", filename="logo.png",
@@ -97,7 +96,7 @@ m.get_payload()[1].add_related(
 m.add_attachment(PDF.read_bytes(), maintype="application", subtype="pdf", filename="figures.pdf")
 write("html_inline.eml", m)
 
-# 5. Duplicate attachment filenames, to prove unique staging.
+# 5. Duplicate attachment filenames, to test unique staging.
 m = base("Two invoices", "Both called invoice.pdf on purpose.")
 m.add_attachment(PDF.read_bytes(), maintype="application", subtype="pdf", filename="invoice.pdf")
 m.add_attachment(PDF.read_bytes(), maintype="application", subtype="pdf", filename="invoice.pdf")
@@ -109,7 +108,7 @@ m = base("Fwd: Forwarded: original", "Forwarding this for your records.")
 m.add_attachment(inner, filename="forwarded.eml")
 write("nested.eml", m)
 
-# 7. An attachment type with no converter, to prove it is reported not crashed.
+# 7. An attachment type with no converter, which is reported, not a crash.
 m = base("Backup archive", "Contains a zip we cannot render.")
 m.add_attachment(b"PK\x03\x04 not really a zip", maintype="application",
                  subtype="zip", filename="backup.zip")

@@ -20,12 +20,11 @@ from . import (
     pipeline,
 )
 
-# What is pulled out of an email item unless told otherwise. Attached messages are
-# included: a forwarded email is ordinary mail, and its contents are the point.
+# Attachment categories extracted from email items by default. Attached
+# messages ("embedded") are included, since forwarded mail is regular content.
 DEFAULT_EXTRACT = ("pdf", "images", "documents", "embedded")
 
-# Older spelling of the "documents" category, still accepted so a script or a
-# habit built on it keeps working.
+# Old name for the "documents" category, kept for backward compatibility.
 CATEGORY_ALIASES = {"office": "documents"}
 
 
@@ -96,7 +95,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             keep_scratch=args.keep_scratch,
         )
     except OSError as exc:
-        # Most often an unwritable destination; a traceback would only obscure it.
+        # Usually an unwritable destination; print a short message, not a traceback.
         print()
         print("Could not write the output: %s" % exc, file=sys.stderr)
         print("Check that the destination folder exists and is writable.", file=sys.stderr)
@@ -177,12 +176,12 @@ def _cmd_check(args: argparse.Namespace) -> int:
 
 
 def _cmd_selftest(args: argparse.Namespace) -> int:
-    """Convert generated samples end to end and report.
+    """Convert generated samples end to end and report the result.
 
-    Exists because the shipped build is a windowed executable with no console:
-    without this there is no way to prove that the frozen application can still
-    find its bundled LibreOffice and produce a PDF. Writes to stdout when there
-    is one, and always to ``selftest.log`` beside the executable.
+    The shipped build is a windowed executable with no console, so this checks
+    that the frozen application finds its bundled LibreOffice and produces a
+    PDF. Output goes to stdout when available and always to ``selftest.log``
+    beside the executable.
     """
     import tempfile
     import traceback
@@ -219,9 +218,8 @@ def _cmd_selftest(args: argparse.Namespace) -> int:
         source_dir = work / "in"
         source_dir.mkdir(parents=True, exist_ok=True)
 
-        # Plain text, an image, and an RTF document - the last one exercises
-        # LibreOffice, which is the part most likely to break in a bundle.
-        # (HTML is deliberately not an accepted input, so RTF stands in.)
+        # Plain text, an image and an RTF document. The RTF file tests
+        # LibreOffice, the part most likely to break in a bundled build.
         (source_dir / "notes.txt").write_text("self test\n" * 40, encoding="utf-8")
         Image.new("RGB", (600, 400), (200, 220, 240)).save(source_dir / "swatch.png")
         (source_dir / "memo.rtf").write_text(

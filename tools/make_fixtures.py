@@ -77,13 +77,13 @@ d.rectangle([40, 40, 1560, 1160], outline=(40, 80, 160), width=6)
 d.text((80, 80), "JPEG fixture 1600x1200", fill=(20, 20, 20))
 img.save(path("photo.jpg"), quality=92)
 
-# PNG with alpha - exercises the flatten-onto-white path in img2pdf.
+# PNG with alpha, for the flatten-onto-white path in img2pdf.
 alpha = Image.new("RGBA", (800, 600), (0, 0, 0, 0))
 ad = ImageDraw.Draw(alpha)
 ad.ellipse([100, 100, 700, 500], fill=(220, 60, 60, 255))
 alpha.save(path("diagram.png"))
 
-# Very tall image - exercises page-fitting.
+# Very tall image, for page fitting.
 tall = Image.new("RGB", (600, 2400), (255, 255, 255))
 td = ImageDraw.Draw(tall)
 td.rectangle([20, 20, 580, 2380], outline=(0, 0, 0), width=4)

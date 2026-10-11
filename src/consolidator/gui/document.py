@@ -1,12 +1,11 @@
-"""The editable document model behind the GUI.
+"""Editable document model for the GUI.
 
-Deliberately free of any Qt import so it can be tested without a display, and so
-the same model could back a different front end.
+This module does not import Qt, so it can be tested without a display.
 
-The model holds *segments* (what conversion produced) and a flat list of *pages*
-(what the user sees and edits). Editing operations act on the page list; building
-output re-groups consecutive pages back into merge entries, which is what allows
-pages from different documents to be interleaved arbitrarily.
+The model holds *segments* (conversion results) and a flat list of *pages*
+(what the user sees and edits). Edits act on the page list. When building
+output, consecutive pages are grouped back into merge entries, so pages from
+different documents can be interleaved in any order.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ from .. import assemble
 
 @dataclass
 class SegmentNode:
-    """One converted run of pages, as produced by Phase A."""
+    """One converted PDF produced by Phase A."""
 
     id: int
     source: Path
@@ -39,11 +38,11 @@ class SegmentNode:
 
 @dataclass
 class MessageNode:
-    """A message inside another message, as the navigator shows it.
+    """A message attached to another message, as shown in the navigator.
 
-    A message attached to a message is its own group of pages, hanging inside the
-    group that carried it. It is not a segment: it contributes no pages of its
-    own, only the ones its body and attachments do.
+    It groups the segments of its body and attachments and is nested in the
+    group of the message that contains it. It is not a segment and has no pages
+    of its own.
     """
 
     key: str
@@ -52,12 +51,11 @@ class MessageNode:
     segments: list[SegmentNode] = field(default_factory=list)
     children: list["MessageNode"] = field(default_factory=list)
     page_count: int = 0
-    # Segments and child messages together, in the order the message held them,
-    # so a forwarded mail sits between the attachments it arrived between.
+    # Segments and child messages in their original order within the message.
     entries: list = field(default_factory=list)
 
     def descendants(self) -> list[SegmentNode]:
-        """Every segment in this message, nested ones included."""
+        """Return all segments in this message, including nested messages."""
         found = list(self.segments)
         for child in self.children:
             found.extend(child.descendants())
@@ -85,11 +83,9 @@ class DocumentModel:
         self.segments: list[SegmentNode] = []
         self.pages: list[PageRef] = []
         self._next_id = 0
-        # Lookup indexes, rebuilt on demand. Every row the interface draws asks
-        # for its segment and its message group, and rescanning the segment list
-        # for each of those turns a few hundred files into tens of millions of
-        # comparisons - which is the difference between a responsive window and
-        # a frozen one.
+        # Lookup indexes, rebuilt lazily after changes. Each drawn row looks up
+        # its segment and message group; scanning the segment list each time is
+        # too slow with hundreds of files.
         self._by_id: dict[int, SegmentNode] = {}
         self._by_group: dict[str, SegmentNode] = {}
         self._by_source: dict[str, list[SegmentNode]] = {}
@@ -103,8 +99,7 @@ class DocumentModel:
         self._by_source = {}
         for node in self.segments:
             if node.group:
-                # First segment of a group wins: it is the one that knows the
-                # group's label and its parent.
+                # Use the group's first segment, which has its label and parent.
                 self._by_group.setdefault(node.group, node)
             self._by_source.setdefault(str(node.source), []).append(node)
         self._indexed = True
@@ -155,7 +150,7 @@ class DocumentModel:
         return self._by_id.get(segment_id)
 
     def segments_of(self, source: Path) -> list[SegmentNode]:
-        """Every segment a source contributed, in conversion order."""
+        """Return all segments from ``source``, in conversion order."""
         self._index()
         return list(self._by_source.get(str(Path(source)), []))
 
@@ -184,12 +179,11 @@ class DocumentModel:
             self.pages = [p for p in self.pages if p.segment_id != segment_id]
 
     def _home_of(self, segment_id: int) -> int:
-        """Where a segment's returning pages belong in the page list.
+        """Return the page-list position where a segment's pages are re-inserted.
 
-        After its own pages if any remain; otherwise after the last page of the
-        nearest segment converted before it, so an attachment ticked back on
-        returns to its place in the email instead of jumping to the top of the
-        document (where re-inserting at position 0 used to put it).
+        This is after the segment's remaining pages, if any; otherwise after the
+        last page of the nearest earlier segment, so a re-enabled attachment
+        returns to its place in the email.
         """
         last_own = None
         for position, page in enumerate(self.pages):
@@ -218,10 +212,9 @@ class DocumentModel:
     # ----------------------------------------------------- message nesting
 
     def group_owner(self, node: SegmentNode | None) -> SegmentNode | None:
-        """The segment belonging to the message that carried ``node``.
+        """Return the first segment of the message that contains ``node``'s message.
 
-        Used to keep a nested message's colour clearly different from the colour
-        of the message it arrived inside.
+        Used to give a nested message a colour distinct from its parent's.
         """
         if node is None or not node.parent:
             return None
@@ -229,10 +222,9 @@ class DocumentModel:
         return self._by_group.get(node.parent)
 
     def group_trail(self, node: SegmentNode | None) -> list[str]:
-        """Message names from the source down to ``node``'s own message.
+        """Return message names from the source down to ``node``'s message.
 
-        The first entry names the source file itself and is dropped: the row
-        already leads with it.
+        The source file itself is omitted because the row already shows it.
         """
         if node is None or not node.group:
             return []
@@ -251,13 +243,12 @@ class DocumentModel:
         return names[1:]
 
     def navigator_entries(self, source: Path) -> list:
-        """One source's rows, in order: its own segments and its nested messages.
+        """Return one source's navigator rows: its segments and nested messages, in order.
 
-        Each nested message is a :class:`MessageNode` placed where the message was
-        among its carrier's attachments, holding its own entries the same way.
-        The pipeline emits a nested message's segments at the position of the
-        attachment that carried it, so the first segment of a group marks where
-        the group goes.
+        Each nested message is a :class:`MessageNode` at its position among the
+        parent message's attachments, with its own entries nested the same way.
+        The pipeline emits a nested message's segments at the position of its
+        attachment, so a group's first segment marks the group's position.
         """
         entries: list = []
         nodes: dict[str, MessageNode] = {}
@@ -281,8 +272,8 @@ class DocumentModel:
             group.segments.append(node)
             group.entries.append(node)
 
-        # A message seen before its carrier (which the pipeline does not produce,
-        # but a model built by hand can) is moved inside the carrier once known.
+        # Move a message that appeared before its parent into the parent. The
+        # pipeline does not produce this order, but a hand-built model can.
         for entry in list(entries):
             if isinstance(entry, MessageNode):
                 owner = nodes.get(entry.parent)
@@ -302,11 +293,10 @@ class DocumentModel:
         return entries
 
     def navigator(self, source: Path) -> tuple[list[SegmentNode], list[MessageNode]]:
-        """Split one source's segments into what hangs off it and its messages.
+        """Split one source's segments into top-level segments and nested messages.
 
-        Returns the segments belonging to the source itself, in conversion order,
-        and the forest of nested messages, each holding its own segments and the
-        messages found inside it. :meth:`navigator_entries` keeps the two in
+        Returns the source's own segments in conversion order, and the tree of
+        nested messages. :meth:`navigator_entries` returns both interleaved in
         their original order instead.
         """
         entries = self.navigator_entries(source)
@@ -362,7 +352,7 @@ class DocumentModel:
             page.selected = selected
 
     def drop_source(self, source: Path) -> int:
-        """Forget everything a source contributed, including its pages."""
+        """Remove all segments and pages from ``source``; return the segment count."""
         doomed = {node.id for node in self.segments_of(source)}
         if not doomed:
             return 0
@@ -372,10 +362,9 @@ class DocumentModel:
         return len(doomed)
 
     def remove_failed_for(self, source: Path) -> int:
-        """Drop the failed segments belonging to one source, before a retry.
+        """Remove the failed segments of one source before a retry.
 
-        Successful segments are left alone, so retrying only ever replaces what
-        actually went wrong.
+        Successful segments are kept.
         """
         source = Path(source)
         before = len(self.segments)
@@ -386,19 +375,16 @@ class DocumentModel:
         return before - len(self.segments)
 
     def replace_source(self, source: Path, segments: list, count_pages=None) -> int:
-        """Merge a re-conversion of one source back in, in place. Returns recoveries.
+        """Merge a re-conversion of one source in place; return the number recovered.
 
-        A retry converts the whole source again, so it comes back with *every*
-        segment, not only the ones that failed. Appending them all duplicated the
-        parts that had worked and put everything - recovered attachments too - at
-        the end of the document. Instead the new segments are matched to the old
-        ones by what they are (label, kind, depth, in order):
+        A retry converts the whole source again and returns all its segments,
+        not only the failed ones. New segments are matched to old ones by
+        (label, kind, depth), in order:
 
-        * a part that had already worked keeps its node, so its pages and any
-          edits made to them stay exactly where they are;
-        * a part that failed before and works now takes the failed one's place in
-          the email, and its pages go where that place is in the page list;
-        * a part that still fails replaces its old failure.
+        * a segment that succeeded before keeps its node, pages and edits;
+        * a segment that failed before and now succeeds takes the old one's
+          position, and its pages are inserted at that position;
+        * a segment that still fails replaces the old failure.
 
         ``segments`` are pipeline segments; ``count_pages`` counts a PDF's pages
         when a segment does not say.
@@ -410,8 +396,8 @@ class DocumentModel:
         for node in old:
             unclaimed.setdefault((node.label, node.kind, node.depth), []).append(node)
 
-        # A nested message's group is named after the retry's scratch path, which
-        # differs from the first run's; map it back so siblings stay together.
+        # Nested message group keys come from the scratch path, which differs
+        # between runs; map new keys to the old ones to keep groups together.
         groups: dict[str, str] = {}
         merged: list[SegmentNode] = []
         recovered = 0
@@ -422,7 +408,7 @@ class DocumentModel:
             if match is not None and segment.group and match.group:
                 groups.setdefault(segment.group, match.group)
             if match is not None and match.ok:
-                merged.append(match)            # worked before: leave it be
+                merged.append(match)            # succeeded before: keep it
                 continue
             pages = segment.page_count
             if not pages and segment.ok and segment.pdf and count_pages:
@@ -446,8 +432,8 @@ class DocumentModel:
                 node.group = groups.get(node.group, node.group)
                 node.parent = groups.get(node.parent, node.parent)
 
-        # The source's block of segments is replaced where it stood, so segment
-        # order - which decides where returning pages go - is the email's order.
+        # Replace the source's segments at their original position. Segment
+        # order determines where re-inserted pages go (see _home_of).
         kept = {node.id for node in merged}
         first = next((i for i, node in enumerate(self.segments) if node.id in old_ids),
                      len(self.segments))
@@ -466,11 +452,10 @@ class DocumentModel:
         return recovered
 
     def group_by_source(self) -> None:
-        """Cluster pages so every page from one source file is contiguous.
+        """Reorder pages so all pages from each source file are contiguous.
 
-        Page order *within* each document is preserved, and documents keep the
-        order of their first appearance, so this is a stable tidy-up rather than
-        a re-sort. It is what the "group by document" button calls.
+        Page order within each document is preserved, and documents are ordered
+        by first appearance. Used by the "group by document" button.
         """
         order: list[str] = []
         buckets: dict[str, list[PageRef]] = {}
@@ -484,7 +469,7 @@ class DocumentModel:
         self.pages = [page for key in order for page in buckets[key]]
 
     def sources_in_order(self) -> list[str]:
-        """Source labels in the order their pages currently appear."""
+        """Return source paths in the order their pages currently appear."""
         seen: list[str] = []
         for page in self.pages:
             node = self.segment(page.segment_id)
@@ -498,9 +483,8 @@ class DocumentModel:
     def to_entries(self) -> list[assemble.MergeEntry]:
         """Group consecutive pages of the same segment into merge entries.
 
-        Re-grouping rather than assuming one entry per segment is what makes
-        arbitrary interleaving work: pages from document A, then B, then A again
-        become three entries, and the output order matches the grid exactly.
+        This supports interleaving: pages from A, then B, then A again become
+        three entries, so the output order matches the page grid.
         """
         entries: list[assemble.MergeEntry] = []
         current_id: int | None = None

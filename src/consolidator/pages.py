@@ -11,14 +11,14 @@ PAGE_SIZES: dict[str, tuple[float, float] | None] = {
     "letter": LETTER,
     "a4": A4,
     "legal": LEGAL,
-    "original": None,  # keep whatever each source page already is
+    "original": None,  # keep each source page's own size
 }
 
 DEFAULT_PAGE_SIZE = "letter"
 
 
 def resolve(name: str) -> tuple[float, float] | None:
-    """Look up a page size by name; ``None`` means 'leave pages alone'."""
+    """Return the page size for ``name``, or ``None`` to keep original sizes."""
     key = (name or DEFAULT_PAGE_SIZE).lower()
     if key not in PAGE_SIZES:
         raise ValueError("unknown page size %r (expected one of %s)"

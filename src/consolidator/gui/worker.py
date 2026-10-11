@@ -1,8 +1,8 @@
 """Background workers.
 
-Conversion and assembly both take seconds to minutes, and LibreOffice calls block
-for their whole duration, so neither may run on the GUI thread. Thumbnail
-rendering is off-thread too, otherwise scrolling a large document stutters.
+Conversion and assembly can take minutes, and LibreOffice calls block for their
+whole duration, so both run off the GUI thread. Thumbnail rendering also runs
+off-thread so scrolling stays smooth.
 """
 
 from __future__ import annotations
@@ -14,19 +14,18 @@ from PySide6.QtCore import QThread, Signal
 
 from .. import assemble, email_items, pipeline
 
-# Worker threads get a generous stack. Parsing a hostile or merely deeply nested
-# PDF or message recurses deeply, and Windows gives a new thread 1 MB by default:
-# running out of that is not an exception Python can catch but the end of the
-# process. Address space is reserved, not committed, so this costs nothing.
+# Worker thread stack size. Parsing deeply nested PDFs or messages recurses
+# deeply, and the Windows default of 1 MB per thread can overflow, which ends
+# the process instead of raising an exception. The space is reserved, not
+# committed, so it does not use memory.
 WORKER_STACK_BYTES = 16 * 1024 * 1024
 
 
 class ConversionWorker(QThread):
-    """Runs Phase A: turn the selected files into PDF segments."""
+    """Run phase A: convert the selected files into PDF segments."""
 
     progressed = Signal(str)
-    # done, total, what is happening now. A folder of several hundred files takes
-    # long enough that silence looks like a hang.
+    # done, total, current status text.
     advanced = Signal(int, int, str)
     completed = Signal(object)   # pipeline.BuildReport
     crashed = Signal(str)
@@ -43,11 +42,11 @@ class ConversionWorker(QThread):
         self._cancelled = False
 
     def cancel(self) -> None:
-        """Ask for the run to stop.
+        """Request that the run stop.
 
-        Checked between sources rather than mid-file: LibreOffice conversions and
-        message parses are not interruptible, and killing one mid-write would
-        leave a half-written PDF behind.
+        Checked between sources, not mid-file: LibreOffice conversions and
+        message parsing cannot be interrupted safely and would leave a partial
+        PDF.
         """
         self._cancelled = True
 
@@ -57,9 +56,8 @@ class ConversionWorker(QThread):
 
     def run(self) -> None:  # noqa: D102
         try:
-            # page_size is deliberately None: raw pages are converted once and
-            # only fitted to a page size at assembly, so changing the page size
-            # later costs nothing but a re-merge.
+            # page_size is None: pages are fitted to a page size at assembly,
+            # so changing the page size only needs a re-merge.
             report = pipeline.convert_sources(
                 self.sources,
                 self.scratch,
@@ -76,7 +74,7 @@ class ConversionWorker(QThread):
 
 
 class MergeWorker(QThread):
-    """Runs Phase B: write the assembled PDF."""
+    """Run phase B: write the assembled PDF."""
 
     completed = Signal(object)   # assemble.MergeReport
     crashed = Signal(str)
@@ -98,15 +96,15 @@ class MergeWorker(QThread):
 
 
 class ThumbnailWorker(QThread):
-    """Renders page thumbnails without blocking the interface.
+    """Render page thumbnails off the GUI thread.
 
     Emits ``QImage`` rather than ``QPixmap`` because only the GUI thread may
-    construct a pixmap.
+    create a pixmap.
     """
 
-    # Row position, the (pdf, page) that was rendered, and the QImage. The page is
-    # sent back so the receiver can check the row still shows that page: a list
-    # rebuilt mid-render would otherwise get another page's picture.
+    # Row position, the rendered (pdf, page), and the QImage. The page is
+    # included so the receiver can check the row still shows that page after
+    # the list is rebuilt.
     ready = Signal(int, object, object)
 
     def __init__(self, jobs: list[tuple[int, Path, int]], cache, parent=None) -> None:

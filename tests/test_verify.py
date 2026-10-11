@@ -1,4 +1,4 @@
-"""The output check: it must find real loss, and only real loss."""
+"""Output verification: it reports real content loss and nothing else."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from consolidator import assemble, pages, verify  # noqa: E402
 
 def _pdf(path: Path, pagesize=(612, 792), words=("alpha", "beta"), image=False,
          at=None) -> Path:
-    """A one-page PDF with words at its four edges, optionally a picture."""
+    """Write a one-page PDF with words at its four edges and an optional picture."""
     from PIL import Image
     from reportlab.lib.utils import ImageReader
     from reportlab.pdfgen import canvas
@@ -48,7 +48,7 @@ def _merge(tmp_path, source, rotation=0, **options):
 @pytest.mark.parametrize("rotation", [0, 90, 180, 270])
 @pytest.mark.parametrize("size", [(612, 792), (842, 595), (720, 540)])
 def test_fitting_a_rotated_page_keeps_every_edge(tmp_path, rotation, size):
-    """Rotating a landscape page and fitting it to portrait clipped its sides."""
+    """A rotated page fitted to the target size keeps all four edges on the page."""
     import pypdfium2 as pdfium
 
     source = _pdf(tmp_path / "src.pdf", size)
@@ -124,12 +124,12 @@ def test_the_check_can_be_switched_off(tmp_path):
     assert report.verification is None
 
 
-# ------------------------------------------- pages are never parsed or lost
+# ------------------------------------- page content is copied, not parsed
 
 
 def _raw_page_pdf(path: Path, content: bytes, mediabox=(0, 0, 612, 792), rotate=0,
                   link=None) -> Path:
-    """A PDF whose page content is exactly ``content``, written by hand."""
+    """Write a one-page PDF whose content stream is exactly ``content``."""
     from pypdf import PdfWriter
     from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject,
                                FloatObject, NameObject, NumberObject, RectangleObject,
@@ -159,7 +159,7 @@ def _raw_page_pdf(path: Path, content: bytes, mediabox=(0, 0, 612, 792), rotate=
     return path
 
 
-LONG_NUMBER = b"0." + b"0" * 108 + b"1"          # 112 characters, as reported
+LONG_NUMBER = b"0." + b"0" * 108 + b"1"          # 112 characters
 
 
 def _text(content: bytes, x=72, y=700) -> bytes:
@@ -174,7 +174,10 @@ def _text(content: bytes, x=72, y=700) -> bytes:
     dict(),
 ])
 def test_a_page_pypdf_cannot_parse_is_still_exported(tmp_path, options):
-    """A 112-character number aborted a 2000-page export with LimitReachedError."""
+    """A page pypdf cannot parse is still exported and verifies clean.
+
+    Guards against a 112-character number raising pypdf's LimitReachedError.
+    """
     content = _text(b"Paragraph before") + LONG_NUMBER + b" w\n" + \
         _text(b"Paragraph after", y=650)
     source = _raw_page_pdf(tmp_path / "long.pdf", content)
@@ -199,7 +202,7 @@ def test_page_content_is_kept_byte_for_byte(tmp_path):
 
 
 def test_a_page_whose_box_does_not_start_at_zero_is_fitted_whole(tmp_path):
-    """Its offset used to be ignored, shifting it and pushing part off the sheet."""
+    """A page whose MediaBox has a non-zero origin is fitted without clipping."""
     content = b"".join(_text(word, x, y) for word, x, y in (
         (b"left", 2010, 1400), (b"right", 2550, 1400),
         (b"bottom", 2300, 1010), (b"top", 2300, 1780)))
