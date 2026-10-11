@@ -1692,3 +1692,38 @@ def test_pages_included_as_images_are_named(window, monkeypatch):
     assert "included as images (page 412)" in window.status.currentMessage()
     assert not window.banner.isHidden()
     assert "page 412 (scan - page, page 3): LimitReachedError" in shown["details"]
+
+
+# ------------------------------------------------------- footer and numbers
+
+
+def _export_text(window, tmp_path) -> list[str]:
+    from pypdf import PdfReader
+
+    from consolidator import assemble
+
+    dest = tmp_path / "out.pdf"
+    assemble.merge(window.model.to_entries(), dest, options=window._merge_options(dest))
+    return [page.extract_text() or "" for page in PdfReader(str(dest)).pages]
+
+
+def test_page_numbers_show_alongside_the_default_footer(window, tmp_path):
+    window.model.add_segment(Path("report.docx"), "report", make_pdf(tmp_path / "r.pdf", 2),
+                             True, page_count=2)
+    window.cmb_numbering.setCurrentText("continuous")
+    assert window.edt_footer.text() == "{doc}"
+
+    texts = _export_text(window, tmp_path)
+
+    assert "report" in texts[0] and "1 of 2" in texts[0]
+    assert "report" in texts[1] and "2 of 2" in texts[1]
+
+
+def test_page_numbers_take_the_centre_without_a_footer(window, tmp_path):
+    window.model.add_segment(Path("report.docx"), "report", make_pdf(tmp_path / "r.pdf", 1),
+                             True, page_count=1)
+    window.cmb_numbering.setCurrentText("continuous")
+    window.edt_footer.setText("")
+
+    assert window._merge_options(tmp_path / "out.pdf").numbering.position == "bottom-center"
+    assert "1 of 1" in _export_text(window, tmp_path)[0]

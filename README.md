@@ -137,7 +137,7 @@ anything.
 | Option | Choices |
 |---|---|
 | Page size | `letter` (default), `a4`, `legal`: each page is scaled to fit with a 0.5 inch margin. `original`: pages keep their own size. |
-| Numbers | `none`, `continuous` (one sequence for the whole PDF), or `per-document` (restarts for each file). Printed at the bottom centre as "*n* of *total*". **The footer uses the same spot and takes priority**, so clear the footer (or put `{n}` in it) to see page numbers. |
+| Numbers | `none`, `continuous` (one sequence for the whole PDF), or `per-document` (restarts for each file). Printed as "*n* of *total*" at the bottom right when there is a footer, or at the bottom centre when the footer is empty. |
 | Separator | `none`, `blank` (an empty page between files), or `title` (a page with the file name between files). |
 | Footer | Text printed at the bottom of every page. Placeholders: `{doc}` file name, `{n}` page number, `{total}` page count, `{n_doc}` / `{total_doc}` page number and count within the file, `{date}` today's date. Example: `{doc} – page {n} of {total}`. Default `{doc}`. Leave empty for no footer. |
 | Bookmarks | Adds a PDF bookmark for each file, so viewers show a clickable outline. |

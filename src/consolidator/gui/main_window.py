@@ -1601,12 +1601,14 @@ class MainWindow(QMainWindow):
         self._merge.start()
 
     def _merge_options(self, dest: Path) -> assemble.MergeOptions:
+        footer_text = self.edt_footer.text().strip()
+        # The footer is drawn bottom centre, and a footer slot takes priority
+        # over the page number, so the number moves aside when there is one.
         numbering = assemble.PageNumbering(
             mode=self.cmb_numbering.currentText(),
-            position="bottom-center",
+            position="bottom-right" if footer_text else "bottom-center",
             template="{n} of {total}",
         )
-        footer_text = self.edt_footer.text().strip()
         return assemble.MergeOptions(
             page_size=pages.resolve(self.cmb_page_size.currentText()),
             margin=36.0,
