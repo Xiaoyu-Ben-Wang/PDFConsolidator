@@ -26,11 +26,11 @@
     from a public certificate authority.
 
 .EXAMPLE
-    .\sign.ps1 -Path dist\PDFConsolidator\PDFConsolidator.exe -Trust
+    .\sign.ps1 -Path dist\PDFConsolidator\PDFConsolidator.exe -Publisher "Your Name" -Trust
 #>
 param(
     [Parameter(Mandatory = $true)][string]$Path,
-    [string]$Publisher = "Xiaoyu-Ben-Wang",
+    [Parameter(Mandatory = $true)][string]$Publisher,
     [switch]$Trust
 )
 

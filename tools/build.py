@@ -18,6 +18,7 @@ spell-check dictionaries, clipart, document templates and translation XSLTs.
 Usage::
 
     python tools/build.py [--out dist] [--skip-libreoffice] [--no-trim] [--zip]
+                          [--publisher NAME [--trust]]
 """
 
 from __future__ import annotations
@@ -279,15 +280,17 @@ def main(argv: list[str] | None = None) -> int:
                         help="LibreOffice installation to bundle")
     parser.add_argument("--skip-libreoffice", action="store_true")
     parser.add_argument("--no-trim", action="store_true")
-    parser.add_argument("--publisher", default="Xiaoyu-Ben-Wang",
-                        help="publisher name to sign with (default: %(default)s)")
-    parser.add_argument("--no-sign", action="store_true",
-                        help="skip signing the executable")
+    parser.add_argument("--publisher", default=None,
+                        help="sign the executable with a self-signed certificate "
+                             "for this publisher name (default: not signed)")
     parser.add_argument("--trust", action="store_true",
-                        help="also trust the certificate locally (needs administrator)")
+                        help="with --publisher, also trust the certificate locally "
+                             "(needs administrator)")
     parser.add_argument("--zip", action="store_true",
                         help="also write <out>/PDFConsolidator.zip, flat (no inner folder)")
     args = parser.parse_args(argv)
+    if args.trust and not args.publisher:
+        parser.error("--trust needs --publisher")
 
     out_dir = Path(args.out)
     started = time.monotonic()
@@ -306,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
           % copy_licences(bundle))
 
     exe = bundle / "PDFConsolidator.exe"
-    if not args.no_sign:
+    if args.publisher:
         sign_executable(exe, args.publisher, args.trust)
 
     check_licences(exe)
@@ -323,7 +326,7 @@ def main(argv: list[str] | None = None) -> int:
     print("Bundle    : %s" % bundle)
     print("Size      : %s" % human(total))
     print("Exe       : %s" % exe)
-    print("Publisher : %s" % (args.publisher if not args.no_sign else "(not signed)"))
+    print("Publisher : %s" % (args.publisher or "(not signed)"))
     if archive is not None:
         print("Zip       : %s (%s, flat)" % (archive, human(archive.stat().st_size)))
     print("Time      : %.1fs" % (time.monotonic() - started))
