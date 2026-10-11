@@ -706,18 +706,16 @@ def test_office_conversion_produces_pdf(tmp_path, fixtures, name):
 
 
 @requires_lo
-def test_libreoffice_env_has_no_python_vars():
+def test_libreoffice_env_has_no_python_vars(tmp_path, monkeypatch):
     """The host's PYTHONPATH breaks LibreOffice's own bootstrap."""
-    import os as _os
-
-    _os.environ["PYTHONPATH"] = r"C:\somewhere\else"
-    env = libreoffice.clean_env(Path("."))
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "elsewhere"))
+    env = libreoffice.clean_env(tmp_path)
     assert "PYTHONPATH" not in env
     assert env["TMP"] and env["TEMP"]
 
 
 @requires_lo
-def test_convert_one_leaves_no_scratch_behind(tmp_path, fixtures):
+def test_convert_one_leaves_no_scratch_behind(tmp_path, fixtures, monkeypatch):
     """Regression: LibreOffice marks its ~lock files read-only.
 
     Windows refuses to delete a read-only file, so a plain rmtree fails with
@@ -725,13 +723,14 @@ def test_convert_one_leaves_no_scratch_behind(tmp_path, fixtures):
     """
     import tempfile
 
-    root = Path(tempfile.gettempdir())
-    before = {p.name for p in root.glob("consolidator_lo_*")}
+    root = tmp_path / "temp"
+    root.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(root))
 
     libreoffice.convert_one(fixtures / "memo.docx", tmp_path / "memo.pdf")
 
-    after = {p.name for p in root.glob("consolidator_lo_*")}
-    assert after == before, "scratch directories leaked: %s" % sorted(after - before)
+    leaked = sorted(p.name for p in root.glob("consolidator_lo_*"))
+    assert not leaked, "scratch directories leaked: %s" % leaked
 
 
 # ---------------------------------------------------------------- pipeline ----

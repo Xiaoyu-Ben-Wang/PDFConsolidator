@@ -1,8 +1,7 @@
-"""Keep the test suite independent of the system temp directory.
+"""Keep test files inside the project folder.
 
-pytest creates its capture files through :mod:`tempfile`, so a ``%TEMP%`` that is
-missing, full or unwritable stops the suite from starting at all — which says
-nothing about the code under test.
+pytest and :mod:`tempfile` write to ``pytest-tmp/`` beside this file, not to the
+system temp directory, so the suite does not depend on ``%TEMP%``.
 
 Only :mod:`tempfile` is redirected here. The process environment is deliberately
 left alone: overriding ``TMP``/``TEMP``/``TMPDIR`` for the whole process changes
@@ -16,25 +15,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+LOCAL_TEMP = Path(__file__).resolve().parent / "pytest-tmp"
+LOCAL_TEMP.mkdir(exist_ok=True)
 
-
-def _usable(path: Path) -> bool:
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-        probe = path / "_writetest"
-        probe.write_bytes(b"x")
-        probe.unlink()
-        return True
-    except Exception:
-        return False
-
-
-def _local_temp() -> Path:
-    for candidate in (ROOT / "pytest-tmp", Path.cwd() / "pytest-tmp"):
-        if _usable(candidate):
-            return candidate
-    return Path(tempfile.gettempdir())
-
-
-tempfile.tempdir = str(_local_temp())
+tempfile.tempdir = str(LOCAL_TEMP)

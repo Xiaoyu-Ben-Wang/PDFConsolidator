@@ -4,6 +4,8 @@ Converts a set of mixed files into one merged PDF: Word, Excel, PowerPoint,
 Outlook items, email, images, plain text and existing PDFs. A desktop window
 lets you reorder, rotate and remove pages before saving.
 
+![PDF Consolidator main window](docs/screenshots/main-window.png)
+
 ## Runs offline
 
 No internet connection is needed. All conversion happens on your machine, and
@@ -22,9 +24,146 @@ It is built on local, open-source components:
 | [pdfium](https://pdfium.googlesource.com/pdfium/) | page previews, thumbnails and the output check |
 | [Qt](https://www.qt.io/) (PySide6) | the desktop window |
 
-Two development scripts do use the internet: `tools/get_msg_samples.py`
-(downloads sample `.msg` files for tests) and `tools/vendor.py` (downloads
-packages). Neither is part of the app.
+The development script `tools/vendor.py` downloads packages from PyPI. It is
+not part of the app.
+
+## How to use
+
+### Start the app
+
+- **Standalone build:** copy the `PDFConsolidator` folder to the machine and run
+  `PDFConsolidator.exe`. Nothing else needs to be installed. See
+  [Building the standalone bundle](#building-the-standalone-bundle).
+- **From source:** run `.venv\Scripts\python -m consolidator gui`, optionally
+  followed by files or folders to load. See
+  [Install (development)](#install-development).
+
+### Make a PDF
+
+1. Click **Add Files…** or **Add Folder…**. Conversion starts automatically,
+   and the progress bar in the status bar shows how far it has got.
+2. Check the **Sources** list. Untick anything you don't want, such as an
+   email's body or one of its attachments.
+3. Arrange the **Pages** list: drag pages to reorder them, and use the buttons
+   to rotate, duplicate or delete them. Click a page to preview it.
+4. Choose the **Layout** options: page size, page numbers, separators, footer
+   and bookmarks.
+5. Click **Save as…** to pick the output file, then **Create PDF**. (If you
+   skip **Save as…**, **Create PDF** asks for a location.)
+
+When it is done, the status bar shows the file name and how many pages were
+written. If any page failed the [output check](#output-check), a banner above
+the page list names it.
+
+
+## Window reference
+
+### Toolbar
+
+| Control | What it does |
+|---|---|
+| **Add Files…** | Add one or more files. The file dialog lists every supported type. |
+| **Add Folder…** | Add every supported file in a folder, including subfolders. |
+| **Remove** | Remove the selected source and its pages. |
+| **Clear** | Remove all sources and pages. |
+| **Sort** | Order the source list by name (natural order, so `file2` comes before `file10`), date modified, size or type. |
+| **Convert** | Re-convert every source from scratch. Normally not needed: new files are converted automatically, and only new files are converted, so your page edits are kept. |
+
+### Sources (left)
+
+One row per input file. Expand a row to see what it produced: the document, or
+an email's body and each of its attachments. An email attached to another email
+appears as a child row with its own body and attachments. Parts are listed in
+the order the email stores them.
+
+- **Tick box:** untick a row to leave its pages out of the PDF. Unticking an
+  email leaves out everything inside it. Ticking it again puts the pages back
+  where they were.
+- **Pages column:** how many pages the row produced.
+- **Arrow (›) at the end of a row:** selects that row's first page in the page
+  list and scrolls to it. It follows the page's current position, so it still
+  works after pages are reordered. The arrow beside the *Sources* heading and
+  **Ctrl+J** do the same for the selected row. Clicking the row itself does not
+  move the page list.
+- **Delete** or **Backspace:** removes the selected source and its pages.
+- A warning icon means an attachment could not be read. Hover over it for the
+  reason.
+
+### Pages (middle)
+
+One row per page of the output, in output order. Each row shows the page
+number, the file it came from, the emails it was found inside, and its rotation
+if it has one. Rows are coloured by source, so each file reads as a block. An
+attached email gets a different colour from the email that carried it.
+
+| Control | What it does |
+|---|---|
+| Drag and drop | Reorder pages. Select several rows (Ctrl/Shift+click) to move them together. |
+| **↺ Left** / **↳ Right** / **180°** | Rotate the selected pages. |
+| **▲** / **▼** | Move the selected pages up or down by one. |
+| **Duplicate** | Insert a copy of the selected pages after them. |
+| **Delete** (button, key, or Backspace) | Remove the selected pages. |
+| **Group by document** | Put each file's pages together, keeping each file's own page order. |
+
+### Preview (right)
+
+Shows the selected page as it will be written, including rotation, with
+"Page *n* of *total*" and the source file underneath.
+
+### Options
+
+![Options panel](docs/screenshots/options.png)
+
+**Extract from email items** decides which parts of an email (`.eml`, `.msg`)
+become pages.
+
+The checkboxes edit the email selected in the Sources list; the label above
+them names it ("Editing: …"). With no email selected, they set the default for
+emails added later. **Apply to all emails** gives every email the current
+settings.
+
+| Checkbox | Effect |
+|---|---|
+| Message body | The headers and body become a page. |
+| PDF documents | Attached PDFs are added unchanged. |
+| Images (excludes inline) | Attached images become pages. Images shown inside the body, such as signature logos, are skipped. |
+| Documents (Office, text, web) | Attached Word, Excel, PowerPoint, HTML, text, Markdown and CSV files are converted. |
+| Embedded messages (drilled into) | Attached emails are opened, and their body and attachments become pages, up to 4 levels deep. |
+| Other attachments (listed only) | Attachments of other types are listed by name on the body page. Off by default. |
+
+**Layout** applies when the PDF is created. Changing it does not re-convert
+anything.
+
+| Option | Choices |
+|---|---|
+| Page size | `letter` (default), `a4`, `legal`: each page is scaled to fit with a 0.5 inch margin. `original`: pages keep their own size. |
+| Numbers | `none`, `continuous` (one sequence for the whole PDF), or `per-document` (restarts for each file). Printed at the bottom centre as "*n* of *total*". **The footer uses the same spot and takes priority**, so clear the footer (or put `{n}` in it) to see page numbers. |
+| Separator | `none`, `blank` (an empty page between files), or `title` (a page with the file name between files). |
+| Footer | Text printed at the bottom of every page. Placeholders: `{doc}` file name, `{n}` page number, `{total}` page count, `{n_doc}` / `{total_doc}` page number and count within the file, `{date}` today's date. Example: `{doc} – page {n} of {total}`. Default `{doc}`. Leave empty for no footer. |
+| Bookmarks | Adds a PDF bookmark for each file, so viewers show a clickable outline. |
+
+**Output**
+
+| Control | What it does |
+|---|---|
+| **Save as…** | Choose the output file. The chosen path is shown underneath. |
+| **Create PDF** | Write the PDF. An existing file is never overwritten: if `report.pdf` exists, the output is written as `report (1).pdf`, then `report (2).pdf`, and so on. The status bar shows the name used. |
+
+### Status bar and banner
+
+- **Progress bar and Cancel:** shown while converting. **Cancel** stops after
+  the current file and keeps everything already converted.
+- **Banner:** appears above the lists if files fail to convert or pages fail
+  the output check. **Details…** lists them, **Retry failed** converts the
+  failed files again, and **Dismiss** hides the banner.
+- **About** (also under *Help*): version, copyright, licence and warranty
+  disclaimer, with a link to every third-party licence.
+
+### Closing
+
+Closing the window asks for confirmation (the default answer is No) and says
+what would be lost: a running conversion, an unfinished PDF, or your page
+arrangement.
 
 ## Requirements
 
@@ -48,57 +187,7 @@ Generate sample input and open the window:
 .venv\Scripts\python -m consolidator gui
 ```
 
-## Using the window
-
-```sh
-.venv\Scripts\python -m consolidator gui [paths...]
-```
-
-The window has three columns.
-
-**Sources** (left) lists the input files.
-
-- Expand a source to see its parts: the document, an email's body, and each
-  attachment. An attached email is shown as a child node with its own body and
-  attachments.
-- Parts are listed in the order the email stores them.
-- Untick a row to exclude it. Unticking an email excludes everything inside it.
-  Ticking it again puts the pages back in their original position.
-- **Delete** or **Backspace** removes the selected row and its pages.
-- An attachment that could not be read shows a warning icon and the reason.
-- The arrow at the end of a row (or **Ctrl+J**) selects that row's first page in
-  the page list. It follows the page's current position, so it still works after
-  pages are reordered. Clicking the row itself does not move the page list.
-
-**Pages** (middle) has one row per page: page number, source file, the emails
-it was found inside, and rotation.
-
-- Rows are coloured by source email. An attached email gets a different colour
-  from the email that carried it.
-- Drag rows to reorder, or select rows and use the buttons. **Delete** and
-  **Backspace** remove the selected pages.
-- **Group by document** puts each file's pages together, keeping their order.
-
-**Preview** (right) shows the selected page as it will be written, with its
-source underneath.
-
-Other controls:
-
-- **Extract from email items** applies to the selected email. With nothing
-  selected, it sets the default for emails added later. **Apply to all emails**
-  clears the per-email settings.
-- **Save as…** opens the Windows save dialog. Existing files are never
-  overwritten: if `report.pdf` exists, the output is written as
-  `report (1).pdf`, then `report (2).pdf`, and so on. The status bar and the
-  *Done* dialog show the name used. The command line works the same way.
-- **Closing** the window asks for confirmation (default: No) and lists what
-  would be lost.
-- **About** (bottom right, and under *Help*) shows the version, licence and
-  warranty disclaimer, and opens the full licence list.
-
-Files are converted when they are added. Only new files are converted, so page
-edits are kept. **Convert** re-converts everything. Changing page size or layout
-only re-runs assembly, which is fast.
+## How it works
 
 ### Large batches
 
@@ -142,19 +231,6 @@ and gets slightly slower with each rebuild. This is Qt item overhead on Windows,
 not a Python memory leak. Editing, thumbnails and preview are not affected. The
 fix would be to update only changed rows instead of rebuilding the tree. It is
 not done yet because at normal sizes a rebuild takes 0.06 s.
-
-### Email extraction
-
-| Option | Effect |
-|---|---|
-| Message body | Headers and body become a page |
-| PDF documents | Attached PDFs are copied in unchanged |
-| Images | Attached images are converted; inline signature images are skipped |
-| Documents | Attached Word/Excel/PowerPoint, HTML, text, Markdown and CSV files are converted |
-| Embedded messages | Attached `.msg`/`.eml` files are opened and their contents extracted, up to `--max-depth` levels (default 4) |
-| Other attachments | Listed on the body page, not converted |
-
-All options are on by default except *Other attachments*.
 
 ### Attached emails
 
@@ -328,8 +404,13 @@ scale, add page numbers and headers.
 ```
 
 Tests that need LibreOffice or fixtures are skipped when those are missing.
-Generate fixtures with `tools/make_fixtures.py`, `tools/make_email_fixtures.py`
-and `tools/get_msg_samples.py`.
+Generate fixtures with `tools/make_fixtures.py` and
+`tools/make_email_fixtures.py`. The `.msg` samples in `tests/data/msg/` are
+committed; they were built from scratch by `tools/make_msg_samples.py` and
+contain no real mail.
+
+Tests only write inside the project folder: temporary files go to `pytest-tmp/`,
+not the system temp directory.
 
 ## About
 

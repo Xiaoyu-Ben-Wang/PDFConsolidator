@@ -12,7 +12,7 @@ import sys
 from email.message import EmailMessage
 from pathlib import Path
 
-WS = Path(r"C:\Users\benwa\Documents\CS\PDFConslidator")
+WS = Path(__file__).resolve().parent.parent
 GEN = WS / "fixtures" / "generated"
 OUT = WS / "fixtures" / "email"
 OUT.mkdir(parents=True, exist_ok=True)

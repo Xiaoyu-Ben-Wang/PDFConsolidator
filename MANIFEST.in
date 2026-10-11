@@ -28,3 +28,6 @@ global-exclude *.pdf
 global-exclude *.msg
 global-exclude *.eml
 prune __pycache__
+
+# The .msg test samples are source, unlike the generated fixtures.
+recursive-include tests/data *.msg

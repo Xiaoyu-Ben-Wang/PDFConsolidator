@@ -74,3 +74,4 @@ RESEARCH-*.md
 CLAUDE.md
 .claude/
 _probe/
+tools/make_msg_fixtures.py

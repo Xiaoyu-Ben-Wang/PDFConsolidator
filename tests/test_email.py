@@ -13,7 +13,7 @@ from consolidator import email_items, libreoffice, pages, pipeline  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 EMAIL_FIXTURES = ROOT / "fixtures" / "email"
-MSG_FIXTURES = ROOT / "fixtures" / "msg"
+MSG_SAMPLES = Path(__file__).resolve().parent / "data" / "msg"
 
 requires_lo = pytest.mark.skipif(
     libreoffice.find_soffice() is None, reason="LibreOffice is not installed"
@@ -29,10 +29,8 @@ def emails():
 
 @pytest.fixture(scope="session")
 def messages():
-    found = list(MSG_FIXTURES.glob("*.msg")) if MSG_FIXTURES.exists() else []
-    if not found:
-        pytest.skip("no .msg samples; run tools/get_msg_samples.py")
-    return MSG_FIXTURES
+    assert list(MSG_SAMPLES.glob("*.msg")), "tests/data/msg is missing its samples"
+    return MSG_SAMPLES
 
 
 # ------------------------------------------------------------------ parsing ---
@@ -87,26 +85,21 @@ def test_duplicate_filenames_both_survive(emails):
     assert item.attachments[0].data == item.attachments[1].data
 
 
-def test_reads_real_outlook_msg(messages):
-    """Genuine Outlook output, including one with binary attachments."""
+def test_reads_outlook_msg(messages):
+    """A .msg with non-ASCII text and binary attachments."""
     item = email_items.read_message(messages / "unicode.msg")
-    assert item.subject
+    assert "日本語" in item.subject
     assert len(item.attachments) == 2
     assert all(a.data for a in item.attachments)
 
 
-def test_msg_survives_a_malformed_header(messages):
-    """A real sample whose recipient header fails to decode must still load.
-
-    extract-msg raises on some malformed headers; one bad field must not cost
-    the whole message.
-    """
+def test_every_msg_sample_loads(messages):
     for path in messages.glob("*.msg"):
         item = email_items.read_message(path)
         assert item.subject is not None
 
 
-# --------------------------------------------------- .msg quirks (real files) ---
+# ------------------------------------------------------------- .msg quirks ---
 
 
 class FakeAttachment:
@@ -165,8 +158,8 @@ def test_an_attached_message_is_serialised_for_staging():
     assert email_items._attachment_bytes(Hostile()) == b""
 
 
-def test_real_msg_samples_keep_every_attachment(messages):
-    """Genuine Outlook output: nothing may be dropped or left with a stray NUL."""
+def test_msg_samples_keep_every_attachment(messages):
+    """Nothing may be dropped or left with a stray NUL."""
     for path in sorted(messages.glob("*.msg")):
         item = email_items.read_message(path)
         assert "\x00" not in item.subject
