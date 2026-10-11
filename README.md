@@ -55,6 +55,17 @@ When it is done, the status bar shows the file name and how many pages were
 written. If any page failed the [output check](#output-check), a banner above
 the page list names it.
 
+### Two phases: convert, then create
+
+1. **Convert.** Each file is turned into PDF pages as soon as it is added. This
+   is the slow part, because Office documents and email bodies go through
+   LibreOffice. Only newly added files are converted, so your page edits are
+   kept. **Convert** in the toolbar redoes every file from scratch.
+2. **Create.** **Create PDF** merges the pages in the order shown, fits them to
+   the page size, and adds page numbers, footer and bookmarks. This does not
+   use LibreOffice and takes seconds, so you can change the layout and create
+   the PDF again as often as you like.
+
 
 ## Window reference
 
@@ -322,30 +333,6 @@ LibreOffice. Copy the folder to the target machine and run
 `PDFConsolidator.exe`. Python and Office are not needed. `--zip` also writes
 `PDFConsolidator.zip`.
 
-### Publisher name
-
-Windows shows "Unknown Publisher" for unsigned executables. The publisher name
-comes from the signing certificate, so the build:
-
-1. embeds a version resource (`build/version_info.txt`) with company name,
-   product name and copyright, shown under *Properties → Details*;
-2. signs the executable with a self-signed certificate whose subject is the
-   publisher name.
-
-```sh
-python tools/build.py --publisher "Xiaoyu-Ben-Wang"       # default
-python tools/build.py --no-sign                            # skip signing
-python tools/build.py --trust                              # also trust it locally
-```
-
-`tools/sign.ps1` signs an existing executable on its own.
-
-A self-signed certificate shows the publisher name but is not trusted by
-default, so Windows still warns. `--trust` adds the certificate to the local
-Trusted Root and Trusted Publishers stores (requires administrator rights). On
-other machines, install `pdfconsolidator-publisher.cer` the same way. Only a
-certificate from a public certificate authority removes the warning everywhere.
-
 ## Supported formats
 
 | Input | Converted by |
@@ -365,37 +352,6 @@ Supported extensions are defined once in `convert.py` (`OFFICE_EXTS`,
 `DOCUMENT_EXTS` for the first three combined). The file dialog filter, the
 `--extract` categories and the support checks all read these sets, so a new
 format only needs to be added there.
-
-## Design notes
-
-Processing has two separate phases:
-
-1. **Convert.** Each source becomes one or more PDF segments. Office documents
-   and email bodies are converted in batched LibreOffice runs, because start-up
-   time dominates. Sources are copied to unique names first so files with the
-   same name do not collide.
-2. **Assemble.** Segments are merged and fitted to the page size. This phase
-   does not use LibreOffice, so re-running it is fast.
-
-LibreOffice issues handled in the code:
-
-- **`PYTHONPATH`.** LibreOffice inherits the caller's environment. If
-  `PYTHONPATH` is set, LibreOffice's bundled Python breaks with
-  `source file could not be loaded`. It is removed before launch.
-- **Relative paths.** LibreOffice resolves paths against its own working
-  directory, so relative input or `--outdir` paths fail with the same error.
-  `convert_batch` converts them to absolute paths and returns results keyed by
-  the caller's original paths.
-- **Temp directory.** The app does not use the system temp folder. It creates
-  `.scratch` next to itself and falls back only if that is not writable.
-  LibreOffice gives the same misleading error when it cannot write work files.
-- **Long paths.** LibreOffice does not support paths over `MAX_PATH`, and its
-  profile contains deep paths. The profile is kept under a short fixed folder
-  (`.lo-profiles` next to the app) and deleted after each run.
-
-Page `/Rotate` values are applied to the page content first, so page numbers
-added later are not rotated with the page. Order: apply rotation, rotate,
-scale, add page numbers and headers.
 
 ## Tests
 
