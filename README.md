@@ -368,53 +368,75 @@ LibreOffice- and fixture-dependent tests skip automatically when unavailable.
 Generate fixtures first with `tools/make_fixtures.py`,
 `tools/make_email_fixtures.py` and `tools/get_msg_samples.py`.
 
-## Licence
+## About
 
-**GPL-3.0-or-later**, no warranty. `LICENSE` is the full text; the **About**
-button in the window carries the summary, with every third-party component and
-its licence text one click away.
+PDF Consolidator 0.1.0 — copyright (C) 2026 Xiaoyu-Ben-Wang.
 
-GPL rather than permissive because one dependency is `extract-msg` (GPL-3.0), the
-`.msg` reader. The rest is either permissive (pypdf, reportlab, Pillow, pywin32)
-or weak copyleft a GPL build satisfies anyway — Qt, img2pdf and RTFDE under the
-LGPL-3.0, pikepdf under the MPL-2.0. A proprietary build is not an option; that
-was a deliberate choice.
+The **About** button in the window (bottom right, and under *Help*) shows the
+version, the copyright, the licence and the warranty disclaimer, and opens the
+full inventory of third-party components with their licence texts.
+
+## Licence and warranty
+
+### No warranty
+
+**The software is provided "as is," without any express or implied warranty.
+The authors are not liable for any damages.** That covers any warranty of
+merchantability or fitness for a particular purpose. You use it entirely at
+your own risk, including any loss of documents or data.
+
+### Licence
+
+PDF Consolidator is free software under the **GNU General Public License,
+version 3 or later** (GPL-3.0-or-later). [`LICENSE`](LICENSE) holds the full
+text. Sections 15 and 16 of the GPL state the same warranty disclaimer and
+limitation of liability formally.
+
+The licence is GPL rather than permissive because one dependency, `extract-msg`
+(the `.msg` reader), is GPL-3.0. The other dependencies are compatible with the
+GPL:
+
+| Component | Licence |
+|---|---|
+| extract-msg | GPL-3.0 |
+| Qt (PySide6), img2pdf, RTFDE | LGPL-3.0 |
+| pikepdf | MPL-2.0 |
+| LibreOffice (bundled) | MPL-2.0 |
+| pypdf, reportlab, Pillow, pywin32 and the rest | permissive (BSD/MIT/PSF-style) |
+
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) is the complete, generated
+inventory, and [`LICENSES/`](LICENSES) has every licence text verbatim.
 
 ### What ships with the binaries
 
-Beside the executable: `LICENSE`, `THIRD-PARTY-NOTICES.md`, `LICENSES/` (every
-text verbatim, as the packages ship them), and LibreOffice's own notices under
-`libreoffice/` — those last are the authoritative ones for that tree.
+Beside the executable: `LICENSE`, `THIRD-PARTY-NOTICES.md`, `LICENSES/`, and
+LibreOffice's own notices under `libreoffice/` (those are the authoritative
+notices for that tree).
 
-`tools/collect_licenses.py` reads the *installed* packages rather than a
-hand-kept list, so a new dependency cannot quietly go unlicensed. The build
-copies the material in and then checks that the frozen module list is covered:
+`tools/collect_licenses.py` reads the *installed* packages, not a hand-kept
+list, so a new dependency can't end up without a licence listed. The build
+copies the notices in, then checks that every module in the frozen build is
+covered:
 
 ```sh
 .venv\Scripts\python tools\collect_licenses.py
-.venv\Scripts\python tools\build.py
+.venv\Scripts\python toolsuild.py
 ```
 
-Two details worth knowing. Qt is used under the LGPL-3.0-only option, its wheels
-ship only a commercial licence reference, so the LGPL text is published as
-`LICENSES/LGPL-3.0.txt`; and because the Qt libraries are separate DLLs under
-`_internal/PySide6/`, they can be replaced with another build of the same version
-without touching the program — which is what the LGPL asks for.
+Qt is used under the LGPL-3.0-only option. Its wheels ship only a reference to
+the commercial licence, so the LGPL text is included as `LICENSES/LGPL-3.0.txt`.
+The Qt libraries are separate DLLs under `_internal/PySide6/`, so they can be
+replaced with another build of the same version without touching the program,
+as the LGPL requires.
 
-### Where the source is
+### Source code
 
-GPL-3.0 section 6 requires the Corresponding Source to reach anyone who gets the
-binaries. This tree *is* that source, build scripts included:
-
-```sh
-python -m venv .venv
-.venv\Scripts\python -m pip install -e ".[dev]"
-.venv\Scripts\python tools\collect_licenses.py
-.venv\Scripts\python tools\build.py
-```
+GPL-3.0 section 6 says anyone who receives the binaries must also be able to get
+the Corresponding Source. This repository is that source, build scripts
+included (see *Install* and *Building the standalone bundle* above).
 
 If you publish the bundle, set `SOURCE_URL` at the top of
-`tools/collect_licenses.py` to where the repository lives and re-run it; the
-notices then name the location instead of telling the recipient to ask you.
-LibreOffice is redistributed unmodified apart from the trimming described above,
-and its own source is published by The Document Foundation.
+`tools/collect_licenses.py` to the repository's location and re-run it. The
+notices will then give that location instead of telling the recipient to ask
+you. LibreOffice is redistributed unmodified apart from the trimming described
+above, and The Document Foundation publishes its source.

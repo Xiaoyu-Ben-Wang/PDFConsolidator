@@ -744,6 +744,7 @@ def test_about_text_states_the_licence_and_the_warranty_position():
     text = about_text()
     assert "GNU General Public License, version 3 or later" in text
     assert "WITHOUT ANY WARRANTY" in text
+    assert "The authors are not liable for any damages." in text
     assert "2026 Xiaoyu-Ben-Wang" in text
 
 

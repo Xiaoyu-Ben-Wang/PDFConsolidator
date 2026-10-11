@@ -67,6 +67,8 @@ def about_text() -> str:
 Free software under the <b>GNU General Public License, version 3 or later</b>,
 and it comes <b>WITHOUT ANY WARRANTY</b> &mdash; without even the implied warranty
 of merchantability or fitness for a particular purpose.</p>
+<p>The software is provided &ldquo;as is,&rdquo; without any express or implied
+warranty. The authors are not liable for any damages.</p>
 <p>Built with Qt (LGPL-3.0) and LibreOffice (MPL-2.0), among others.<br>
 <b>Licences&hellip;</b> lists every component beside its text.</p>""".format(
         version=version()
