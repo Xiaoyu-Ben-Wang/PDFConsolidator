@@ -342,21 +342,106 @@ def bake_rotation(page) -> None:
 # ------------------------------------------------------------------ overlays
 
 
-def _draw_slot(canvas, text: str, slot: str, width: float, height: float,
-               y: float, font: str, size: float) -> None:
-    """Draw one header/footer slot at the given vertical position."""
+EDGE_MARGIN = 40.0      # distance of header/footer text from the page sides
+SLOT_GAP = 12.0         # space kept between neighbouring slots
+MAX_SLOT_LINES = 3      # a slot never grows past this many lines
+
+
+def _slot_widths(texts: dict[str, str], width: float, font: str,
+                 size: float) -> dict[str, float]:
+    """How wide each slot on one edge may be before its text wraps.
+
+    The centre slot is centred on the page, so it gets whatever the wider of
+    the two sides leaves on both sides of it. A side slot takes the room it
+    needs, up to a third of the line.
+    """
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    usable = max(width - 2 * EDGE_MARGIN, 1.0)
+    if not texts.get("center"):
+        sides = [s for s in ("left", "right") if texts.get(s)]
+        share = usable if len(sides) < 2 else (usable - SLOT_GAP) / 2
+        return {"left": share, "center": usable, "right": share}
+    side = max((min(stringWidth(texts[s], font, size), usable / 3)
+                for s in ("left", "right") if texts.get(s)), default=0.0)
+    center = usable - 2 * (side + SLOT_GAP) if side else usable
+    return {"left": usable / 3, "center": max(center, usable / 3), "right": usable / 3}
+
+
+def _wrap(text: str, limit: float, font: str, size: float) -> list[str]:
+    """Break ``text`` into lines no wider than ``limit``.
+
+    Lines break at spaces first. A single word too long for a line (a file name,
+    usually) breaks after ``_``, ``-`` or ``.`` where it can, and anywhere if not.
+    Past MAX_SLOT_LINES the last line ends in an ellipsis.
+    """
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    def fits(candidate: str) -> bool:
+        return stringWidth(candidate, font, size) <= limit
+
+    def split_word(word: str) -> list[str]:
+        pieces, current = [], ""
+        for char in word:
+            if not current or fits(current + char):
+                current += char
+                continue
+            cut = max(current.rfind(c) for c in "_-.")
+            if cut > 0 and cut < len(current) - 1:
+                pieces.append(current[:cut + 1])
+                current = current[cut + 1:] + char
+            else:
+                pieces.append(current)
+                current = char
+        return pieces + ([current] if current else [])
+
+    lines: list[str] = []
+    current = ""
+    for word in text.split(" "):
+        candidate = word if not current else current + " " + word
+        if fits(candidate):
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+        parts = split_word(word) if not fits(word) else [word]
+        lines.extend(parts[:-1])
+        current = parts[-1] if parts else ""
+    if current:
+        lines.append(current)
+
+    if len(lines) > MAX_SLOT_LINES:
+        lines = lines[:MAX_SLOT_LINES]
+        last = lines[-1]
+        while last and not fits(last + "…"):
+            last = last[:-1]
+        lines[-1] = last + "…"
+    return lines
+
+
+def _draw_slot(canvas, text: str, slot: str, width: float, y: float,
+               font: str, size: float, limit: float, grow: int) -> None:
+    """Draw one header/footer slot, wrapped to ``limit`` points.
+
+    ``y`` is the baseline of the line nearest the page edge; further lines go
+    towards the middle of the page (``grow`` is +1 for a footer, -1 for a header).
+    """
     if not text:
         return
     canvas.setFont(font, size)
-    left_margin = 40.0
-    right_edge = width - 40.0
-
-    if slot == "left":
-        canvas.drawString(left_margin, y, text)
-    elif slot == "right":
-        canvas.drawRightString(right_edge, y, text)
-    else:
-        canvas.drawCentredString(width / 2.0, y, text)
+    lines = _wrap(text, limit, font, size)
+    leading = size * 1.2
+    # Lines are drawn in reading order, so text selection and extraction
+    # read them in that order too. A footer's last line sits on the baseline.
+    for index, line in enumerate(lines):
+        steps = len(lines) - 1 - index if grow > 0 else index
+        line_y = y + grow * steps * leading
+        if slot == "left":
+            canvas.drawString(EDGE_MARGIN, line_y, line)
+        elif slot == "right":
+            canvas.drawRightString(width - EDGE_MARGIN, line_y, line)
+        else:
+            canvas.drawCentredString(width / 2.0, line_y, line)
 
 
 def _substitute(template: str, *, number: int, total: int, document: str,
@@ -428,14 +513,18 @@ def _decorate(page, options: MergeOptions, number: int, total: int,
     top_y = height - 40.0
     bottom_y = 30.0
 
+    font, size = numbering.font, numbering.size
+    top_widths = _slot_widths(top, width, font, size)
+    bottom_widths = _slot_widths(bottom, width, font, size)
+
     def draw(canvas) -> None:
         canvas.setFillGray(numbering.grey)
         for slot in slots:
-            _draw_slot(canvas, top[slot], slot, width, height, top_y,
-                       numbering.font, numbering.size)
+            _draw_slot(canvas, top[slot], slot, width, top_y, font, size,
+                       top_widths[slot], grow=-1)
         for slot in slots:
-            _draw_slot(canvas, bottom[slot], slot, width, height, bottom_y,
-                       numbering.font, numbering.size)
+            _draw_slot(canvas, bottom[slot], slot, width, bottom_y, font, size,
+                       bottom_widths[slot], grow=+1)
 
     stamp(page, _make_overlay(width, height, draw))
 

@@ -262,3 +262,70 @@ def test_a_failed_write_leaves_no_placeholder(tmp_path, two_pdfs, monkeypatch):
 
     assert sorted(p.name for p in tmp_path.iterdir() if p.suffix != ".pdf" or
                   p.name.startswith("report")) == ["report.pdf"]
+
+
+# ------------------------------------------------------- long header/footer
+
+
+LONG_NAME = ("Quarterly_financial_report_for_the_northern_region_including_all_"
+             "appendices_and_supporting_schedules_FINAL_v3_reviewed.docx")
+
+
+def _words_inside(path, index):
+    """(text, x0, x1) for each run of text on a page, from pdfium."""
+    import pypdfium2 as pdfium
+
+    document = pdfium.PdfDocument(str(path))
+    try:
+        page = document[index]
+        width = page.get_width()
+        text = page.get_textpage()
+        boxes = [text.get_charbox(i) for i in range(text.count_chars())]
+        return width, text.get_text_range(), boxes
+    finally:
+        document.close()
+
+
+def test_a_long_footer_wraps_instead_of_running_off_the_page(tmp_path, two_pdfs):
+    dest = tmp_path / "out.pdf"
+    options = assemble.MergeOptions(
+        page_size=pages.resolve("letter"),
+        footer=assemble.HeaderFooter(center="{doc}"),
+        numbering=assemble.PageNumbering(mode="continuous", position="bottom-right",
+                                         template="{n} of {total}"),
+    )
+    assemble.merge([assemble.MergeEntry(two_pdfs[0], LONG_NAME)], dest, options=options)
+
+    width, text, boxes = _words_inside(dest, 0)
+    assert "".join(LONG_NAME.split()) in "".join(text.split()), "every character is kept"
+    assert "1 of 2" in text
+    assert all(0 <= left and right <= width for left, _b, right, _t in boxes), \
+        "no character may fall outside the page"
+    lines = {round(bottom) for _l, bottom, _r, _t in boxes if bottom < 72}
+    assert len(lines) > 1, "the name wraps onto more than one line"
+
+
+def test_wrapping_prefers_breaking_a_file_name_at_a_separator():
+    lines = assemble._wrap(LONG_NAME, 200, "Helvetica", 9)
+
+    assert "".join(lines) == LONG_NAME
+    assert all(line.endswith(("_", "-", ".")) for line in lines[:-1]), lines
+
+
+def test_wrapping_keeps_words_whole_when_it_can():
+    lines = assemble._wrap("alpha beta gamma delta epsilon", 60, "Helvetica", 9)
+
+    assert " ".join(lines) == "alpha beta gamma delta epsilon"
+    assert all(word in ("alpha", "beta", "gamma", "delta", "epsilon")
+               for line in lines for word in line.split())
+
+
+def test_a_very_long_slot_stops_at_three_lines_with_an_ellipsis():
+    lines = assemble._wrap("x" * 2000, 200, "Helvetica", 9)
+
+    assert len(lines) == assemble.MAX_SLOT_LINES
+    assert lines[-1].endswith("\u2026")
+
+
+def test_a_short_footer_is_still_one_line():
+    assert assemble._wrap("report.docx", 500, "Helvetica", 9) == ["report.docx"]
