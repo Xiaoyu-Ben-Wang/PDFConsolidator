@@ -1704,11 +1704,130 @@ def _export_text(window, tmp_path) -> list[str]:
     return [page.extract_text() or "" for page in PdfReader(str(dest)).pages]
 
 
-def test_page_numbers_show_alongside_the_default_footer(window, tmp_path):
+def test_scan_for_duplicates_lists_and_deletes_repeats(window, tmp_path):
+    from PySide6.QtCore import Qt
+
+    from consolidator.gui.duplicates_dialog import PAGE_COLUMN
+    from test_duplicates import LETTER, text_pdf
+
+    pdf = text_pdf(tmp_path / "a.pdf", [LETTER, "A different page with its own words.",
+                                        LETTER.upper()])
+    window.model.add_segment(Path("a.docx"), "a", pdf, True, page_count=3)
+    window.refresh_pages()
+
+    window.scan_for_duplicates()
+    assert window._scan.wait(30000)
+    qapp_process()
+
+    dialog = window.duplicates_dialog
+    assert dialog.tree.topLevelItemCount() == 1
+    row = dialog.tree.topLevelItem(0)
+    assert row.text(2) == "96%" and row.checkState(PAGE_COLUMN) == Qt.Checked
+    assert row.text(0).startswith("3.") and row.text(1).startswith("1.")
+
+    # The duplicate's row is tagged, and struck through while it is checked.
+    tagged = window.page_list.item(2)
+    assert "duplicate 96%" in tagged.text()
+    assert "Duplicate (96%) of a, page 1" in tagged.toolTip()
+    assert tagged.font().strikeOut()
+    assert not window.page_list.item(0).font().strikeOut()
+    row.setCheckState(PAGE_COLUMN, Qt.Unchecked)
+    assert not window.page_list.item(2).font().strikeOut()
+    row.setCheckState(PAGE_COLUMN, Qt.Checked)
+
+    dialog.delete_checked()
+    assert [p.index for p in window.model.pages] == [0, 1]
+
+
+def test_duplicate_tags_survive_a_drag_and_clear_on_the_next_scan(window, tmp_path):
+    from consolidator import duplicates
+    from test_duplicates import LETTER, text_pdf
+
+    pdf = text_pdf(tmp_path / "a.pdf", [LETTER, LETTER])
+    window.model.add_segment(Path("a.docx"), "a", pdf, True, page_count=2)
+    window.refresh_pages()
+    window.mark_duplicates([duplicates.Match(1, 0, 99, "Identical text")])
+
+    # A drag rebuilds the pages from the rows' data.
+    moved = window.page_list.takeItem(1)
+    window.page_list.insertItem(0, moved)
+    window._on_pages_reordered()
+    assert [p.duplicate for p in window.model.pages] == [99, 0]
+
+    # The link still finds the original after the drag moved both pages.
+    window.go_to_page(0)
+    assert window.preview_link.isVisibleTo(window)
+    assert "of page 2" in window.preview_link.text()
+    assert window.go_to_original()
+    assert window.selected_page_indices() == [1]
+    assert not window.preview_link.isVisibleTo(window)
+
+    window.mark_duplicates([])
+    assert all(p.duplicate == 0 for p in window.model.pages)
+    assert "duplicate" not in window.page_list.item(0).text()
+
+
+def test_a_duplicate_whose_original_was_deleted_says_so(window, tmp_path):
+    from consolidator import duplicates
+    from test_duplicates import LETTER, text_pdf
+
+    pdf = text_pdf(tmp_path / "a.pdf", [LETTER, LETTER])
+    window.model.add_segment(Path("a.docx"), "a", pdf, True, page_count=2)
+    window.refresh_pages()
+    window.mark_duplicates([duplicates.Match(1, 0, 99, "Identical text")])
+    window.model.delete([0])
+    window.refresh_pages()
+
+    window.go_to_page(0)
+    assert "no longer in the list" in window.preview_link.text()
+    assert not window.go_to_original()
+
+
+def test_double_clicking_a_duplicate_shows_its_original(window, tmp_path):
+    from consolidator import duplicates
+    from test_duplicates import LETTER, text_pdf
+
+    pdf = text_pdf(tmp_path / "a.pdf", [LETTER, "Another page entirely.", LETTER])
+    window.model.add_segment(Path("a.docx"), "a", pdf, True, page_count=3)
+    window.refresh_pages()
+    window.mark_duplicates([duplicates.Match(2, 0, 99, "Identical text")])
+
+    window.page_list.itemDoubleClicked.emit(window.page_list.item(2))
+
+    assert window.selected_page_indices() == [0]
+
+
+def test_scan_results_are_dropped_if_the_pages_changed(window, tmp_path):
+    from consolidator import duplicates
+    from test_duplicates import LETTER, text_pdf
+
+    pdf = text_pdf(tmp_path / "a.pdf", [LETTER, LETTER])
+    window.model.add_segment(Path("a.docx"), "a", pdf, True, page_count=2)
+    window.refresh_pages()
+    window._scan_keys = [p.key for p in window.model.pages]
+    window.model.delete([0])
+
+    window._on_duplicates_found([duplicates.Match(1, 0, 99, "Identical text")])
+
+    assert "changed during the scan" in window.status.currentMessage()
+
+
+def qapp_process() -> None:
+    from PySide6.QtWidgets import QApplication
+
+    QApplication.processEvents()
+
+
+def test_the_footer_is_empty_by_default(window):
+    assert window.edt_footer.text() == ""
+    assert "{n_doc}" in window.edt_footer.toolTip()
+
+
+def test_page_numbers_show_alongside_a_footer(window, tmp_path):
     window.model.add_segment(Path("report.docx"), "report", make_pdf(tmp_path / "r.pdf", 2),
                              True, page_count=2)
     window.cmb_numbering.setCurrentText("continuous")
-    assert window.edt_footer.text() == "{doc}"
+    window.edt_footer.setText("{doc}")
 
     texts = _export_text(window, tmp_path)
 

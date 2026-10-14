@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import time
 from pathlib import Path
@@ -49,9 +50,10 @@ from PySide6.QtWidgets import (
 
 from .. import assemble, convert, email_items, pages, pipeline
 from .document import DocumentModel
+from .duplicates_dialog import DuplicatesDialog
 from .licences import show_about, show_licences
 from .thumbs import ThumbnailCache
-from .worker import ConversionWorker, MergeWorker, ThumbnailWorker
+from .worker import ConversionWorker, DuplicateWorker, MergeWorker, ThumbnailWorker
 
 POLICY_EXCLUSION = "excluded by the extraction policy"
 
@@ -78,6 +80,18 @@ ROW_ROLE = Qt.UserRole + 1
 
 # Tooltip suffix for navigator rows that explains how to jump to their pages.
 JUMP_HINT = "\n\nClick the arrow at the end of the row (or press Ctrl+J) to see its pages."
+
+FOOTER_HELP = (
+    "Text printed at the bottom centre of every page. Leave empty for no footer.\n\n"
+    "Placeholders:\n"
+    "  {doc}\tfile name\n"
+    "  {n}\tpage number in the merged PDF\n"
+    "  {total}\tpage count of the merged PDF\n"
+    "  {n_doc}\tpage number within the file\n"
+    "  {total_doc}\tpage count of the file\n"
+    "  {date}\ttoday's date (YYYY-MM-DD)\n\n"
+    "Example: {doc} \u2013 page {n} of {total}"
+)
 
 # Navigator columns. The jump arrow has its own narrow column so it stays
 # aligned and does not compete with long names for space.
@@ -171,7 +185,15 @@ def row_description(node, page, position: int, trail: list[str] | None = None) -
         text += "  \u2192  " + " \u203a ".join(part for part in route if part)
     if page.rotation:
         text += "   [%d\u00b0]" % page.rotation
+    if page.duplicate:
+        text += "   [duplicate %d%%]" % page.duplicate
     return text
+
+
+def page_data(page) -> tuple:
+    """Return the page fields a page-list row carries, so a drag keeps them."""
+    return (page.segment_id, page.index, page.rotation,
+            page.duplicate, page.duplicate_note, page.duplicate_of, page.uid)
 
 
 class MainWindow(QMainWindow):
@@ -200,6 +222,8 @@ class MainWindow(QMainWindow):
 
         self._conversion: ConversionWorker | None = None
         self._merge: MergeWorker | None = None
+        self._scan: DuplicateWorker | None = None
+        self._scan_keys: list[tuple[int, int]] = []
         self._thumbs: ThumbnailWorker | None = None
         # All live thumbnail workers, so shutdown can wait for them.
         self._thumb_workers: set[ThumbnailWorker] = set()
@@ -362,6 +386,14 @@ class MainWindow(QMainWindow):
         )
         group_button.clicked.connect(self.group_by_document)
         header.addWidget(group_button)
+        self.btn_scan = QPushButton("Scan for duplicates")
+        self.btn_scan.setToolTip(
+            "Look for pages that repeat an earlier page, by their text or, for\n"
+            "pages without text, by how they look. Each match gets a confidence\n"
+            "score; text that differs only in whitespace or letter case still matches."
+        )
+        self.btn_scan.clicked.connect(self.scan_for_duplicates)
+        header.addWidget(self.btn_scan)
         right_layout.addLayout(header)
 
         pages_split = QSplitter(Qt.Horizontal)
@@ -377,6 +409,8 @@ class MainWindow(QMainWindow):
         self.page_list.setWordWrap(False)
         self.page_list.model().rowsMoved.connect(self._on_pages_reordered)
         self.page_list.itemSelectionChanged.connect(self._on_page_selection_changed)
+        self.page_list.itemDoubleClicked.connect(
+            lambda item: self.go_to_original(self.page_list.row(item)))
         self.page_list.verticalScrollBar().valueChanged.connect(self._on_pages_scrolled)
         pages_split.addWidget(self.page_list)
 
@@ -392,6 +426,14 @@ class MainWindow(QMainWindow):
         self.preview_caption.setAlignment(Qt.AlignCenter)
         self.preview_caption.setWordWrap(True)
         preview_layout.addWidget(self.preview_caption)
+        self.preview_link = QLabel("")
+        self.preview_link.setAlignment(Qt.AlignCenter)
+        self.preview_link.setTextFormat(Qt.RichText)
+        self.preview_link.setTextInteractionFlags(Qt.LinksAccessibleByMouse
+                                                  | Qt.LinksAccessibleByKeyboard)
+        self.preview_link.linkActivated.connect(lambda _href: self.go_to_original())
+        self.preview_link.setVisible(False)
+        preview_layout.addWidget(self.preview_link)
         pages_split.addWidget(preview_panel)
 
         pages_split.setStretchFactor(0, 3)
@@ -507,9 +549,18 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.cmb_separator, 0, 5)
 
         grid.addWidget(QLabel("Footer:"), 1, 0)
-        self.edt_footer = QLineEdit("{doc}")
-        self.edt_footer.setPlaceholderText("{doc}  {n}  {total}  {date}")
-        grid.addWidget(self.edt_footer, 1, 1, 1, 4)
+        self.edt_footer = QLineEdit()
+        self.edt_footer.setPlaceholderText("No footer - e.g. {doc} \u2013 page {n} of {total}")
+        self.edt_footer.setToolTip(FOOTER_HELP)
+        footer_row = QHBoxLayout()
+        footer_row.setContentsMargins(0, 0, 0, 0)
+        footer_row.addWidget(self.edt_footer, 1)
+        self.lbl_footer_info = QLabel()
+        self.lbl_footer_info.setPixmap(
+            self.style().standardIcon(QStyle.SP_MessageBoxInformation).pixmap(16, 16))
+        self.lbl_footer_info.setToolTip(FOOTER_HELP)
+        footer_row.addWidget(self.lbl_footer_info)
+        grid.addLayout(footer_row, 1, 1, 1, 4)
 
         self.chk_bookmarks = QCheckBox("Bookmarks")
         self.chk_bookmarks.setChecked(True)
@@ -598,7 +649,15 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setVisible(False)
 
     def cancel_conversion(self) -> None:
-        """Stop after the current file. Already converted files are kept."""
+        """Stop after the current file. Already converted files are kept.
+
+        The same Cancel button also stops a duplicate scan.
+        """
+        if self._scan is not None and self._scan.isRunning():
+            self._scan.cancel()
+            self.btn_cancel.setEnabled(False)
+            self.status.showMessage("Stopping the duplicate scan\u2026")
+            return
         worker = self._conversion
         if worker is None or not worker.isRunning():
             return
@@ -1033,11 +1092,13 @@ class MainWindow(QMainWindow):
             tint = node_colour(node, self.model.group_owner(node))
             trail = self.model.group_trail(node)
             item = QListWidgetItem(row_description(node, page, position, trail))
-            item.setData(Qt.UserRole, (page.segment_id, page.index, page.rotation))
-            item.setToolTip("%s\npage %d of %d"
-                            % (node.label if node else "?",
-                               page.index + 1,
-                               node.page_count if node else 0))
+            item.setData(Qt.UserRole, page_data(page))
+            tip = "%s\npage %d of %d" % (node.label if node else "?",
+                                         page.index + 1,
+                                         node.page_count if node else 0)
+            if page.duplicate:
+                tip += "\n\n" + page.duplicate_note + "\nDouble-click to show that page."
+            item.setToolTip(tip)
             # The row tint identifies the message the page came from; a nested
             # message gets a different colour from its parent.
             item.setBackground(QBrush(tint))
@@ -1061,6 +1122,140 @@ class MainWindow(QMainWindow):
         self.status.showMessage(
             "Grouped %d page(s) by source document." % self.model.page_count
         )
+
+    # ----------------------------------------------------------- duplicates
+
+    def page_name(self, position: int) -> str:
+        """Return "n. file" for a page-list position, as the duplicates dialog shows it.
+
+        The duplicate tag is left out; the dialog has its own confidence column.
+        """
+        page = dataclasses.replace(self.model.pages[position], duplicate=0)
+        node = self.model.segment(page.segment_id)
+        return row_description(node, page, position + 1, self.model.group_trail(node))
+
+    def scan_for_duplicates(self) -> None:
+        """Read every page in the background and report pages that repeat."""
+        if len(self.model.pages) < 2:
+            QMessageBox.information(self, "Scan for duplicates",
+                                    "There must be at least two pages to compare.")
+            return
+        if self._scan is not None and self._scan.isRunning():
+            return
+        jobs = []
+        for page in self.model.pages:
+            node = self.model.segment(page.segment_id)
+            jobs.append((node.pdf if node and node.pdf else Path(), page.index))
+        self._scan_keys = [page.key for page in self.model.pages]
+        self.btn_scan.setEnabled(False)
+        self._begin_progress(len(jobs), "Scanning %d page(s) for duplicates\u2026" % len(jobs))
+
+        self._scan = DuplicateWorker(jobs, self)
+        self._scan.advanced.connect(self._on_progress)
+        self._scan.completed.connect(self._on_duplicates_found)
+        self._scan.crashed.connect(self._on_scan_crash)
+        self._scan.start()
+
+    def _on_duplicates_found(self, matches) -> None:
+        self._end_progress()
+        self.btn_scan.setEnabled(True)
+        cancelled = self._scan is not None and self._scan.cancelled
+        if cancelled:
+            self.status.showMessage("Duplicate scan stopped.")
+            return
+        if [page.key for page in self.model.pages] != self._scan_keys:
+            self.status.showMessage(
+                "The pages changed during the scan. Scan again for up-to-date results.")
+            return
+        if not matches:
+            self.mark_duplicates([])
+            self.status.showMessage("No duplicate pages found.")
+            QMessageBox.information(self, "Scan for duplicates", "No duplicate pages found.")
+            return
+        self.mark_duplicates(matches)
+        self.status.showMessage("%d possible duplicate page(s) found." % len(matches))
+        self.duplicates_dialog = DuplicatesDialog(self, matches)
+        self.duplicates_dialog.finished.connect(lambda _result: self.mark_for_deletion([]))
+        # Window-modal, so the page list cannot change while the dialog's
+        # positions are in use.
+        self.duplicates_dialog.open()
+
+    def _on_scan_crash(self, detail: str) -> None:
+        self._end_progress()
+        self.btn_scan.setEnabled(True)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle("Duplicate scan failed")
+        box.setText("The pages could not be scanned for duplicates.")
+        box.setDetailedText(detail)
+        box.exec()
+
+    def mark_duplicates(self, matches: list) -> None:
+        """Tag each matched page's row with its confidence, replacing earlier tags."""
+        for page in self.model.pages:
+            page.duplicate, page.duplicate_note, page.duplicate_of = 0, "", 0
+        for match in matches:
+            page = self.model.pages[match.position]
+            original = self.model.pages[match.original]
+            node = self.model.segment(original.segment_id)
+            page.duplicate = match.confidence
+            page.duplicate_of = original.uid
+            page.duplicate_note = "Duplicate (%d%%) of %s, page %d\n%s" % (
+                match.confidence, node.label if node else "?",
+                original.index + 1, match.reason)
+        self.refresh_pages()
+
+    def mark_for_deletion(self, positions) -> None:
+        """Strike through the rows the duplicates dialog would delete."""
+        doomed = set(positions)
+        for row in range(self.page_list.count()):
+            item = self.page_list.item(row)
+            font = item.font()
+            font.setStrikeOut(row in doomed)
+            item.setFont(font)
+            item.setForeground(QBrush(QColor("#b00020" if row in doomed else "#202020")))
+
+    def _update_duplicate_link(self) -> None:
+        """Under the preview, link a duplicate page to the page it repeats."""
+        indices = self.selected_page_indices()
+        page = self.model.pages[indices[0]] if indices else None
+        if page is None or not page.duplicate:
+            self.preview_link.setVisible(False)
+            return
+        original = self.model.position_of(page.duplicate_of)
+        if original is None:
+            self.preview_link.setText(
+                "Duplicate (%d%%) of a page that is no longer in the list" % page.duplicate)
+        else:
+            self.preview_link.setText(
+                '<a href="original">Duplicate (%d%%) of page %d \u2013 show it</a>'
+                % (page.duplicate, original + 1))
+        self.preview_link.setVisible(True)
+
+    def go_to_original(self, position: int | None = None) -> bool:
+        """Show the page that a duplicate repeats; return False if there is none.
+
+        ``position`` defaults to the first selected page.
+        """
+        if position is None:
+            indices = self.selected_page_indices()
+            position = indices[0] if indices else -1
+        if not 0 <= position < len(self.model.pages):
+            return False
+        page = self.model.pages[position]
+        if not page.duplicate:
+            return False
+        original = self.model.position_of(page.duplicate_of)
+        if original is None:
+            self.status.showMessage("The page this one duplicates is no longer in the list.")
+            return False
+        self.go_to_page(original)
+        return True
+
+    def delete_duplicate_pages(self, positions: list[int]) -> None:
+        removed = self.model.delete(positions)
+        self.refresh_pages()
+        self.status.showMessage("Deleted %d duplicate page(s)." % removed)
 
     def _start_thumbnails(self) -> None:
         """Render thumbnails for the rows near the viewport.
@@ -1156,6 +1351,7 @@ class MainWindow(QMainWindow):
         self._update_preview()
 
     def _update_preview(self) -> None:
+        self._update_duplicate_link()
         indices = self.selected_page_indices()
         if not indices:
             self.preview.setPixmap(QPixmap())
@@ -1206,8 +1402,10 @@ class MainWindow(QMainWindow):
             data = self.page_list.item(row).data(Qt.UserRole)
             if data is None:
                 continue
-            segment_id, index, rotation = data
-            reordered.append(PageRef(segment_id, index, rotation))
+            segment_id, index, rotation, score, note, original, uid = data
+            reordered.append(PageRef(segment_id, index, rotation,
+                                     duplicate=score, duplicate_note=note,
+                                     duplicate_of=original, uid=uid))
         if len(reordered) == len(self.model.pages):
             self.model.pages = reordered
 
@@ -1263,7 +1461,7 @@ class MainWindow(QMainWindow):
                 continue
             node = self.model.segment(page.segment_id)
             item.setText(row_description(node, page, position))
-            item.setData(Qt.UserRole, (page.segment_id, page.index, page.rotation))
+            item.setData(Qt.UserRole, page_data(page))
 
     # ----------------------------------------------------------- conversion
 
@@ -1693,7 +1891,7 @@ class MainWindow(QMainWindow):
         Checked at exit: destroying a running QThread makes Qt abort the process,
         so ``app.run`` exits with ``os._exit`` in that case.
         """
-        workers = [self._conversion, self._merge, *self._thumb_workers]
+        workers = [self._conversion, self._merge, self._scan, *self._thumb_workers]
         for worker in workers:
             try:
                 if worker is not None and worker.isRunning():
@@ -1740,7 +1938,7 @@ class MainWindow(QMainWindow):
 
         self._autoconvert.stop()
 
-        workers = [w for w in (self._conversion, self._merge, *self._thumb_workers)
+        workers = [w for w in (self._conversion, self._merge, self._scan, *self._thumb_workers)
                    if w is not None]
         for worker in workers:
             if worker.isRunning() and hasattr(worker, "cancel"):

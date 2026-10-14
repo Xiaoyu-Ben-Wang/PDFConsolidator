@@ -12,7 +12,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
-from .. import assemble, email_items, pipeline
+from .. import assemble, duplicates, email_items, pipeline
 
 # Worker thread stack size. Parsing deeply nested PDFs or messages recurses
 # deeply, and the Windows default of 1 MB per thread can overflow, which ends
@@ -91,6 +91,36 @@ class MergeWorker(QThread):
         try:
             report = assemble.merge(self.entries, self.dest, options=self.options)
             self.completed.emit(report)
+        except Exception:
+            self.crashed.emit(traceback.format_exc())
+
+
+class DuplicateWorker(QThread):
+    """Read every page and look for pages that repeat an earlier one."""
+
+    advanced = Signal(int, int, str)
+    completed = Signal(object)   # list[duplicates.Match]
+    crashed = Signal(str)
+
+    def __init__(self, pages: list[tuple[Path, int]], parent=None) -> None:
+        super().__init__(parent)
+        self.setStackSize(WORKER_STACK_BYTES)
+        self.pages = pages
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def run(self) -> None:  # noqa: D102
+        try:
+            stop = lambda: self._cancelled  # noqa: E731
+            prints = duplicates.read_pages(self.pages, should_stop=stop,
+                                           on_progress=self.advanced.emit)
+            self.completed.emit(duplicates.find_duplicates(prints, should_stop=stop))
         except Exception:
             self.crashed.emit(traceback.format_exc())
 

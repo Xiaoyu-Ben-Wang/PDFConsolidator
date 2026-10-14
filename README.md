@@ -115,6 +115,7 @@ attached email gets a different colour from the email that carried it.
 | **Duplicate** | Insert a copy of the selected pages after them. |
 | **Delete** (button, key, or Backspace) | Remove the selected pages. |
 | **Group by document** | Put each file's pages together, keeping each file's own page order. |
+| **Scan for duplicates** | Find pages that repeat an earlier page and list them with a confidence score: 100% the same page twice, 99% identical text, 96% the same text apart from whitespace or letter case, up to 94% for mostly matching text, and up to 90% for pages without text that look alike. Blank pages are ignored. Each duplicate's row in the page list is tagged "[duplicate *n*%]" (hover for the page it repeats); double-click the row, or click the link under the preview, to jump to that page, wherever it has since been moved. Click a row to show the page; matches of 95% or more are checked, checked pages are struck through in red in the page list, and **Delete checked pages** removes them, keeping the earlier copy. |
 
 ### Preview (right)
 
@@ -150,7 +151,7 @@ anything.
 | Page size | `letter` (default), `a4`, `legal`: each page is scaled to fit with a 0.5 inch margin. `original`: pages keep their own size. |
 | Numbers | `none`, `continuous` (one sequence for the whole PDF), or `per-document` (restarts for each file). Printed as "*n* of *total*" at the bottom right when there is a footer, or at the bottom centre when the footer is empty. |
 | Separator | `none`, `blank` (an empty page between files), or `title` (a page with the file name between files). |
-| Footer | Text printed at the bottom of every page. Placeholders: `{doc}` file name, `{n}` page number, `{total}` page count, `{n_doc}` / `{total_doc}` page number and count within the file, `{date}` today's date. Example: `{doc} – page {n} of {total}`. Default `{doc}`. Leave empty for no footer. Long text wraps onto up to three lines; long file names break at `_`, `-` or `.`. |
+| Footer | Text printed at the bottom of every page. Placeholders: `{doc}` file name, `{n}` page number, `{total}` page count, `{n_doc}` / `{total_doc}` page number and count within the file, `{date}` today's date. Example: `{doc} – page {n} of {total}`. Empty by default (no footer); hover the info icon beside the field for this list. Long text wraps onto up to three lines; long file names break at `_`, `-` or `.`. |
 | Bookmarks | Adds a PDF bookmark for each file, so viewers show a clickable outline. |
 
 **Output**

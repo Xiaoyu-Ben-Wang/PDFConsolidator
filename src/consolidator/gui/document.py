@@ -10,10 +10,13 @@ different documents can be interleaved in any order.
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import assemble
+
+_page_uids = itertools.count(1)
 
 
 @dataclass
@@ -70,6 +73,14 @@ class PageRef:
     index: int          # index within that segment's PDF
     rotation: int = 0   # clockwise degrees, applied on output
     selected: bool = False
+    # Set by the duplicate scan: the match confidence (0 when the page is not a
+    # duplicate), a description of the earlier page for the row's tooltip, and
+    # that page's uid, so the row can link to it wherever it has moved.
+    duplicate: int = 0
+    duplicate_note: str = ""
+    duplicate_of: int = 0
+    # Identifies this entry in the page list; copies of a page get their own.
+    uid: int = field(default_factory=lambda: next(_page_uids))
 
     @property
     def key(self) -> tuple[int, int]:
@@ -511,6 +522,13 @@ class DocumentModel:
 
         flush()
         return entries
+
+    def position_of(self, uid: int) -> int | None:
+        """Return the page-list position of the page with ``uid``, if it is still there."""
+        for position, page in enumerate(self.pages):
+            if page.uid == uid:
+                return position
+        return None
 
     @property
     def page_count(self) -> int:
