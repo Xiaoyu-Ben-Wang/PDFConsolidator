@@ -46,6 +46,8 @@ not part of the app.
    email's body or one of its attachments.
 3. Arrange the **Pages** list: drag pages to reorder them, and use the buttons
    to rotate, duplicate or delete them. Click a page to preview it.
+   **Scan for duplicates** finds pages that appear more than once, for example
+   an attachment that is also in another email, so you can remove the repeats.
 4. Choose the **Layout** options: page size, page numbers, separators, footer
    and bookmarks.
 5. Click **Save as…** to pick the output file, then **Create PDF**. (If you
@@ -120,7 +122,9 @@ attached email gets a different colour from the email that carried it.
 ### Preview (right)
 
 Shows the selected page as it will be written, including rotation, with
-"Page *n* of *total*" and the source file underneath.
+"Page *n* of *total*" and the source file underneath. For a page found by
+**Scan for duplicates**, a link underneath names the page it repeats and jumps
+to it.
 
 ### Options
 
@@ -371,7 +375,7 @@ not the system temp directory.
 
 ## About
 
-PDF Consolidator 0.1.0. Copyright (C) 2026 Xiaoyu-Ben-Wang.
+PDF Consolidator 0.2.0. Copyright (C) 2026 Xiaoyu-Ben-Wang.
 
 The **About** dialog in the app shows the version, copyright, licence and
 warranty disclaimer, and links to every third-party licence.
