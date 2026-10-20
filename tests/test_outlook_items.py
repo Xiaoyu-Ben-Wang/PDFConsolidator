@@ -159,6 +159,20 @@ def test_a_windows_1252_html_body_keeps_its_characters(tmp_path):
     assert "�" not in item.body_html
 
 
+def test_the_written_body_drops_the_original_charset_declaration(tmp_path):
+    # The body is written as UTF-8; a leftover windows-1252 declaration made
+    # LibreOffice show "’" as "â€™".
+    html = ("<html><head><meta http-equiv='Content-Type' "
+            "content='text/html; charset=windows-1252'></head><body>It’s</body></html>")
+    path = _write(tmp_path, "cp1252.msg", mb.Item(
+        subject="Top", html=html.encode("cp1252")))
+
+    written = email_items.body_html(email_items.read_message(path))
+
+    assert "windows-1252" not in written
+    assert "It’s" in written
+
+
 def test_files_attached_by_value_of_every_supported_kind_are_categorised(tmp_path):
     eml = b"From: a@example.com\r\nSubject: attached eml\r\n\r\nbody\r\n"
     inner_msg = mb.build(mb.Item(subject="attached msg file", body="x"))

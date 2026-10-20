@@ -132,6 +132,11 @@ def _cid_plain(value: str) -> str:
 
 _CID_REF = re.compile(r"""cid:([^"'\s>)]+)""", re.IGNORECASE)
 
+# A charset declaration inside the body HTML. The body is already decoded and
+# is written out as UTF-8, so a leftover declaration such as windows-1252 would
+# make LibreOffice decode the UTF-8 bytes in that charset ("’" becomes "â€™").
+_BODY_CHARSET_META = re.compile(r"<meta\b[^>]*\bcharset\b[^>]*>", re.IGNORECASE)
+
 
 def referenced_cids(html: str) -> set[str]:
     return {_cid_plain(m) for m in _CID_REF.findall(html or "")}
@@ -895,7 +900,8 @@ def body_html(item: EmailItem, policy: ExtractionPolicy | None = None,
         parts.append("</table>")
 
     if item.body_html:
-        parts.append(resolve_cids(item.body_html, references or {}))
+        body = _BODY_CHARSET_META.sub("", item.body_html)
+        parts.append(resolve_cids(body, references or {}))
     elif item.body_text:
         parts.append("<pre class='body'>%s</pre>" % html_module.escape(item.body_text))
     else:
