@@ -228,8 +228,58 @@ def wrap_contents(page, prefix: bytes = b"", suffix: bytes = b"") -> None:
     page[NameObject("/Contents")] = ArrayObject(parts)
 
 
+def _rotate_appearance(writer, annotation, linear: Matrix) -> None:
+    """Turn an annotation's appearance streams by ``linear`` (no translation).
+
+    A viewer draws an appearance by fitting its /BBox, transformed by its
+    /Matrix, into the annotation's /Rect. When the page is rotated, the /Rect
+    turns with it but the appearance does not, so the appearance is squeezed
+    into a box with width and height swapped. Adding the rotation to /Matrix
+    keeps the two in step. Each stream is copied, because other annotations
+    may share it.
+    """
+    from pypdf.generic import (ArrayObject, DictionaryObject, FloatObject,
+                               NameObject, StreamObject)
+
+    def turned(reference):
+        stream = reference.get_object()
+        if not isinstance(stream, StreamObject):
+            return reference
+        copy = stream.__class__()
+        copy._data = stream._data               # keep the data encoded, unparsed
+        for key, value in dict.items(stream):
+            copy[key] = value
+        try:
+            current = tuple(float(v) for v in stream.get("/Matrix", ()))
+        except Exception:
+            current = ()
+        if len(current) != 6:
+            current = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        copy[NameObject("/Matrix")] = ArrayObject(
+            FloatObject(v) for v in then(current, linear))
+        return writer._add_object(copy)
+
+    appearances = annotation.get("/AP")
+    if appearances is None:
+        return
+    appearances = DictionaryObject(dict.items(appearances.get_object()))
+    for kind in ("/N", "/R", "/D"):
+        if kind not in appearances:
+            continue
+        entry = appearances[kind].get_object()
+        if isinstance(entry, StreamObject):
+            appearances[NameObject(kind)] = turned(dict.__getitem__(appearances, kind))
+        elif isinstance(entry, DictionaryObject):
+            # One stream per state, e.g. the on and off look of a checkbox.
+            states = DictionaryObject()
+            for state in entry:
+                states[NameObject(state)] = turned(dict.__getitem__(entry, state))
+            appearances[NameObject(kind)] = states
+    annotation[NameObject("/AP")] = appearances
+
+
 def _transform_annotations(page, matrix: Matrix) -> None:
-    """Transform annotation rectangles (links etc.) with the page content.
+    """Transform annotations (links, comments, stamps etc.) with the page content.
 
     Each annotation is copied first, because a page used twice shares its
     annotations with the other copy, which must not move.
@@ -243,6 +293,9 @@ def _transform_annotations(page, matrix: Matrix) -> None:
         annotations = list(page["/Annots"])
     except Exception:
         return
+    a, b, c, d, _e, _f = matrix
+    # A scale needs no change to the appearance: the viewer fits it to /Rect.
+    turns = abs(b) > 1e-9 or abs(c) > 1e-9 or a < 0 or d < 0
     moved = ArrayObject()
     for reference in annotations:
         try:
@@ -255,6 +308,9 @@ def _transform_annotations(page, matrix: Matrix) -> None:
                 xs, ys = [c[0] for c in corners], [c[1] for c in corners]
                 copy[NameObject("/Rect")] = RectangleObject(
                     (min(xs), min(ys), max(xs), max(ys)))
+            # NoRotate annotations (flag bit 5) stay upright on purpose.
+            if turns and not int(copy.get("/F", 0) or 0) & 16:
+                _rotate_appearance(writer, copy, (a, b, c, d, 0.0, 0.0))
             moved.append(writer._add_object(copy))
         except Exception:
             continue                    # drop unreadable annotations

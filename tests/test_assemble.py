@@ -70,6 +70,68 @@ def test_rotation_is_applied(tmp_path, two_pdfs):
     assert (round(float(page.mediabox.width)), round(float(page.mediabox.height))) ==         (round(pages.LETTER[0]), round(pages.LETTER[1]))
 
 
+def _rotated_page_with_caption(path):
+    """A /Rotate 90 page whose caption is a FreeText annotation with an appearance.
+
+    The caption reads horizontally when displayed, so in the page's own
+    (unrotated) coordinates its /Rect is tall and narrow, and its appearance
+    /Matrix turns the text to fit.
+    """
+    from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject,
+                               FloatObject, NameObject, NumberObject, RectangleObject)
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+    page[NameObject("/Rotate")] = NumberObject(90)
+    appearance = DecodedStreamObject()
+    appearance.set_data(b"1 0 0 rg 0 0 300 30 re f\n")
+    appearance.update({
+        NameObject("/Type"): NameObject("/XObject"),
+        NameObject("/Subtype"): NameObject("/Form"),
+        NameObject("/BBox"): ArrayObject(FloatObject(v) for v in (0, 0, 300, 30)),
+        NameObject("/Matrix"): ArrayObject(FloatObject(v) for v in (0, 1, -1, 0, 0, 0)),
+    })
+    annotation = DictionaryObject({
+        NameObject("/Type"): NameObject("/Annot"),
+        NameObject("/Subtype"): NameObject("/FreeText"),
+        NameObject("/Rect"): RectangleObject((100, 150, 130, 450)),
+        NameObject("/AP"): DictionaryObject(
+            {NameObject("/N"): writer._add_object(appearance)}),
+    })
+    page[NameObject("/Annots")] = ArrayObject([writer._add_object(annotation)])
+    with open(path, "wb") as handle:
+        writer.write(handle)
+
+
+@pytest.mark.parametrize("extra", [0, 90, 180])
+def test_annotation_appearance_turns_with_a_rotated_page(tmp_path, extra):
+    """The appearance must keep the shape of the annotation's rectangle.
+
+    Only the /Rect used to be turned, so the viewer squeezed a wide caption
+    into a tall box (or the reverse), and the text came out as smears.
+    """
+    source = tmp_path / "caption.pdf"
+    _rotated_page_with_caption(source)
+    dest = tmp_path / "out.pdf"
+    entry = assemble.MergeEntry(source, "caption", pages=[assemble.PageSpec(0, extra)])
+    assemble.merge([entry], dest, page_size=pages.LETTER)
+
+    annotation = PdfReader(str(dest)).pages[0]["/Annots"][0].get_object()
+    x0, y0, x1, y1 = (float(v) for v in annotation["/Rect"])
+    appearance = annotation["/AP"]["/N"].get_object()
+    matrix = tuple(float(v) for v in appearance["/Matrix"])
+    corners = [assemble.apply(matrix, x, y) for x, y in ((0, 0), (300, 0), (0, 30), (300, 30))]
+    width = max(c[0] for c in corners) - min(c[0] for c in corners)
+    height = max(c[1] for c in corners) - min(c[1] for c in corners)
+    assert width / height == pytest.approx((x1 - x0) / (y1 - y0), rel=1e-3)
+    # Displayed upright before, so upright after: the caption's text runs
+    # left to right along the bottom edge of the box (90 + extra turns in all).
+    a, b, _c, _d, _e, _f = matrix
+    length = (a * a + b * b) ** 0.5
+    expected = {0: (1, 0), 90: (0, -1), 180: (-1, 0)}[extra]
+    assert (round(a / length), round(b / length)) == expected
+
+
 def test_rotation_without_fitting_stays_a_rotate_entry(tmp_path, two_pdfs):
     """Without a page size, the rotation is stored as a /Rotate entry."""
     entry = assemble.MergeEntry(two_pdfs[0], "alpha", pages=[assemble.PageSpec(0, 90)])
