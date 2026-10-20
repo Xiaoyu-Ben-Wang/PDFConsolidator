@@ -62,7 +62,7 @@ the page list names it.
 1. **Convert.** Each file is turned into PDF pages as soon as it is added. This
    is the slow part, because Office documents and email bodies go through
    LibreOffice. Only newly added files are converted, so your page edits are
-   kept. **Convert** in the toolbar redoes every file from scratch.
+   kept. **Reconvert All** in the toolbar redoes every file from scratch.
 2. **Create.** **Create PDF** merges the pages in the order shown, fits them to
    the page size, and adds page numbers, footer and bookmarks. This does not
    use LibreOffice and takes seconds, so you can change the layout and create
@@ -70,6 +70,12 @@ the page list names it.
 
 
 ## Window reference
+
+### Menus
+
+- **File:** Add Files… (**Ctrl+O**), Add Folder…, Create PDF… (**Ctrl+S**),
+  Reconvert All, Clear and Exit.
+- **Help:** About and Licences.
 
 ### Toolbar
 
@@ -80,7 +86,7 @@ the page list names it.
 | **Remove** | Remove the selected source and its pages. |
 | **Clear** | Remove all sources and pages. |
 | **Sort** | Order the source list by name (natural order, so `file2` comes before `file10`), date modified, size or type. |
-| **Convert** | Re-convert every source from scratch. Normally not needed: new files are converted automatically, and only new files are converted, so your page edits are kept. |
+| **Reconvert All** | Re-convert every source from scratch, discarding page edits (order, rotation, deletions). Normally not needed: new files are converted automatically, and only new files are converted, so your page edits are kept. |
 
 ### Sources (left)
 
@@ -112,8 +118,8 @@ attached email gets a different colour from the email that carried it.
 | Control | What it does |
 |---|---|
 | Drag and drop | Reorder pages. Select several rows (Ctrl/Shift+click) to move them together. |
-| **↺ Left** / **↳ Right** / **180°** | Rotate the selected pages. |
-| **▲** / **▼** | Move the selected pages up or down by one. |
+| **↺** / **↻** / **180°** | Rotate the selected pages left, right or half a turn. |
+| **Up** / **Down** arrows | Move the selected pages up or down by one. |
 | **Duplicate** | Insert a copy of the selected pages after them. |
 | **Delete** (button, key, or Backspace) | Remove the selected pages. |
 | **Group by document** | Put each file's pages together, keeping each file's own page order. |
@@ -121,8 +127,10 @@ attached email gets a different colour from the email that carried it.
 
 ### Preview (right)
 
-Shows the selected page as it will be written, including rotation, with
-"Page *n* of *total*" and the source file underneath. For a page found by
+Shows the selected page as it will be written, including rotation, scaled to
+fit the pane. **−**, **Fit** and **+** above it zoom in up to 3×; scroll to see
+the rest of a zoomed page. Underneath are "Page *n* of *total*" and the source
+file. For a page found by
 **Scan for duplicates**, a link underneath names the page it repeats and jumps
 to it.
 
@@ -172,7 +180,7 @@ anything.
 - **Banner:** appears above the lists if files fail to convert or pages fail
   the output check. **Details…** lists them, **Retry failed** converts the
   failed files again, and **Dismiss** hides the banner.
-- **About** (also under *Help*): version, copyright, licence and warranty
+- **About** is under *Help*: version, copyright, licence and warranty
   disclaimer, with a link to every third-party licence.
 
 ### Closing
@@ -375,7 +383,7 @@ not the system temp directory.
 
 ## About
 
-PDF Consolidator 0.2.0. Copyright (C) 2026 Xiaoyu-Ben-Wang.
+PDF Consolidator 0.3.0. Copyright (C) 2026 Xiaoyu-Ben-Wang.
 
 The **About** dialog in the app shows the version, copyright, licence and
 warranty disclaimer, and links to every third-party licence.

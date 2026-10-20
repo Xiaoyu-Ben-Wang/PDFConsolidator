@@ -1,3 +1,3 @@
 """PDF Consolidator - convert a mixed folder of documents into one merged PDF."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
