@@ -771,15 +771,15 @@ def test_licences_are_found_beside_a_frozen_executable(qapp, tmp_path, monkeypat
 
 
 def test_the_window_offers_the_licences(qapp):
-    """The About button and the Help menu exist and are connected."""
+    """The Help menu has About and Licences entries."""
     from consolidator.gui.main_window import MainWindow
 
     win = MainWindow()
     try:
-        assert win.btn_about.text() == "About"
         assert win.act_about.text().startswith("About")
         assert win.act_licences.text().startswith("Licences")
-        help_menu = win.menuBar().actions()[0].menu()
+        help_menu = next(action.menu() for action in win.menuBar().actions()
+                         if action.text() == "&Help")
         assert [action.text() for action in help_menu.actions()] == [
             win.act_about.text(), win.act_licences.text(),
         ]

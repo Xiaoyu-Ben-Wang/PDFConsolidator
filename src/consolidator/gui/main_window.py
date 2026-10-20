@@ -7,13 +7,14 @@ import hashlib
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QFileInfo, Qt, QSize, QTimer
+from PySide6.QtCore import QEvent, QFileInfo, Qt, QSize, QTimer
 from PySide6.QtGui import (
     QAction,
     QBrush,
     QColor,
     QIcon,
     QKeySequence,
+    QPainter,
     QPixmap,
     QShortcut,
     QTransform,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QStyle,
     QToolBar,
@@ -58,10 +60,15 @@ from .worker import ConversionWorker, DuplicateWorker, MergeWorker, ThumbnailWor
 POLICY_EXCLUSION = "excluded by the extraction policy"
 
 # Row and thumbnail sizes, in pixels. Kept compact so more pages fit.
-LIST_THUMB_W = 64
-LIST_THUMB_H = 84
-ROW_HEIGHT = 92
-PREVIEW_HEIGHT = 640
+LIST_THUMB_W = 50
+LIST_THUMB_H = 64
+ROW_HEIGHT = 70
+# Preview zoom steps, as a fraction of the pane height ("fit" is 1.0).
+PREVIEW_ZOOMS = (1.0, 1.5, 2.0, 3.0)
+PREVIEW_MAX_HEIGHT = 4000
+# Space around the previewed page, and the offset of its drop shadow.
+PREVIEW_MARGIN = 12
+PREVIEW_SHADOW = 4
 TREE_ROW_HEIGHT = 20
 TREE_ICON = 16
 
@@ -91,6 +98,25 @@ FOOTER_HELP = (
     "  {total_doc}\tpage count of the file\n"
     "  {date}\ttoday's date (YYYY-MM-DD)\n\n"
     "Example: {doc} \u2013 page {n} of {total}"
+)
+
+# Accent style for the window's main action (Create PDF).
+PRIMARY_BUTTON_STYLE = (
+    "QPushButton { background: #0067c0; color: white; border: 1px solid #005ba9;"
+    " border-radius: 4px; padding: 4px 16px; font-weight: 600; }"
+    "QPushButton:hover { background: #1975c5; }"
+    "QPushButton:pressed { background: #005ba9; }"
+    "QPushButton:disabled { background: #9fc3e6; border-color: #9fc3e6; }"
+)
+
+# Background behind the page preview, so a white page stands out from it.
+PREVIEW_BACKGROUND = "#d4d4d4"
+
+PAGES_HELP = (
+    "Each row is one page of the merged PDF, in output order.\n"
+    "The row colour shows which file or message the page came from;\n"
+    "the same colour marks that item in the Sources list.\n"
+    "Drag rows to reorder them."
 )
 
 # Navigator columns. The jump arrow has its own narrow column so it stays
@@ -133,7 +159,10 @@ def group_colour(key: str, parent_hue: int | None = None) -> QColor:
         distance = (hue - parent_hue) % 360
         if distance < 45 or distance > 315:
             hue = (hue + 150) % 360
-    return QColor.fromHsv(hue, 55, 246)
+    # Map onto orange..violet, leaving out reds and pinks so a tint is never
+    # mistaken for an error.
+    hue = 30 + hue * 270 // 359
+    return QColor.fromHsv(hue, 40, 250)
 
 
 def source_colour(key: str) -> QColor:
@@ -190,6 +219,20 @@ def row_description(node, page, position: int, trail: list[str] | None = None) -
     return text
 
 
+def page_with_shadow(image) -> QPixmap:
+    """Return the page image with a thin border and a drop shadow."""
+    offset = PREVIEW_SHADOW
+    pixmap = QPixmap(image.width() + offset, image.height() + offset)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.fillRect(offset, offset, image.width(), image.height(), QColor(0, 0, 0, 60))
+    painter.drawImage(0, 0, image)
+    painter.setPen(QColor("#a0a0a0"))
+    painter.drawRect(0, 0, image.width() - 1, image.height() - 1)
+    painter.end()
+    return pixmap
+
+
 def page_data(page) -> tuple:
     """Return the page fields a page-list row carries, so a drag keeps them."""
     return (page.segment_id, page.index, page.rotation,
@@ -244,8 +287,8 @@ class MainWindow(QMainWindow):
         self._autoconvert.setInterval(350)
         self._autoconvert.timeout.connect(self._convert_new_sources)
 
-        self._build_menu()
         self._build_toolbar()
+        self._build_menu()
         self._build_body()
         self._build_options()
         self._build_status()
@@ -256,11 +299,27 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ UI
 
     def _build_menu(self) -> None:
-        """Build the Help menu with About and Licences entries.
+        """Build the File menu and the Help menu with About and Licences entries.
 
         The GPL recommends that a GUI show its notices in an About box, and the
         LGPL requires the licence texts to be reachable from the program.
         """
+        file_menu = self.menuBar().addMenu("&File")
+        self.act_add_files.setShortcut(QKeySequence.Open)
+        file_menu.addAction(self.act_add_files)
+        file_menu.addAction(self.act_add_folder)
+        file_menu.addSeparator()
+        self.act_create = QAction("Create PDF…", self)
+        self.act_create.setShortcut(QKeySequence.Save)
+        self.act_create.triggered.connect(self.create_pdf)
+        file_menu.addAction(self.act_create)
+        file_menu.addAction(self.act_convert)
+        file_menu.addAction(self.act_clear)
+        file_menu.addSeparator()
+        exit_action = QAction("E&xit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
         menu = self.menuBar().addMenu("&Help")
 
         self.act_about = QAction("About PDF Consolidator", self)
@@ -307,9 +366,43 @@ class MainWindow(QMainWindow):
         self.cmb_sort.currentIndexChanged.connect(self.refresh_tree)
         bar.addWidget(self.cmb_sort)
 
-        self.act_convert = QAction("Convert", self)
+        # Added files convert automatically, so this is only for starting over.
+        bar.addSeparator()
+        self.act_convert = QAction("Reconvert All", self)
+        self.act_convert.setToolTip(
+            "Convert every source again from scratch.\n"
+            "Discards page edits (order, rotation, deletions)."
+        )
         self.act_convert.triggered.connect(self.start_conversion)
         bar.addAction(self.act_convert)
+
+    def _separator(self) -> QFrame:
+        """Return a thin vertical line that separates groups of buttons."""
+        line = QFrame()
+        line.setFrameShape(QFrame.VLine)
+        line.setFrameShadow(QFrame.Sunken)
+        line.setFixedHeight(20)
+        return line
+
+    def _page_button(self, text: str, tip: str, icon, slot) -> QToolButton:
+        """Return a flat page-action button with a tooltip."""
+        button = QToolButton()
+        button.setAutoRaise(True)
+        button.setToolTip(tip)
+        if icon is not None:
+            button.setIcon(self.style().standardIcon(icon))
+        if text:
+            button.setText(text)
+            if len(text) == 1:
+                # A one-character glyph (rotate arrow) reads better larger.
+                font = button.font()
+                font.setPointSizeF(font.pointSizeF() * 1.4)
+                button.setFont(font)
+        if text and icon is not None:
+            button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        button.setMinimumWidth(30)
+        button.clicked.connect(slot)
+        return button
 
     def _build_body(self) -> None:
         splitter = QSplitter(Qt.Horizontal)
@@ -355,6 +448,11 @@ class MainWindow(QMainWindow):
         self.tree.itemChanged.connect(self._on_tree_item_changed)
         self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
         self.tree.itemClicked.connect(self._on_tree_item_clicked)
+        # A pointing-hand cursor over the jump arrows shows they can be clicked.
+        self.tree.setMouseTracking(True)
+        self.tree.itemEntered.connect(self._on_tree_item_entered)
+        self.tree.viewportEntered.connect(self.tree.viewport().unsetCursor)
+        self.tree.headerItem().setToolTip(JUMP_COLUMN, "Show in the page list")
         left_layout.addWidget(self.tree)
         splitter.addWidget(left)
 
@@ -364,21 +462,37 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(6, 6, 6, 6)
 
         header = QHBoxLayout()
-        header.addWidget(QLabel("Pages"))
+        header.setSpacing(2)
+        pages_label = QLabel("Pages")
+        pages_label.setToolTip(PAGES_HELP)
+        header.addWidget(pages_label)
         header.addStretch(1)
-        for label, slot in (("\u21ba Left", lambda: self.rotate_selected(-90)),
-                            ("\u21b3 Right", lambda: self.rotate_selected(90)),
-                            ("180\u00b0", lambda: self.rotate_selected(180))):
-            button = QPushButton(label)
-            button.clicked.connect(slot)
-            header.addWidget(button)
-        for label, slot in (("\u25b2", self.move_selected_up),
-                            ("\u25bc", self.move_selected_down),
-                            ("Duplicate", self.duplicate_selected),
-                            ("Delete", self.delete_selected)):
-            button = QPushButton(label)
-            button.clicked.connect(slot)
-            header.addWidget(button)
+        # Page actions in three groups: rotate, move, and copy/remove.
+        groups = (
+            (("\u21ba", "Rotate left (counter-clockwise)", None,
+              lambda: self.rotate_selected(-90)),
+             ("\u21bb", "Rotate right (clockwise)", None,
+              lambda: self.rotate_selected(90)),
+             ("180\u00b0", "Rotate 180\u00b0", None,
+              lambda: self.rotate_selected(180))),
+            (("", "Move up", QStyle.StandardPixmap.SP_ArrowUp, self.move_selected_up),
+             ("", "Move down", QStyle.StandardPixmap.SP_ArrowDown,
+              self.move_selected_down)),
+            (("Duplicate", "Add a copy of the selected pages", None,
+              self.duplicate_selected),
+             ("Delete", "Remove the selected pages (Delete)",
+              QStyle.StandardPixmap.SP_TrashIcon, self.delete_selected)),
+        )
+        for number, group in enumerate(groups):
+            if number:
+                header.addSpacing(6)
+                header.addWidget(self._separator())
+                header.addSpacing(6)
+            for text, tip, icon, slot in group:
+                header.addWidget(self._page_button(text, tip, icon, slot))
+        header.addSpacing(6)
+        header.addWidget(self._separator())
+        header.addSpacing(6)
         group_button = QPushButton("Group by document")
         group_button.setToolTip(
             "Cluster the pages so every page from one file sits together,\n"
@@ -402,6 +516,8 @@ class MainWindow(QMainWindow):
         self.page_list.setViewMode(QListView.ListMode)
         self.page_list.setIconSize(QSize(LIST_THUMB_W, LIST_THUMB_H))
         self.page_list.setUniformItemSizes(True)
+        # A one-pixel gap between rows, so rows of the same colour stay separate.
+        self.page_list.setSpacing(1)
         self.page_list.setMovement(QListView.Static)
         self.page_list.setDragDropMode(QAbstractItemView.InternalMove)
         self.page_list.setDefaultDropAction(Qt.MoveAction)
@@ -417,11 +533,42 @@ class MainWindow(QMainWindow):
         preview_panel = QWidget()
         preview_layout = QVBoxLayout(preview_panel)
         preview_layout.setContentsMargins(0, 0, 0, 0)
+
+        zoom_row = QHBoxLayout()
+        zoom_row.setSpacing(2)
+        zoom_row.addStretch(1)
+        self.btn_zoom_out = self._page_button("−", "Zoom out", None,
+                                              lambda: self.zoom_preview(-1))
+        self.btn_zoom_fit = self._page_button("Fit", "Fit the page in the pane", None,
+                                              lambda: self.zoom_preview(0))
+        self.btn_zoom_in = self._page_button("+", "Zoom in", None,
+                                             lambda: self.zoom_preview(1))
+        for button in (self.btn_zoom_out, self.btn_zoom_fit, self.btn_zoom_in):
+            zoom_row.addWidget(button)
+        preview_layout.addLayout(zoom_row)
+
+        # The page sits on a grey background in a scroll area, so a zoomed page
+        # can be scrolled and an unzoomed one is scaled to fit the pane.
+        self._preview_zoom = 0
         self.preview = QLabel("Select a page to preview it")
         self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setMinimumWidth(260)
-        self.preview.setStyleSheet("QLabel { background: #303030; color: #c8c8c8; }")
-        preview_layout.addWidget(self.preview, 1)
+        self.preview.setStyleSheet(
+            "QLabel { background: %s; color: #505050; }" % PREVIEW_BACKGROUND)
+        self.preview_scroll = QScrollArea()
+        self.preview_scroll.setWidget(self.preview)
+        self.preview_scroll.setWidgetResizable(True)
+        self.preview_scroll.setAlignment(Qt.AlignCenter)
+        self.preview_scroll.setMinimumWidth(260)
+        self.preview_scroll.setStyleSheet(
+            "QScrollArea { background: %s; border: none; }" % PREVIEW_BACKGROUND)
+        preview_layout.addWidget(self.preview_scroll, 1)
+        self.btn_zoom_out.setEnabled(False)
+        # Render the preview again at the new size once resizing pauses.
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(80)
+        self._preview_timer.timeout.connect(self._update_preview)
+        self.preview_scroll.viewport().installEventFilter(self)
         self.preview_caption = QLabel("")
         self.preview_caption.setAlignment(Qt.AlignCenter)
         self.preview_caption.setWordWrap(True)
@@ -506,25 +653,34 @@ class MainWindow(QMainWindow):
         self.lbl_policy_scope.setWordWrap(True)
         email_layout.addWidget(self.lbl_policy_scope)
 
+        # Two columns of checkboxes keep the options panel short.
+        checks = QGridLayout()
+        checks.setHorizontalSpacing(16)
+        checks.setVerticalSpacing(2)
         self.policy_checks: dict[str, QCheckBox] = {}
-        for key, label in (
+        for number, (key, label) in enumerate((
             ("body", "Message body"),
             ("pdf", "PDF documents"),
             ("images", "Images (excludes inline)"),
             ("documents", "Documents (Office, text, web)"),
             ("embedded", "Embedded messages (drilled into)"),
             ("other", "Other attachments (listed only)"),
-        ):
+        )):
             check = QCheckBox(label)
             check.stateChanged.connect(self._on_policy_toggled)
-            email_layout.addWidget(check)
+            checks.addWidget(check, number % 3, number // 3)
             self.policy_checks[key] = check
+        email_layout.addLayout(checks)
 
         apply_all = QPushButton("Apply to all emails")
         apply_all.setToolTip("Give every Outlook item and email these settings")
         apply_all.clicked.connect(self.apply_policy_to_all_emails)
-        email_layout.addWidget(apply_all)
-        outer.addWidget(email_box, 2)
+        apply_row = QHBoxLayout()
+        apply_row.addWidget(apply_all)
+        apply_row.addStretch(1)
+        email_layout.addLayout(apply_row)
+        email_layout.addStretch(1)
+        outer.addWidget(email_box, 3)
 
         # ---------------- layout ----------------
         layout_box = QGroupBox("Layout")
@@ -568,26 +724,36 @@ class MainWindow(QMainWindow):
 
         for column in (1, 3, 5):
             grid.setColumnStretch(column, 1)
-        outer.addWidget(layout_box, 3)
+        # Keep both rows at the top instead of spreading them over the height.
+        grid.setRowStretch(2, 1)
+        outer.addWidget(layout_box, 4)
 
         # ---------------- output ----------------
         out_box = QGroupBox("Output")
         out_layout = QVBoxLayout(out_box)
-
-        self.btn_output = QPushButton("Save as\u2026")
-        self.btn_output.setToolTip("Choose where to write the merged PDF")
-        self.btn_output.clicked.connect(self.choose_output)
-        out_layout.addWidget(self.btn_output)
+        out_layout.setSpacing(6)
 
         self.lbl_output = QLabel("No destination chosen")
         self.lbl_output.setWordWrap(True)
         self.lbl_output.setStyleSheet("QLabel { color: #555; }")
         out_layout.addWidget(self.lbl_output)
 
-        out_layout.addStretch(1)
+        buttons = QHBoxLayout()
+        self.btn_output = QPushButton("Save as\u2026")
+        self.btn_output.setToolTip("Choose where to write the merged PDF")
+        self.btn_output.clicked.connect(self.choose_output)
+        buttons.addWidget(self.btn_output)
+
+        # The main action of the window, so it stands out from the others.
         self.btn_create = QPushButton("Create PDF")
+        self.btn_create.setToolTip("Write the merged PDF (Ctrl+S)")
+        self.btn_create.setDefault(True)
+        self.btn_create.setMinimumHeight(32)
+        self.btn_create.setStyleSheet(PRIMARY_BUTTON_STYLE)
         self.btn_create.clicked.connect(self.create_pdf)
-        out_layout.addWidget(self.btn_create)
+        buttons.addWidget(self.btn_create, 1)
+        out_layout.addLayout(buttons)
+        out_layout.addStretch(1)
         outer.addWidget(out_box, 2)
 
         return box
@@ -607,13 +773,6 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setToolTip("Stop converting after the file in progress")
         self.btn_cancel.clicked.connect(self.cancel_conversion)
         self.status.addPermanentWidget(self.btn_cancel)
-        # About button in the status bar, so licence information is one click away.
-        self.btn_about = QPushButton("About")
-        self.btn_about.setToolTip(
-            "Version, copyright and the licences this program is under."
-        )
-        self.btn_about.clicked.connect(lambda: show_about(self))
-        self.status.addPermanentWidget(self.btn_about)
         self.status.showMessage("Add files or a folder to begin.")
 
     # ------------------------------------------------------------- progress
@@ -922,6 +1081,13 @@ class MainWindow(QMainWindow):
         if page_count > 0:
             item.setIcon(JUMP_COLUMN, self.jump_icon)
             item.setToolTip(JUMP_COLUMN, "Show in the page list")
+
+    def _on_tree_item_entered(self, item: QTreeWidgetItem, column: int) -> None:
+        viewport = self.tree.viewport()
+        if column == JUMP_COLUMN and not item.icon(JUMP_COLUMN).isNull():
+            viewport.setCursor(Qt.PointingHandCursor)
+        else:
+            viewport.unsetCursor()
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
         """Jump to a row's pages when its arrow column is clicked."""
@@ -1368,20 +1534,28 @@ class MainWindow(QMainWindow):
             self.preview_caption.setText("")
             return
 
-        image = self.thumbs.render(node.pdf, page.index, PREVIEW_HEIGHT)
+        # Fit the page in the pane (less a margin for the shadow), then zoom.
+        viewport = self.preview_scroll.viewport().size()
+        zoom = PREVIEW_ZOOMS[self._preview_zoom]
+        box_w = max(200, viewport.width() - 2 * PREVIEW_MARGIN)
+        box_h = max(200, viewport.height() - 2 * PREVIEW_MARGIN)
+        height = min(PREVIEW_MAX_HEIGHT, int(box_h * zoom))
+        image = self.thumbs.render(node.pdf, page.index, height)
         if image is not None and page.rotation:
             # Apply the page's rotation so the preview matches the output.
             image = image.transformed(
                 QTransform().rotate(page.rotation), Qt.SmoothTransformation
             )
-            if image.height() > PREVIEW_HEIGHT:
-                image = image.scaledToHeight(PREVIEW_HEIGHT, Qt.SmoothTransformation)
+        if image is not None:
+            image = image.scaled(int(box_w * zoom), height, Qt.KeepAspectRatio,
+                                 Qt.SmoothTransformation)
 
         if image is None:
+            self.preview.setPixmap(QPixmap())
             self.preview.setText("Preview unavailable")
         else:
             self.preview.setText("")
-            self.preview.setPixmap(QPixmap.fromImage(image))
+            self.preview.setPixmap(page_with_shadow(image))
 
         extra = "   (+%d more selected)" % (len(indices) - 1) if len(indices) > 1 else ""
         rotation = "   rotated %d\u00b0" % page.rotation if page.rotation else ""
@@ -1389,6 +1563,26 @@ class MainWindow(QMainWindow):
             "Page %d of %d\n%s%s%s"
             % (position + 1, self.model.page_count, node.source.name, rotation, extra)
         )
+
+    def zoom_preview(self, step: int) -> None:
+        """Zoom the preview in (1) or out (-1), or back to fit the pane (0)."""
+        if step == 0:
+            self._preview_zoom = 0
+        else:
+            self._preview_zoom = max(0, min(len(PREVIEW_ZOOMS) - 1,
+                                            self._preview_zoom + step))
+        zoom = PREVIEW_ZOOMS[self._preview_zoom]
+        self.btn_zoom_fit.setText("Fit" if zoom == 1.0 else "%g×" % zoom)
+        self.btn_zoom_out.setEnabled(self._preview_zoom > 0)
+        self.btn_zoom_in.setEnabled(self._preview_zoom < len(PREVIEW_ZOOMS) - 1)
+        self._update_preview()
+
+    def eventFilter(self, watched, event) -> bool:
+        # The preview is scaled to the pane, so render it again after a resize.
+        if (event.type() == QEvent.Resize
+                and watched is self.preview_scroll.viewport()):
+            self._preview_timer.start()
+        return super().eventFilter(watched, event)
 
     def selected_page_indices(self) -> list[int]:
         return sorted(self.page_list.row(item) for item in self.page_list.selectedItems())
@@ -1755,6 +1949,7 @@ class MainWindow(QMainWindow):
         options = self._merge_options(self.output_path)
         self._begin_busy("Assembling %d page(s)\u2026" % len(self.model.pages))
         self.btn_create.setEnabled(False)
+        self.act_create.setEnabled(False)
 
         self._merge = MergeWorker(entries, self.output_path, options, self)
         self._merge.completed.connect(self._on_merged)
@@ -1784,6 +1979,7 @@ class MainWindow(QMainWindow):
     def _on_merged(self, report) -> None:
         self._end_progress()
         self.btn_create.setEnabled(True)
+        self.act_create.setEnabled(True)
         written = getattr(report, "output", None) or self.output_path
         message = "Wrote %d page(s)" % report.pages
         if written is not None and self.output_path is not None \
@@ -1870,6 +2066,7 @@ class MainWindow(QMainWindow):
     def _on_merge_crash(self, detail: str) -> None:
         self.progress.setVisible(False)
         self.btn_create.setEnabled(True)
+        self.act_create.setEnabled(True)
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Critical)
         box.setWindowTitle("Could not write the PDF")
